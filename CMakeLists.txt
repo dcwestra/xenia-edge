@@ -78,11 +78,17 @@ message(STATUS "Target architecture: XE_TARGET_AARCH64=${XE_TARGET_AARCH64} XE_T
 option(XENIA_BUILD_TESTS "Build test suites" OFF)
 option(XENIA_BUILD_MISC "Build misc subprojects (trace viewers, shader compiler, vfs-dump, demos)" OFF)
 option(XENIA_ENABLE_LTO "Enable link-time optimization in Release (slow link)" ON)
+option(XENIA_KEEP_FRAME_POINTERS
+       "Keep frame pointers in Release on GCC/Clang, for perf profiling and crash backtraces (costs ~1% host CPU)"
+       ON)
 option(XENIA_ENABLE_PROFILER "Enable profiler (UI is Debug-only)" OFF)
 option(XENIA_ENABLE_ITRACE "Enable JIT per-instruction tracing to the log (slow)" OFF)
 option(XENIA_ENABLE_DTRACE "Enable JIT per-operation data tracing to the log (very slow)" OFF)
 option(XENIA_ENABLE_FTRACE "Enable JIT per-function-call tracing to the log" OFF)
 option(XENIA_ENABLE_GPU_TRACE "Enable GPU trace capture in Release" OFF)
+option(XENIA_PORTABLE_LINUX
+       "Build a Linux binary that also runs on distributions with an older glibc and C++ runtime, such as Batocera: static libstdc++, functions glibc 2.43 re-versioned bound to their older versions, and no system PCRE2"
+       OFF)
 
 if(XENIA_ENABLE_PROFILER)
   # UI is Debug-only — shutdown dump spams the log otherwise.
@@ -370,6 +376,21 @@ else()
 
     link_libraries(stdc++fs dl lz4 m pthread rt)
 
+    if(XENIA_PORTABLE_LINUX)
+      set(XENIA_PORTABLE_LINUX_STATIC_LIB_DIR "" CACHE PATH
+          "Directory holding libstdc++.a, when the toolchain has no static libstdc++ installed (on Fedora, unpack libstdc++-static there)")
+      if(XENIA_PORTABLE_LINUX_STATIC_LIB_DIR)
+        add_link_options("-L${XENIA_PORTABLE_LINUX_STATIC_LIB_DIR}")
+      endif()
+      # Not -static-libgcc: glibc's pthread_exit unwinds through the system
+      # libgcc_s.so.1, and a second, static unwinder from a newer GCC, which
+      # the static libstdc++'s personality routine would call into, aborts
+      # on its context (Batocera, exiting any guest thread).
+      add_link_options(-static-libstdc++)
+      add_compile_options(
+        "$<$<COMPILE_LANGUAGE:C,CXX>:SHELL:-include ${CMAKE_SOURCE_DIR}/src/xenia/base/glibc_compat.h>")
+    endif()
+
     # Link group so executables resolve circular static-lib deps.
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--start-group")
     set(CMAKE_CXX_STANDARD_LIBRARIES "${CMAKE_CXX_STANDARD_LIBRARIES} -Wl,--end-group")
@@ -398,9 +419,15 @@ else()
     $<$<CONFIG:Release>:-O3>
     $<$<CONFIG:Release>:-finline-functions>
     $<$<CONFIG:Release>:-funroll-loops>
-    $<$<CONFIG:Release>:-fomit-frame-pointer>
     $<$<CONFIG:Release>:-g>
   )
+  # Without frame pointers, perf and other sampling profilers can't walk the
+  # host stack cheaply, which is most of what finding the next bottleneck takes.
+  if(XENIA_KEEP_FRAME_POINTERS)
+    add_compile_options($<$<CONFIG:Release>:-fno-omit-frame-pointer>)
+  else()
+    add_compile_options($<$<CONFIG:Release>:-fomit-frame-pointer>)
+  endif()
   # ThinLTO. On Linux use lld (faster and what LLVM tests ThinLTO
   # against upstream). On macOS use Apple's ld64, which handles ThinLTO
   # natively and avoids an lld install requirement. Gated behind

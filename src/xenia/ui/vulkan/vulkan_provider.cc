@@ -9,10 +9,13 @@
 
 #include "xenia/ui/vulkan/vulkan_provider.h"
 
+#include <cstdint>
+#include <string>
 #include <vector>
 
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
+#include "xenia/base/system.h"
 #include "xenia/ui/vulkan/vulkan_immediate_drawer.h"
 #include "xenia/ui/vulkan/vulkan_presenter.h"
 
@@ -59,16 +62,23 @@ std::unique_ptr<VulkanProvider> VulkanProvider::Create(
   XELOGW(
       "Available Vulkan physical devices (use the 'vulkan_device' "
       "configuration variable to force a specific device):");
+  std::vector<bool> physical_devices_cpu(physical_devices.size());
   for (size_t physical_device_index = 0;
        physical_device_index < physical_devices.size();
        ++physical_device_index) {
     VkPhysicalDeviceProperties physical_device_properties;
     ifn.vkGetPhysicalDeviceProperties(physical_devices[physical_device_index],
                                       &physical_device_properties);
-    XELOGW("* {}: {}", physical_device_index,
-           physical_device_properties.deviceName);
+    physical_devices_cpu[physical_device_index] =
+        physical_device_properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
+    XELOGW("* {}: {}{}", physical_device_index,
+           physical_device_properties.deviceName,
+           physical_devices_cpu[physical_device_index]
+               ? " (software rasterizer)"
+               : "");
   }
 
+  size_t physical_device_index = SIZE_MAX;
   const int32_t preferred_physical_device_index = cvars::vulkan_device;
   if (preferred_physical_device_index >= 0 &&
       uint32_t(preferred_physical_device_index) < physical_devices.size()) {
@@ -76,13 +86,28 @@ std::unique_ptr<VulkanProvider> VulkanProvider::Create(
         provider->vulkan_instance_.get(),
         physical_devices[preferred_physical_device_index], with_gpu_emulation,
         with_presentation);
+    if (provider->vulkan_device_) {
+      physical_device_index = size_t(preferred_physical_device_index);
+    }
   }
 
   if (!provider->vulkan_device_) {
-    for (const VkPhysicalDevice physical_device : physical_devices) {
-      provider->vulkan_device_ = VulkanDevice::CreateIfSupported(
-          provider->vulkan_instance_.get(), physical_device, with_gpu_emulation,
-          with_presentation);
+    // Software rasterizers such as lavapipe are far too slow for emulation, so
+    // try them only after every hardware device. They may be listed first, and
+    // they are the only device left when the GPU's own driver fails to load.
+    for (const bool cpu : {false, true}) {
+      for (size_t i = 0; i < physical_devices.size(); ++i) {
+        if (physical_devices_cpu[i] != cpu) {
+          continue;
+        }
+        provider->vulkan_device_ = VulkanDevice::CreateIfSupported(
+            provider->vulkan_instance_.get(), physical_devices[i],
+            with_gpu_emulation, with_presentation);
+        if (provider->vulkan_device_) {
+          physical_device_index = i;
+          break;
+        }
+      }
       if (provider->vulkan_device_) {
         break;
       }
@@ -93,6 +118,24 @@ std::unique_ptr<VulkanProvider> VulkanProvider::Create(
           "Couldn't choose a compatible Vulkan physical device or initialize a "
           "Vulkan logical device");
       return nullptr;
+    }
+
+    // Without this, games silently show a black screen, as emulation on the
+    // CPU takes seconds per frame. A common cause is a driver update that
+    // replaced the userspace libraries while the old kernel module is still
+    // loaded, which the driver refuses until the computer restarts.
+    if (with_gpu_emulation && physical_devices_cpu[physical_device_index]) {
+      std::string message = fmt::format(
+          "No GPU Vulkan driver is available, so Xenia is using '{}', a "
+          "software renderer that draws on the CPU. Games will be extremely "
+          "slow or show only a black screen.\n\n"
+          "Your GPU's driver likely failed to load. If it was just installed "
+          "or updated, restart the computer. Otherwise, make sure its kernel "
+          "module and its Vulkan libraries are installed and of the same "
+          "version.",
+          provider->vulkan_device_->properties().deviceName);
+      XELOGE("{}", message);
+      xe::ShowSimpleMessageBox(xe::SimpleMessageBoxType::Warning, message);
     }
   }
 

@@ -1116,6 +1116,11 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Android")
     if(UNIX)
       set(wxUSE_ZLIB sys CACHE STRING "" FORCE)
       set(wxUSE_EXPAT sys CACHE STRING "" FORCE)
+      if(XENIA_PORTABLE_LINUX)
+        # wxRegEx needs PCRE2's 32-bit build, missing on some distributions,
+        # such as Batocera, and Xenia doesn't use it.
+        set(wxUSE_REGEX OFF CACHE STRING "" FORCE)
+      endif()
       # Resolve in this scope so the imported targets propagate to wx (its
       # nested find_package calls would otherwise create them in wx's
       # subdirectory scope, out of reach of the fixup below).

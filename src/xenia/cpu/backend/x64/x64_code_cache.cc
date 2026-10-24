@@ -11,6 +11,23 @@
 
 #include <cstring>
 
+#if !XE_PLATFORM_WIN32
+#include <unistd.h>
+
+#include <cstdio>
+#include <mutex>
+
+#include "xenia/base/cvar.h"
+#include "xenia/cpu/function.h"
+
+DEFINE_bool(perf_map, false,
+            "Write /tmp/perf-<pid>.map naming every JIT-compiled guest "
+            "function, so Linux perf and similar profilers attribute samples "
+            "in translated code to guest functions instead of anonymous "
+            "memory. Diagnostic only.",
+            "CPU");
+#endif  // !XE_PLATFORM_WIN32
+
 #if ENABLE_VTUNE
 #include "third_party/fmt/include/fmt/format.h"
 #include "third_party/vtune/include/jitprofiling.h"
@@ -34,6 +51,31 @@ void X64CodeCache::FlushCodeRange(void* address, size_t size) {
 void X64CodeCache::OnCodePlaced(uint32_t guest_address,
                                 GuestFunction* function_info,
                                 void* code_execute_address, size_t code_size) {
+#if !XE_PLATFORM_WIN32
+  if (cvars::perf_map) {
+    static std::mutex perf_map_mutex;
+    static FILE* perf_map_file = nullptr;
+    std::lock_guard<std::mutex> lock(perf_map_mutex);
+    if (!perf_map_file) {
+      char path[64];
+      std::snprintf(path, sizeof(path), "/tmp/perf-%d.map", int(getpid()));
+      perf_map_file = std::fopen(path, "w");
+    }
+    if (perf_map_file) {
+      // "START SIZE name" in hex, the format perf reads for JIT code.
+      if (function_info && !function_info->name().empty()) {
+        std::fprintf(perf_map_file, "%zx %zx %s\n",
+                     reinterpret_cast<size_t>(code_execute_address), code_size,
+                     function_info->name().c_str());
+      } else {
+        std::fprintf(perf_map_file, "%zx %zx sub_%08X\n",
+                     reinterpret_cast<size_t>(code_execute_address), code_size,
+                     guest_address);
+      }
+      std::fflush(perf_map_file);
+    }
+  }
+#endif  // !XE_PLATFORM_WIN32
 #if ENABLE_VTUNE
   if (iJIT_IsProfilingActive() == iJIT_SAMPLING_ON) {
     std::string method_name;

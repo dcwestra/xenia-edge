@@ -10,6 +10,7 @@
 #include "xenia/ui/imgui_drawer.h"
 
 #include <cfloat>
+#include <cstdio>
 #include <cstring>
 #include <ranges>
 
@@ -34,7 +35,25 @@
 
 #if XE_PLATFORM_LINUX
 #include <fontconfig/fontconfig.h>
+
+#include <set>
+#include <string>
+
+#include "third_party/imgui/imgui_internal.h"
+
+// A private copy of the TrueType parser ImGui builds fonts with, to check that
+// a system font is one ImGui can load before merging it (see LoadJapaneseFont).
+#if defined(__clang__) || defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
 #endif
+#define STBTT_STATIC
+#define STB_TRUETYPE_IMPLEMENTATION
+#include "third_party/imgui/imstb_truetype.h"
+#if defined(__clang__) || defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+#endif  // XE_PLATFORM_LINUX
 
 DEFINE_path(custom_font_path, "",
             "Path to custom font file (overrides the embedded UI font). "
@@ -478,6 +497,50 @@ bool ImGuiDrawer::LoadWindowsFont(ImGuiIO& io, ImFontConfig& font_config,
   return false;
 }
 
+#if XE_PLATFORM_LINUX
+namespace {
+// Reads face |face_index| of |path| into an ImGui allocation if ImGui's font
+// builder can parse it and it has a glyph for |codepoint|, else returns null.
+// ImGui discards the whole atlas, every font in it, when one merged face fails
+// to parse, and its stb_truetype builder has no CFF2 support, which variable
+// CJK fonts use (Fedora's default Noto Sans CJK VF among them). Merging one
+// left every UI string drawn as solid blocks.
+void* LoadParseableFontFace(const char* path, int face_index,
+                            unsigned int codepoint, int* out_size) {
+  FILE* file = std::fopen(path, "rb");
+  if (!file) {
+    return nullptr;
+  }
+  void* data = nullptr;
+  long size = 0;
+  if (std::fseek(file, 0, SEEK_END) == 0) {
+    size = std::ftell(file);
+  }
+  if (size > 0 && size < 0x7FFFFFFF && std::fseek(file, 0, SEEK_SET) == 0) {
+    data = IM_ALLOC(size_t(size));
+    if (std::fread(data, 1, size_t(size), file) != size_t(size)) {
+      IM_FREE(data);
+      data = nullptr;
+    }
+  }
+  std::fclose(file);
+  if (!data) {
+    return nullptr;
+  }
+  const auto* bytes = static_cast<const unsigned char*>(data);
+  const int offset = stbtt_GetFontOffsetForIndex(bytes, face_index);
+  stbtt_fontinfo info;
+  if (offset < 0 || !stbtt_InitFont(&info, bytes, offset) ||
+      !stbtt_FindGlyphIndex(&info, int(codepoint))) {
+    IM_FREE(data);
+    return nullptr;
+  }
+  *out_size = int(size);
+  return data;
+}
+}  // namespace
+#endif  // XE_PLATFORM_LINUX
+
 bool ImGuiDrawer::LoadJapaneseFont(ImGuiIO& io, float font_size) {
 #if XE_PLATFORM_WIN32
   PWSTR fonts_dir;
@@ -516,37 +579,89 @@ bool ImGuiDrawer::LoadJapaneseFont(ImGuiIO& io, float font_size) {
   }
 
   // Create a pattern to search for fonts with CJK support
+  constexpr FcChar32 kCjkCodepoint = 0x4E00;
   FcPattern* pattern = FcPatternCreate();
   FcCharSet* charset = FcCharSetCreate();
-  FcCharSetAddChar(charset, 0x4E00);  // Add a CJK character to the charset
+  FcCharSetAddChar(charset, kCjkCodepoint);
   FcPatternAddCharSet(pattern, FC_CHARSET, charset);
 
   // Configure the search
   FcConfigSubstitute(config, pattern, FcMatchPattern);
   FcDefaultSubstitute(pattern);
 
-  // Find the best matching font
+  // Take the best matching font ImGui can actually load, not just the best
+  // match, which may be one its builder can't parse.
   FcResult result;
-  FcPattern* font = FcFontMatch(config, pattern, &result);
+  FcFontSet* candidates =
+      FcFontSort(config, pattern, FcFalse, nullptr, &result);
 
   bool success = false;
-  if (font) {
-    FcChar8* file = nullptr;
-    if (FcPatternGetString(font, FC_FILE, 0, &file) == FcResultMatch) {
-      const char* font_path = reinterpret_cast<const char*>(file);
-
-      if (std::filesystem::exists(font_path)) {
-        ImFontConfig jp_font_config;
-        jp_font_config.MergeMode = true;
-        jp_font_config.OversampleH = jp_font_config.OversampleV = 2;
-        jp_font_config.PixelSnapH = true;
-
-        io.Fonts->AddFontFromFileTTF(font_path, font_size, &jp_font_config,
-                                     io.Fonts->GetGlyphRangesJapanese());
-        success = true;
-      }
+  // Each candidate is read whole to check it, and a CJK font runs to tens of
+  // MB, so stop after a few files.
+  constexpr size_t kMaxFilesChecked = 6;
+  std::set<std::string> rejected_files;
+  for (int i = 0; candidates && i < candidates->nfont && !success &&
+                  rejected_files.size() < kMaxFilesChecked;
+       ++i) {
+    FcPattern* candidate = candidates->fonts[i];
+    FcCharSet* candidate_charset = nullptr;
+    if (FcPatternGetCharSet(candidate, FC_CHARSET, 0, &candidate_charset) !=
+            FcResultMatch ||
+        !FcCharSetHasChar(candidate_charset, kCjkCodepoint)) {
+      continue;
     }
-    FcPatternDestroy(font);
+    FcChar8* file = nullptr;
+    if (FcPatternGetString(candidate, FC_FILE, 0, &file) != FcResultMatch) {
+      continue;
+    }
+    const char* font_path = reinterpret_cast<const char*>(file);
+    if (rejected_files.count(font_path)) {
+      continue;
+    }
+    int face_index = 0;
+    FcPatternGetInteger(candidate, FC_INDEX, 0, &face_index);
+    // The high bits name a variable font's named instance, not the face.
+    face_index &= 0xFFFF;
+    int font_data_size = 0;
+    void* font_data = LoadParseableFontFace(font_path, face_index,
+                                            kCjkCodepoint, &font_data_size);
+    if (!font_data) {
+      XELOGI("Skipping CJK font {}, which the UI font builder can't load",
+             xe::strip_pii(font_path));
+      rejected_files.insert(font_path);
+      continue;
+    }
+    ImFontConfig jp_font_config;
+    jp_font_config.MergeMode = true;
+    jp_font_config.OversampleH = jp_font_config.OversampleV = 2;
+    jp_font_config.PixelSnapH = true;
+    jp_font_config.FontNo = face_index;
+    // The atlas takes the allocation over and frees it.
+    jp_font_config.FontDataOwnedByAtlas = true;
+    io.Fonts->AddFontFromMemoryTTF(font_data, font_data_size, font_size,
+                                   &jp_font_config,
+                                   io.Fonts->GetGlyphRangesJapanese());
+    // A failed build would take every other font down with it, so drop the
+    // merge rather than risk the whole UI.
+    if (io.Fonts->Build()) {
+      XELOGI("Using CJK font {} (face {}) for the UI", xe::strip_pii(font_path),
+             face_index);
+      success = true;
+    } else {
+      XELOGW("Failed to build the UI font atlas with CJK font {}, dropping it",
+             xe::strip_pii(font_path));
+      ImFontConfig& merged = io.Fonts->Sources.back();
+      if (merged.FontDataOwnedByAtlas) {
+        IM_FREE(merged.FontData);
+      }
+      io.Fonts->Sources.pop_back();
+      ImFontAtlasUpdateSourcesPointers(io.Fonts);
+      io.Fonts->Build();
+      rejected_files.insert(font_path);
+    }
+  }
+  if (candidates) {
+    FcFontSetDestroy(candidates);
   }
 
   FcCharSetDestroy(charset);
@@ -555,8 +670,8 @@ bool ImGuiDrawer::LoadJapaneseFont(ImGuiIO& io, float font_size) {
 
   if (!success) {
     XELOGW(
-        "Unable to find CJK font; Japanese characters may not display "
-        "correctly");
+        "Unable to find a CJK font the UI can load; Japanese characters may "
+        "not display correctly");
   }
   return success;
 #endif
@@ -598,6 +713,12 @@ void ImGuiDrawer::SetupFontTexture() {
   unsigned char* pixels;
   int width, height;
   io.Fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
+  if (!pixels || width <= 0 || height <= 0) {
+    XELOGE("UI font atlas failed to build, UI text will not render");
+  } else {
+    XELOGI("UI font atlas: {}x{}, {} fonts", width, height,
+           io.Fonts->Fonts.Size);
+  }
   font_texture_ = immediate_drawer_->CreateTexture(
       width, height, ImmediateTextureFilter::kLinear, true,
       reinterpret_cast<uint8_t*>(pixels));

@@ -64,8 +64,14 @@ uint64_t Clock::QueryHostSystemTime() {
 }
 
 // Split the division: ticks * units overflows uint64 in ~31 min at 100 ns.
-static uint64_t TicksTo(uint64_t ticks, uint64_t units) {
+static inline uint64_t TicksTo(uint64_t ticks, uint64_t units) {
   static const uint64_t freq = Clock::host_tick_frequency_platform();
+  // Linux reports nanosecond ticks, where this is a division by a constant
+  // the compiler makes a multiply. The general form costs two divisions and a
+  // modulo, and the guest scheduler converts on every yield and poll.
+  if (freq == 1000000000ull && 1000000000ull % units == 0) {
+    return ticks / (1000000000ull / units);
+  }
   if (!freq) {
     return 0;
   }

@@ -566,6 +566,16 @@ class Memory {
     return mapping_;
   }
 
+  // Writes data the host produced, such as GPU output read back, into guest
+  // physical memory whatever the host protection of its views. Without a GPU
+  // import of guest RAM, physical_membase_ carries guest protection and access
+  // watches too, so a plain copy through TranslatePhysical faults on a page the
+  // guest has just made read-only - and a fault there, under the global
+  // critical region, halts the guest thread holding it, hanging the title.
+  // Triggers no access callbacks, like writes through physical_membase_.
+  void WritePhysicalUnprotected(uint32_t guest_address, const void* data,
+                                size_t length);
+
   // Translates a guest physical address to a host address that can be accessed
   // as a normal pointer.
   // Note that the contents at the specified host address are big-endian.

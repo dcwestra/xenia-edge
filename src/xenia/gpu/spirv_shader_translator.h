@@ -1377,6 +1377,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // Guest instruction bisect, snapshotting a register to color 0.
   bool BisectTargetsCurrentShader() const;
   bool BisectSkipsInstruction();
+  // Whether shader_texture_fetch_zero names this shader and fetch constant.
+  bool IsTextureFetchZeroed(uint32_t fetch_constant) const;
+  bool texture_fetch_zero_logged_ = false;
   void BisectSnapshotAfterInstruction();
   void BisectStoreSnapshot();
   void BisectOverrideColorOutput();

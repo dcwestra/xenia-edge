@@ -40,6 +40,15 @@ DECLARE_bool(clear_memory_page_state);
 DECLARE_bool(gpu_debug_markers);
 DECLARE_bool(memexport_enable);
 DECLARE_bool(submit_on_primary_buffer_end);
+DECLARE_uint32(log_fps);
+DEFINE_string(
+    shader_depth_bias, "",
+    "Comma-separated guest pixel shader ucode hashes (hex) with an extra host "
+    "depth bias each, as <hash>:<units>. For layered geometry that relies on "
+    "exact ties in the 24-bit float guest depth, which 32-bit host depth "
+    "breaks, such as Fable II's dog fur shells (014F8A02DB7B19CA:16, about two "
+    "24-bit depth steps). Host render target path only.",
+    "GPU");
 
 DEFINE_bool(
     vulkan_dynamic_rendering, true,
@@ -94,6 +103,7 @@ VulkanCommandProcessor::VulkanCommandProcessor(
                                ->vulkan_device(),
                            "cp"),
       deferred_command_buffer_(*this),
+      deferred_upload_command_buffer_(*this, 64 * 1024),
       transient_descriptor_allocator_uniform_buffer_(
           static_cast<const ui::vulkan::VulkanProvider*>(
               graphics_system->provider())
@@ -1440,6 +1450,7 @@ void VulkanCommandProcessor::ShutdownContext() {
            gpu_time_untimed_submissions_);
   }
   DestroyGpuTimeQueryPool();
+  DestroyGpuPhaseQueryPool();
 
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -1756,18 +1767,21 @@ void VulkanCommandProcessor::DestroyReadbackStagingBuffer(
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
   if (buffer.mapped != nullptr) {
+    // Unmapping is host-side only, legal with a copy into it still in flight.
     dfn.vkUnmapMemory(device, buffer.memory);
     buffer.mapped = nullptr;
   }
-  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
-                                         buffer.buffer);
-  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
-                                         buffer.memory);
-}
-
-// The copy into a staging buffer is recorded, so it has to drain first.
-void VulkanCommandProcessor::PrepareReadbackStagingEviction() {
-  AwaitAllQueueOperationsCompletion();
+  // Deferred like D3D12, a submitted copy may still be writing it. Draining the
+  // whole queue here instead stalled the frame on every eviction.
+  const uint64_t submission = GetCurrentSubmission();
+  if (buffer.buffer != VK_NULL_HANDLE) {
+    destroy_buffers_.emplace_back(submission, buffer.buffer);
+    buffer.buffer = VK_NULL_HANDLE;
+  }
+  if (buffer.memory != VK_NULL_HANDLE) {
+    destroy_memory_.emplace_back(submission, buffer.memory);
+    buffer.memory = VK_NULL_HANDLE;
+  }
 }
 
 // Orders a copy into a staging buffer against the previous one into the same
@@ -1968,6 +1982,9 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
                                        uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
   EndZPDFrame();
+  if (submission_open_) {
+    SetGpuPhase(GpuPhase::kPresent);
+  }
 
   // Before the presenter check, so the paths that return early end the frame
   // too.
@@ -3468,6 +3485,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
     // cache.
     if (!memexport_used_vertex) {
       // This draw has no effect.
+      if (cvars::log_draws) {
+        XELOGI("log_draws: skipped, no rasterization");
+      }
       return true;
     }
   }
@@ -3540,6 +3560,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
     }
     if (!primitive_processing_result.host_draw_vertex_count) {
       // Nothing to draw.
+      if (cvars::log_draws) {
+        XELOGI("log_draws: skipped, no vertices after primitive processing");
+      }
       return true;
     }
     // TODO(Triang3l): Geometry-type-specific vertex shader, vertex shader as
@@ -3823,8 +3846,43 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
     draw_util::FormatDrawDebugMarker(
         label, sizeof(label), prim_type, primitive_processing_result,
         vertex_shader ? vertex_shader->ucode_data_hash() : 0,
-        pixel_shader ? pixel_shader->ucode_data_hash() : 0);
+        pixel_shader ? pixel_shader->ucode_data_hash() : 0,
+        primitive_processing_result.index_buffer_type ==
+                PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA
+            ? regs[XE_GPU_REG_VGT_DMA_BASE]
+            : 0);
     PushDebugMarker("%s", label);
+  }
+  if (cvars::log_draws && !vertex_shader->texture_bindings().empty()) {
+    // Vertex shader texture fetches are rare and often feed culling, so log
+    // their raw fetch constants.
+    for (const Shader::TextureBinding& binding :
+         vertex_shader->texture_bindings()) {
+      const uint32_t* fetch =
+          &regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 +
+                       binding.fetch_constant * 6];
+      XELOGI("log_draws:   vs tf{} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+             binding.fetch_constant, fetch[0], fetch[1], fetch[2], fetch[3],
+             fetch[4], fetch[5]);
+    }
+  }
+  if (cvars::log_draws && pixel_shader && pixel_shader->bindings_ready()) {
+    // Which textures a draw samples, to tell a stale or swapped texture from a
+    // shader or constant problem. Base and mip addresses are in words 1 and 5.
+    uint32_t ps_fetch_mask = 0;
+    for (const Shader::TextureBinding& binding :
+         pixel_shader->texture_bindings()) {
+      if (ps_fetch_mask & (uint32_t(1) << binding.fetch_constant)) {
+        continue;
+      }
+      ps_fetch_mask |= uint32_t(1) << binding.fetch_constant;
+      const uint32_t* fetch =
+          &regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 +
+                       binding.fetch_constant * 6];
+      XELOGI("log_draws:   ps tf{} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+             binding.fetch_constant, fetch[0], fetch[1], fetch[2], fetch[3],
+             fetch[4], fetch[5]);
+    }
   }
 
   // Update the textures before most other work in the submission because
@@ -3952,8 +4010,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   // Update dynamic graphics pipeline state.
   UpdateDynamicState(viewport_info, primitive_polygonal,
                      normalized_depth_control, draw_resolution_scale_x,
-                     draw_resolution_scale_y, apply_host_depth_polygon_offset,
-                     window_offset_tiles != 0);
+                     draw_resolution_scale_y, GetShaderDepthBias(pixel_shader),
+                     apply_host_depth_polygon_offset, window_offset_tiles != 0);
 
   auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
 
@@ -4122,10 +4180,14 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
       for (uint32_t i = 0; i < vfetch_current_queued; ++i) {
         if (!shared_memory_->RequestRange(vfetch_addresses[i] << 2,
                                           vfetch_sizes[i] << 2)) {
-          XELOGE(
-              "Failed to request vertex buffer at 0x{:08X} (size {}) in the "
-              "shared memory",
-              vfetch_addresses[i] << 2, vfetch_sizes[i] << 2);
+          static uint32_t request_failure_count = 0;
+          if (xe::is_pow2(++request_failure_count)) {
+            XELOGE(
+                "Failed to request vertex buffer at 0x{:08X} (size {}) in the "
+                "shared memory ({} times so far)",
+                vfetch_addresses[i] << 2, vfetch_sizes[i] << 2,
+                request_failure_count);
+          }
           return false;
         }
       }
@@ -4203,6 +4265,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
       render_target_cache_->last_update_render_pass_key().key;
 
   // Draw.
+  SetGpuPhase(GpuPhase::kDraw);
   OnVIZSurveyDraw(true);
   if (primitive_processing_result.index_buffer_type ==
           PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
@@ -5450,6 +5513,7 @@ void VulkanCommandProcessor::CheckSubmissionCompletionAndDeviceLoss(
 
   PumpQueryResolves();
   PumpPendingRetire();
+  CollectCompletedGpuPhases();
 
   // Destroy objects scheduled for destruction.
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -5550,6 +5614,11 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     // Start a new deferred command buffer - will submit it to the real one in
     // the end of the submission.
     deferred_command_buffer_.Reset();
+    deferred_upload_command_buffer_.Reset();
+    if (shared_memory_) {
+      shared_memory_->BeginSubmissionPageUse();
+    }
+    BeginGpuPhaseSubmission();
 
     // Reset cached state of the command buffer.
     dynamic_viewport_update_needed_ = true;
@@ -5691,6 +5760,177 @@ void VulkanCommandProcessor::DestroyGpuTimeQueryPool() {
   vulkan_device->functions().vkDestroyQueryPool(vulkan_device->device(),
                                                 gpu_time_query_pool_, nullptr);
   gpu_time_query_pool_ = VK_NULL_HANDLE;
+}
+
+void VulkanCommandProcessor::BeginGpuPhaseSubmission() {
+  gpu_phase_slot_ = kNoGpuPhaseSlot;
+  gpu_phase_current_ = GpuPhase::kOther;
+  if (!cvars::log_fps || gpu_phase_pool_failed_) {
+    return;
+  }
+  ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  if (gpu_phase_query_pool_ == VK_NULL_HANDLE) {
+    VkQueryPoolCreateInfo pool_info = {
+        VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    pool_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    pool_info.queryCount = kGpuPhaseSlots * kGpuPhaseQueriesPerSlot;
+    if (!vulkan_device->properties().timestampPeriod ||
+        dfn.vkCreateQueryPool(vulkan_device->device(), &pool_info, nullptr,
+                              &gpu_phase_query_pool_) != VK_SUCCESS) {
+      XELOGW("Vulkan: GPU time breakdown unavailable, no timestamp queries");
+      gpu_phase_query_pool_ = VK_NULL_HANDLE;
+      gpu_phase_pool_failed_ = true;
+      return;
+    }
+  }
+  CollectCompletedGpuPhases();
+  const uint32_t slot = gpu_phase_next_slot_;
+  if (gpu_phase_slot_submission_[slot]) {
+    ++gpu_phase_untimed_submissions_;
+    return;
+  }
+  gpu_phase_slot_ = slot;
+  gpu_phase_slot_marker_count_[slot] = 0;
+  // Opens the first phase, at the start of the submission.
+  WriteGpuPhaseMarker(GpuPhase::kOther);
+}
+
+void VulkanCommandProcessor::WriteGpuPhaseMarker(GpuPhase phase) {
+  uint32_t& count = gpu_phase_slot_marker_count_[gpu_phase_slot_];
+  // Two queries stay free, for the closing marker and the upload prologue.
+  // Past that, the rest of the submission is charged to the phase already
+  // open.
+  if (count + 2 >= kGpuPhaseQueriesPerSlot) {
+    return;
+  }
+  deferred_command_buffer_.CmdVkWriteTimestamp(
+      VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, gpu_phase_query_pool_,
+      gpu_phase_slot_ * kGpuPhaseQueriesPerSlot + count);
+  gpu_phase_slot_phases_[gpu_phase_slot_][count] = phase;
+  ++count;
+  gpu_phase_current_ = phase;
+}
+
+void VulkanCommandProcessor::CollectCompletedGpuPhases() {
+  if (gpu_phase_query_pool_ == VK_NULL_HANDLE) {
+    return;
+  }
+  ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const double period = vulkan_device->properties().timestampPeriod;
+  const uint64_t completed = GetCompletedSubmission();
+  uint64_t timestamps[kGpuPhaseQueriesPerSlot];
+  for (uint32_t slot = 0; slot < kGpuPhaseSlots; ++slot) {
+    const uint64_t submission = gpu_phase_slot_submission_[slot];
+    if (!submission || submission > completed) {
+      continue;
+    }
+    const uint32_t count = gpu_phase_slot_marker_count_[slot];
+    const bool has_prologue = gpu_phase_slot_has_upload_prologue_[slot];
+    const uint32_t query_count = count + 1 + uint32_t(has_prologue);
+    if (count && dfn.vkGetQueryPoolResults(
+                     vulkan_device->device(), gpu_phase_query_pool_,
+                     slot * kGpuPhaseQueriesPerSlot, query_count,
+                     sizeof(uint64_t) * query_count, timestamps,
+                     sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+      for (uint32_t i = 0; i < count; ++i) {
+        if (timestamps[i + 1] > timestamps[i]) {
+          gpu_phase_ns_[size_t(gpu_phase_slot_phases_[slot][i])] +=
+              uint64_t(double(timestamps[i + 1] - timestamps[i]) * period);
+        }
+      }
+      if (has_prologue && timestamps[0] > timestamps[count + 1]) {
+        gpu_phase_ns_[size_t(GpuPhase::kUpload)] +=
+            uint64_t(double(timestamps[0] - timestamps[count + 1]) * period);
+      }
+    }
+    gpu_phase_slot_submission_[slot] = 0;
+  }
+}
+
+void VulkanCommandProcessor::DestroyGpuPhaseQueryPool() {
+  if (gpu_phase_query_pool_ == VK_NULL_HANDLE) {
+    return;
+  }
+  ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  vulkan_device->functions().vkDestroyQueryPool(vulkan_device->device(),
+                                                gpu_phase_query_pool_, nullptr);
+  gpu_phase_query_pool_ = VK_NULL_HANDLE;
+  for (uint64_t& submission : gpu_phase_slot_submission_) {
+    submission = 0;
+  }
+  gpu_phase_slot_ = kNoGpuPhaseSlot;
+}
+
+std::string VulkanCommandProcessor::TakeGpuTimeReport(uint32_t frames) {
+  uint64_t total_ns = 0;
+  for (uint64_t ns : gpu_phase_ns_) {
+    total_ns += ns;
+  }
+  if (!total_ns || !frames) {
+    return {};
+  }
+  auto ms = [frames](uint64_t ns) { return double(ns) / 1e6 / frames; };
+  std::string report = fmt::format(
+      ", GPU {:.1f} ms/frame (draws {:.1f}, render target copies {:.1f}, "
+      "resolves {:.1f}, texture loads {:.1f}, uploads {:.1f}, present {:.1f}, "
+      "other {:.1f})",
+      ms(total_ns), ms(gpu_phase_ns_[size_t(GpuPhase::kDraw)]),
+      ms(gpu_phase_ns_[size_t(GpuPhase::kRenderTargetCopy)]),
+      ms(gpu_phase_ns_[size_t(GpuPhase::kResolve)]),
+      ms(gpu_phase_ns_[size_t(GpuPhase::kTextureLoad)]),
+      ms(gpu_phase_ns_[size_t(GpuPhase::kUpload)]),
+      ms(gpu_phase_ns_[size_t(GpuPhase::kPresent)]),
+      ms(gpu_phase_ns_[size_t(GpuPhase::kOther)]));
+  // Uploads end the render pass and drain the pipeline before copying, so
+  // their count matters as much as their size.
+  const uint64_t upload_batches = shared_memory_->upload_batches();
+  const uint64_t upload_bytes = shared_memory_->upload_bytes();
+  const uint64_t hoisted_upload_batches =
+      shared_memory_->hoisted_upload_batches();
+  report += fmt::format(
+      "; per frame: {:.0f} uploads ({:.0f} hoisted, {:.2f} MB), {:.0f} render "
+      "passes",
+      double(upload_batches - gpu_report_upload_batches_start_) / frames,
+      double(hoisted_upload_batches -
+             gpu_report_hoisted_upload_batches_start_) /
+          frames,
+      double(upload_bytes - gpu_report_upload_bytes_start_) / frames /
+          (1024.0 * 1024.0),
+      double(render_passes_total_ - gpu_report_render_passes_start_) / frames);
+  gpu_report_hoisted_upload_batches_start_ = hoisted_upload_batches;
+  gpu_report_upload_batches_start_ = upload_batches;
+  // Copies into depth without VK_EXT_shader_stencil_export take 8 more draws
+  // for the stencil bits, so the kinds matter as much as the sizes.
+  const VulkanRenderTargetCache::TransferStats transfer_stats =
+      render_target_cache_->TakeTransferStats();
+  auto transfer_report = [&](size_t kind) {
+    return fmt::format("{:.1f} ({:.2f} M)",
+                       double(transfer_stats.count[kind]) / frames,
+                       double(transfer_stats.samples[kind]) / frames / 1e6);
+  };
+  report += fmt::format(
+      ", render target copies (samples) color>color {}, depth>color {}, "
+      "color>depth {}, depth>depth {}, into depth at 1x/2x/4x MSAA "
+      "{:.1f}/{:.1f}/{:.1f}, {:.1f} stencil bit checks",
+      transfer_report(0), transfer_report(1), transfer_report(2),
+      transfer_report(3), double(transfer_stats.to_depth_by_msaa[0]) / frames,
+      double(transfer_stats.to_depth_by_msaa[1]) / frames,
+      double(transfer_stats.to_depth_by_msaa[2]) / frames,
+      double(transfer_stats.stencil_bit_checks) / frames);
+  gpu_report_upload_bytes_start_ = upload_bytes;
+  gpu_report_render_passes_start_ = render_passes_total_;
+  if (gpu_phase_untimed_submissions_) {
+    report +=
+        fmt::format(", {} submissions untimed", gpu_phase_untimed_submissions_);
+    gpu_phase_untimed_submissions_ = 0;
+  }
+  report += TakeResolveReadbackReport(frames);
+  for (uint64_t& ns : gpu_phase_ns_) {
+    ns = 0;
+  }
+  return report;
 }
 
 void VulkanCommandProcessor::CollectCompletedGpuTimeQueries() {
@@ -5884,7 +6124,56 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
                               gpu_time_query_pool_, gpu_time_slot * 2);
     }
 
+    const uint32_t gpu_phase_slot = gpu_phase_slot_;
+    const bool has_upload_prologue = !deferred_upload_command_buffer_.empty();
+    if (gpu_phase_slot != kNoGpuPhaseSlot) {
+      dfn.vkCmdResetQueryPool(command_buffer.buffer, gpu_phase_query_pool_,
+                              gpu_phase_slot * kGpuPhaseQueriesPerSlot,
+                              gpu_phase_slot_marker_count_[gpu_phase_slot] + 1 +
+                                  uint32_t(has_upload_prologue));
+      gpu_phase_slot_has_upload_prologue_[gpu_phase_slot] = has_upload_prologue;
+    }
+    if (has_upload_prologue) {
+      if (gpu_phase_slot != kNoGpuPhaseSlot) {
+        // Times the prologue, which ends where the first marker starts.
+        dfn.vkCmdWriteTimestamp(
+            command_buffer.buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+            gpu_phase_query_pool_,
+            gpu_phase_slot * kGpuPhaseQueriesPerSlot +
+                gpu_phase_slot_marker_count_[gpu_phase_slot] + 1);
+      }
+      // Earlier submissions' accesses to the pages before the copies replace
+      // them, then the copies before anything in this submission.
+      VkMemoryBarrier upload_barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+      upload_barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+      upload_barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+      dfn.vkCmdPipelineBarrier(command_buffer.buffer,
+                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1,
+                               &upload_barrier, 0, nullptr, 0, nullptr);
+      deferred_upload_command_buffer_.Execute(command_buffer.buffer);
+      upload_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+      upload_barrier.dstAccessMask =
+          VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+      dfn.vkCmdPipelineBarrier(command_buffer.buffer,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1,
+                               &upload_barrier, 0, nullptr, 0, nullptr);
+    }
+
     deferred_command_buffer_.Execute(command_buffer.buffer);
+
+    if (gpu_phase_slot != kNoGpuPhaseSlot) {
+      // Closes the last phase.
+      dfn.vkCmdWriteTimestamp(command_buffer.buffer,
+                              VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                              gpu_phase_query_pool_,
+                              gpu_phase_slot * kGpuPhaseQueriesPerSlot +
+                                  gpu_phase_slot_marker_count_[gpu_phase_slot]);
+      gpu_phase_slot_submission_[gpu_phase_slot] = GetCurrentSubmission();
+      gpu_phase_next_slot_ = (gpu_phase_slot + 1) % kGpuPhaseSlots;
+      gpu_phase_slot_ = kNoGpuPhaseSlot;
+    }
 
     // Record query resolves before submitting.
     if (host_query_pool_) {
@@ -6073,11 +6362,41 @@ void VulkanCommandProcessor::DestroyScratchBuffer() {
                                          scratch_buffer_memory_);
 }
 
+float VulkanCommandProcessor::GetShaderDepthBias(const Shader* pixel_shader) {
+  const std::string& setting = cvars::shader_depth_bias;
+  if (setting.empty() || !pixel_shader) {
+    return 0.0f;
+  }
+  // Parsed again only when the setting changes.
+  if (setting != shader_depth_bias_parsed_) {
+    shader_depth_bias_parsed_ = setting;
+    shader_depth_bias_units_.clear();
+    size_t entry_start = 0;
+    while (entry_start < setting.size()) {
+      size_t entry_end = setting.find(',', entry_start);
+      if (entry_end == std::string::npos) {
+        entry_end = setting.size();
+      }
+      std::string entry = setting.substr(entry_start, entry_end - entry_start);
+      entry_start = entry_end + 1;
+      size_t colon = entry.find(':');
+      if (colon == std::string::npos) {
+        continue;
+      }
+      shader_depth_bias_units_[std::strtoull(entry.c_str(), nullptr, 16)] =
+          std::strtof(entry.c_str() + colon + 1, nullptr);
+    }
+  }
+  auto it = shader_depth_bias_units_.find(pixel_shader->ucode_data_hash());
+  return it != shader_depth_bias_units_.end() ? it->second : 0.0f;
+}
+
 void VulkanCommandProcessor::UpdateDynamicState(
     const draw_util::ViewportInfo& viewport_info, bool primitive_polygonal,
     reg::RB_DEPTHCONTROL normalized_depth_control,
     uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y,
-    bool depth_bias_in_pixel_shader, bool window_offset_in_edram) {
+    float extra_depth_bias_constant, bool depth_bias_in_pixel_shader,
+    bool window_offset_in_edram) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -6149,6 +6468,7 @@ void VulkanCommandProcessor::UpdateDynamicState(
           xenos::kPolygonOffsetScaleSubpixelUnit *
           float(std::max(draw_resolution_scale_x, draw_resolution_scale_y));
     }
+    depth_bias_constant_factor += extra_depth_bias_constant;
     // std::memcmp instead of != so in case of NaN, every draw won't be
     // invalidating it.
     dynamic_depth_bias_update_needed_ |=

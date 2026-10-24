@@ -11,6 +11,7 @@
 #define XENIA_UI_GPU_COMPLETION_TIMELINE_H_
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 
 #include "xenia/base/assert.h"
@@ -55,7 +56,12 @@ class GPUCompletionTimeline {
   bool AwaitSubmissionAndUpdateCompleted(const uint64_t awaited_submission) {
     assert_true(awaited_submission < upcoming_submission_);
     if (UpdateAndGetCompletedSubmission() < awaited_submission) {
+      auto await_start = std::chrono::steady_clock::now();
       AwaitSubmissionImpl(awaited_submission);
+      await_ns_ +=
+          uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now() - await_start)
+                       .count());
     }
     // Recheck, the wait might have been incomplete if there was an error.
     return UpdateAndGetCompletedSubmission() >= awaited_submission;
@@ -71,6 +77,13 @@ class GPUCompletionTimeline {
 
   bool AwaitAllSubmissions() {
     return AwaitSubmissionAndUpdateCompleted(GetUpcomingSubmission() - 1);
+  }
+
+  // Time spent blocked in awaiting submissions since the last call.
+  uint64_t TakeAwaitNanoseconds() {
+    uint64_t await_ns = await_ns_;
+    await_ns_ = 0;
+    return await_ns;
   }
 
  protected:
@@ -93,6 +106,8 @@ class GPUCompletionTimeline {
   uint64_t upcoming_submission_ = 1;
 
   uint64_t completed_submission_ = 0;
+
+  uint64_t await_ns_ = 0;
 };
 
 }  // namespace ui

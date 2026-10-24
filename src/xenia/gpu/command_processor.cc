@@ -43,6 +43,12 @@ DEFINE_bool(
     "its own, just ones the guest makes or instructs it to make.",
     "Logging");
 
+DEFINE_uint32(log_fps, 0,
+              "Every this many seconds, log the guest frame rate (presents "
+              "per second) and the longest frame in that window. 0 disables "
+              "it.",
+              "GPU");
+
 DEFINE_bool(disassemble_pm4, false,
             "Only does anything in debug builds, if set will disassemble and "
             "log all PM4 packets sent to the CP.",
@@ -369,11 +375,38 @@ void CommandProcessor::RestoreGammaRamp(
 }
 
 void CommandProcessor::CallInThread(std::function<void()> fn) {
-  if (pending_fns_.empty() &&
-      kernel::XThread::IsInThread(worker_thread_.get())) {
+  {
+    std::unique_lock<std::mutex> lock(pending_fns_mutex_);
+    if (!pending_fns_.empty() ||
+        !kernel::XThread::IsInThread(worker_thread_.get())) {
+      pending_fns_.push(std::move(fn));
+      pending_fns_queued_.store(true, std::memory_order_release);
+      lock.unlock();
+      // Cut the worker's idle wait short rather than leave the call queued for
+      // the rest of it.
+      write_ptr_index_event_->Set();
+      return;
+    }
+  }
+  fn();
+}
+
+void CommandProcessor::RunPendingFns() {
+  while (pending_fns_queued_.load(std::memory_order_acquire)) {
+    std::function<void()> fn;
+    {
+      std::lock_guard<std::mutex> lock(pending_fns_mutex_);
+      if (pending_fns_.empty()) {
+        pending_fns_queued_.store(false, std::memory_order_relaxed);
+        break;
+      }
+      fn = std::move(pending_fns_.front());
+      pending_fns_.pop();
+      pending_fns_queued_.store(!pending_fns_.empty(),
+                                std::memory_order_relaxed);
+    }
+    // Unlocked, the call may queue another or suspend this thread.
     fn();
-  } else {
-    pending_fns_.push(std::move(fn));
   }
 }
 
@@ -431,6 +464,61 @@ void CommandProcessor::SetDesiredSwapPostEffect(
   CallInThread([this, swap_post_effect]() {
     swap_post_effect_actual_ = swap_post_effect;
   });
+}
+
+void CommandProcessor::NoteGuestSwapForFpsLog() {
+  // This frame and any the guest has queued after it.
+  const uint64_t frames_queued =
+      guest_swaps_queued_.load(std::memory_order_relaxed) -
+      ++guest_swaps_processed_ + 1;
+  fps_max_frames_queued_ = std::max(fps_max_frames_queued_, frames_queued);
+  const uint32_t interval_s = cvars::log_fps;
+  if (!interval_s) {
+    return;
+  }
+  const int64_t now_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count();
+  const int64_t frame_idle_ns = fps_frame_idle_ns_;
+  fps_frame_idle_ns_ = 0;
+  const int64_t frame_guest_wait_ns = fps_frame_guest_wait_ns_;
+  fps_frame_guest_wait_ns_ = 0;
+  const int64_t frame_gpu_await_ns = TakeGpuAwaitNanoseconds();
+  if (!fps_window_start_ns_) {
+    fps_window_start_ns_ = fps_last_swap_ns_ = now_ns;
+    fps_worst_frame_ns_ = 0;
+    fps_window_frames_ = 0;
+    return;
+  }
+  const int64_t frame_ns = now_ns - fps_last_swap_ns_;
+  if (frame_ns > fps_worst_frame_ns_) {
+    fps_worst_frame_ns_ = frame_ns;
+    fps_worst_frame_idle_ns_ = frame_idle_ns;
+    fps_worst_frame_gpu_await_ns_ = frame_gpu_await_ns;
+    fps_worst_frame_guest_wait_ns_ = frame_guest_wait_ns;
+  }
+  fps_last_swap_ns_ = now_ns;
+  ++fps_window_frames_;
+  const int64_t window_ns = now_ns - fps_window_start_ns_;
+  if (window_ns >= int64_t(interval_s) * 1000000000) {
+    // Waiting for commands is the guest not submitting, mostly the game's own
+    // CPU work. Guest waits are for vertical blank or the guest's fences.
+    XELOGI(
+        "Guest frame rate: {:.1f} fps, longest frame {:.1f} ms ({:.1f} ms "
+        "waiting for commands, {:.1f} ms in guest waits, {:.1f} ms for the "
+        "GPU), up to {} guest frames queued{}",
+        double(fps_window_frames_) * 1e9 / double(window_ns),
+        double(fps_worst_frame_ns_) / 1e6,
+        double(fps_worst_frame_idle_ns_) / 1e6,
+        double(fps_worst_frame_guest_wait_ns_) / 1e6,
+        double(fps_worst_frame_gpu_await_ns_) / 1e6, fps_max_frames_queued_,
+        TakeGpuTimeReport(fps_window_frames_));
+    fps_window_start_ns_ = now_ns;
+    fps_worst_frame_ns_ = 0;
+    fps_window_frames_ = 0;
+    fps_max_frames_queued_ = 0;
+  }
 }
 
 void CommandProcessor::ThrottlePresentation() {
@@ -509,15 +597,14 @@ void CommandProcessor::WorkerThreadMain() {
   SetTitleStateSuffix(MakeTitleStateSuffix());
 
   while (worker_running_) {
-    while (!pending_fns_.empty()) {
-      auto fn = std::move(pending_fns_.front());
-      pending_fns_.pop();
-      fn();
-    }
+    RunPendingFns();
 
     uint32_t write_ptr_index = write_ptr_index_.load();
     if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
       SCOPE_profile_cpu_i("gpu", "xe::gpu::CommandProcessor::Stall");
+      auto stall_start = cvars::log_fps
+                             ? std::chrono::steady_clock::now()
+                             : std::chrono::steady_clock::time_point();
       // We've run out of commands to execute.
       // We spin here waiting for new ones, as the overhead of waiting on our
       // event is too high.
@@ -541,11 +628,19 @@ void CommandProcessor::WorkerThreadMain() {
         // The guest may be spinning on a held-back signal.
         SubmitHeldSignals();
         write_ptr_index = write_ptr_index_.load();
-      } while (worker_running_ && pending_fns_.empty() &&
+      } while (worker_running_ &&
+               !pending_fns_queued_.load(std::memory_order_acquire) &&
                (write_ptr_index == 0xBAADF00D ||
                 read_ptr_index_ == write_ptr_index));
       ReturnFromWait();
-      if (!worker_running_ || !pending_fns_.empty()) {
+      if (cvars::log_fps) {
+        fps_frame_idle_ns_ +=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - stall_start)
+                .count();
+      }
+      if (!worker_running_ ||
+          pending_fns_queued_.load(std::memory_order_acquire)) {
         continue;
       }
     }

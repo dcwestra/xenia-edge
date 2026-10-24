@@ -82,6 +82,9 @@ class Logger;
 
 Logger* logger_ = nullptr;
 
+// The log file's descriptor, for a fatal signal handler to write to directly.
+std::atomic<int> log_file_descriptor_{-1};
+
 // Present-frame counter, advanced once per guest present. Stamped into each
 // log line at emit time.
 std::atomic<uint32_t> global_frame_number_{0};
@@ -540,8 +543,13 @@ void InitializeLogging(const std::string_view app_name) {
       xe::filesystem::CreateParentFolder(cvars::log_file);
       log_path = cvars::log_file;
     }
-    logger_->AddLogSink(std::make_unique<FileLogSink>(
-        OpenLogFile(log_path, !cvars::log_append), true));
+    FILE* log_file = OpenLogFile(log_path, !cvars::log_append);
+#if !XE_PLATFORM_WIN32
+    if (log_file) {
+      log_file_descriptor_.store(fileno(log_file), std::memory_order_release);
+    }
+#endif
+    logger_->AddLogSink(std::make_unique<FileLogSink>(log_file, true));
   }
 
   if (cvars::log_to_stdout) {
@@ -555,11 +563,16 @@ void InitializeLogging(const std::string_view app_name) {
 }
 
 void ShutdownLogging() {
+  log_file_descriptor_.store(-1, std::memory_order_release);
   Logger* logger = logger_;
   logger_ = nullptr;
 
   logger->~Logger();
   memory::AlignedFree(logger);
+}
+
+int GetLogFileDescriptor() {
+  return log_file_descriptor_.load(std::memory_order_acquire);
 }
 
 void FlushLog() {

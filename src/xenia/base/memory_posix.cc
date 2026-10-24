@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <atomic>
 #include <cerrno>
 #include <cstddef>
 #include <cstdio>
@@ -347,8 +348,20 @@ bool Protect(void* base_address, size_t length, PageAccess access,
   uint32_t prot = ToPosixProtectFlags(access);
   int ret = mprotect(base_address, length, prot);
   if (ret != 0) {
+    const int error = errno;
     XELOGE("mprotect({}, 0x{:X}, {}) failed: {} ({})", base_address, length,
-           prot, strerror(errno), errno);
+           prot, strerror(error), error);
+#if XE_PLATFORM_GNU_LINUX
+    // ENOMEM from mprotect on a mapped range means the split it needs would
+    // exceed vm.max_map_count.
+    static std::atomic<bool> map_count_reported{false};
+    if (error == ENOMEM && !map_count_reported.exchange(true)) {
+      XELOGE(
+          "mprotect ran out of memory mappings: vm.max_map_count is too low "
+          "for this title. Raise it with: sudo sysctl -w "
+          "vm.max_map_count=1048576");
+    }
+#endif  // XE_PLATFORM_GNU_LINUX
   }
   return ret == 0;
 }

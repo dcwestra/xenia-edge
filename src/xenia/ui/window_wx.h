@@ -12,6 +12,7 @@
 
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_set>
 
@@ -68,6 +69,11 @@ class WxWindow : public Window {
   void RequestCloseImpl() override;
   uint32_t GetLatestDpiImpl() const override;
   void ApplyNewFullscreen() override;
+#if XE_PLATFORM_LINUX
+  // Hides the menu bar in fullscreen and shows it otherwise, as wxGTK's own
+  // fullscreen handling can't for a menu bar attached before the frame showed.
+  void ApplyMenuBarVisibility();
+#endif
   void ApplyNewTitle() override;
   void LoadAndApplyIcon(const void* buffer, size_t size,
                         bool can_apply_state_in_current_phase) override;
@@ -150,6 +156,13 @@ class WxWindow : public Window {
 #endif
 
 #if XE_PLATFORM_LINUX
+  // The glib idle source of a pending RequestPaintImpl, 0 if none. The
+  // presenter requests paints from the guest output thread too, so it's only
+  // accessed under the mutex: unguarded, the UI thread could run and clear the
+  // source between g_idle_add_full returning and its id being stored, leaving
+  // a stale id that made every later request return without painting - the
+  // picture froze while the game kept running.
+  std::mutex pending_paint_mutex_;
   unsigned int pending_paint_source_ = 0;
   GtkSurfaceFactory gtk_surface_factory_;
 #endif

@@ -9,10 +9,15 @@
 
 #include <alloca.h>
 #include <dlfcn.h>
+#include <spawn.h>
 #include <stdlib.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <thread>
 
 #include "xenia/base/assert.h"
 #include "xenia/base/logging.h"
@@ -30,19 +35,35 @@ constexpr uint32_t kSDL_MessageBoxWarning = 0x00000020;
 constexpr uint32_t kSDL_MessageBoxInformation = 0x00000040;
 }  // namespace
 
+extern char** environ;
+
 namespace xe {
 
-void LaunchWebBrowser(const std::string_view url) {
-  auto cmd = std::string("xdg-open ");
-  cmd.append(url);
-  system(cmd.c_str());
+// Hands |target| to xdg-open as its own argument, with no shell to interpret
+// it, so a path holding $, ` or " opens as named, and returns without waiting.
+// system() ran it through sh and blocked the caller until xdg-open exited.
+static void XdgOpen(const std::string& target) {
+  char program[] = "xdg-open";
+  std::string argument = target;
+  char* argv[] = {program, argument.data(), nullptr};
+  pid_t pid;
+  int result = posix_spawnp(&pid, program, nullptr, nullptr, argv, environ);
+  if (result != 0) {
+    XELOGE("Failed to run xdg-open for {}: {}", target, std::strerror(result));
+    return;
+  }
+  // Reap it off the calling (often UI) thread so it doesn't linger as a zombie.
+  std::thread([pid]() {
+    int status;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+    }
+  }).detach();
 }
 
+void LaunchWebBrowser(const std::string_view url) { XdgOpen(std::string(url)); }
+
 void LaunchFileExplorer(const std::filesystem::path& path) {
-  auto cmd = std::string("xdg-open \"");
-  cmd.append(path.string());
-  cmd.append("\"");
-  system(cmd.c_str());
+  XdgOpen(path.string());
 }
 
 void ShowSimpleMessageBox(SimpleMessageBoxType type, std::string_view message) {

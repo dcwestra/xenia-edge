@@ -20,6 +20,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -610,6 +611,17 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
 
   // VkPipelineCache persistence path.
   std::filesystem::path vk_pipeline_cache_path_;
+  // Pipelines created into vk_pipeline_cache_, against the count at the last
+  // save, so the periodic save only runs when the driver cache has grown.
+  std::atomic<uint64_t> vk_pipeline_cache_creations_{0};
+  uint64_t vk_pipeline_cache_saved_creations_ = 0;
+  uint64_t vk_pipeline_cache_last_save_ms_ = 0;
+  // Periodic saves run here, off the draw thread, one at a time. Saving only on
+  // a clean exit lost the session's driver compiles to every crash.
+  std::thread vk_pipeline_cache_save_thread_;
+  std::atomic<bool> vk_pipeline_cache_save_busy_{false};
+  void MaybeSaveVkPipelineCacheInBackground();
+  void JoinVkPipelineCacheSave();
 };
 
 }  // namespace vulkan

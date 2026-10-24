@@ -234,6 +234,24 @@ int GuestScheduler::DispatchCpuOf(uint8_t guest_cpu) const {
   return guest_cpu % kMaxCpus;
 }
 
+void GuestScheduler::SetNextTimedRepoll(Cpu& cpu, uint64_t due_ms) const {
+  cpu.next_timed_repoll_ms = due_ms;
+  if (!due_ms || ticks_per_us_ <= 0.0) {
+    cpu.next_timed_repoll_tick = 0;
+    return;
+  }
+  // From 100 ns time rather than the ms clock, which floors, so the tick
+  // deadline lands on the ms boundary instead of up to 1 ms after it.
+  const uint64_t now_tick = Clock::host_tick_count_raw();
+  const uint64_t now_100ns = Clock::QueryHostInterruptTime();
+  const uint64_t due_100ns = due_ms * 10000;
+  cpu.next_timed_repoll_tick =
+      due_100ns > now_100ns
+          ? now_tick +
+                uint64_t(double(due_100ns - now_100ns) * ticks_per_us_ / 10.0)
+          : now_tick;
+}
+
 int GuestScheduler::CpuOf(XThread* thread) const {
   return DispatchCpuOf(thread->guest_object<X_KTHREAD>()->current_cpu);
 }
@@ -1033,7 +1051,9 @@ bool GuestScheduler::YieldExecution(bool quantum_end) {
       links.terminate_pending.load(std::memory_order_relaxed) ||
       cpu.repoll_now.load(std::memory_order_relaxed) || self->suspend_count() ||
       CpuOf(self) != cpu_index ||
-      Clock::QueryHostUptimeMillis() >= cpu.next_timed_repoll_ms) {
+      (ticks_per_us_ > 0.0
+           ? Clock::host_tick_count_raw() >= cpu.next_timed_repoll_tick
+           : Clock::QueryHostUptimeMillis() >= cpu.next_timed_repoll_ms)) {
     return YieldCurrentThread(quantum_end);
   }
   links.unyielded_quanta = 0;
@@ -1432,7 +1452,7 @@ void GuestScheduler::BlockCurrentThread(uint64_t deadline_ms,
       }
     }
     if (due && due < cpu.next_timed_repoll_ms) {
-      cpu.next_timed_repoll_ms = due;
+      SetNextTimedRepoll(cpu, due);
     }
     // seq_cst pairs with the wake pre-filters' loads: epoch-read-then-store
     // here vs bump-then-load there, so at least one side always sees the other.
@@ -1519,7 +1539,7 @@ void GuestScheduler::RereadyBlocked(int cpu_index) {
     cpu.blocked_head = kept_head;
     cpu.blocked_tail = kept_tail;
     cpu.max_blocked_prio = kept_max_prio;
-    cpu.next_timed_repoll_ms = next_due;
+    SetNextTimedRepoll(cpu, next_due);
     cpu.has_blocked.store(kept_head != nullptr, std::memory_order_relaxed);
   }
   // Wake any other dispatch thread that received a ready fiber (this one runs).

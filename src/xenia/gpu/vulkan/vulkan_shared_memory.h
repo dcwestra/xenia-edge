@@ -70,6 +70,12 @@ class VulkanSharedMemory : public SharedMemory {
   bool InitializeTraceSubmitDownloads();
   void InitializeTraceCompleteDownloads();
 
+  // Upload batches recorded and bytes copied into the buffer, cumulative, for
+  // the log_fps report.
+  uint64_t upload_batches() const { return upload_batches_; }
+  uint64_t upload_bytes() const { return upload_bytes_; }
+  uint64_t hoisted_upload_batches() const { return hoisted_upload_batches_; }
+
  protected:
   bool AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,
                                         uint32_t length_allocations) override;
@@ -78,6 +84,9 @@ class VulkanSharedMemory : public SharedMemory {
                     uint32_t num_ranges) override;
 
  private:
+  uint64_t upload_batches_ = 0;
+  uint64_t upload_bytes_ = 0;
+  uint64_t hoisted_upload_batches_ = 0;
   void GetUsageMasks(Usage usage, VkPipelineStageFlags& stage_mask,
                      VkAccessFlags& access_mask) const;
 

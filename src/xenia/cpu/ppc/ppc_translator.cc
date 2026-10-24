@@ -30,6 +30,10 @@
 #include "xenia/cpu/processor.h"
 #include "xenia/cpu/xex_module.h"
 
+DEFINE_uint32(log_function_disassembly, 0,
+              "Log the PPC, HIR and host code of the guest function starting "
+              "at this address (hexadecimal 0x8...) when it's translated.",
+              "CPU");
 DEFINE_bool(dump_translated_hir_functions, false, "dumps translated hir",
             "CPU");
 
@@ -223,7 +227,10 @@ bool PPCTranslator::Translate(GuestFunction* function,
   xe::make_reset_scope(&string_buffer_);
 
   // NOTE: we only want to do this when required, as it's expensive to build.
-  if (cvars::disassemble_functions) {
+  const bool log_disassembly =
+      cvars::log_function_disassembly &&
+      function->address() == cvars::log_function_disassembly;
+  if (cvars::disassemble_functions || log_disassembly) {
     debug_info_flags |= DebugInfoFlags::kDebugInfoAllDisasm;
   }
   // Sourced from the processor's latched value, not the cvar. Every thread is
@@ -307,6 +314,14 @@ bool PPCTranslator::Translate(GuestFunction* function,
   if (!assembler_->Assemble(function, builder_.get(), debug_info_flags,
                             std::move(debug_info))) {
     return false;
+  }
+
+  if (log_disassembly && function->debug_info()) {
+    const FunctionDebugInfo& info = *function->debug_info();
+    XELOGI("PPC:\n{}", info.source_disasm() ? info.source_disasm() : "");
+    XELOGI("Optimized HIR:\n{}", info.hir_disasm() ? info.hir_disasm() : "");
+    XELOGI("Machine code:\n{}",
+           info.machine_code_disasm() ? info.machine_code_disasm() : "");
   }
 
   return true;

@@ -1077,10 +1077,14 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
     // TODO(Triang3l): Shared memory request cache.
     if (!shared_memory_.RequestRange(guest_index_base,
                                      guest_index_buffer_needed_bytes)) {
-      XELOGE(
-          "PrimitiveProcessor: Failed to request index buffer 0x{:08X}, 0x{:X} "
-          "bytes needed, in the shared memory",
-          guest_index_base, guest_index_buffer_needed_bytes);
+      static uint32_t request_failure_count = 0;
+      if (xe::is_pow2(++request_failure_count)) {
+        XELOGE(
+            "PrimitiveProcessor: Failed to request index buffer 0x{:08X}, "
+            "0x{:X} bytes needed, in the shared memory ({} times so far)",
+            guest_index_base, guest_index_buffer_needed_bytes,
+            request_failure_count);
+      }
       return false;
     }
   }

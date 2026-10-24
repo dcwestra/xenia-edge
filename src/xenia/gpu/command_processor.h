@@ -24,6 +24,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "xenia/base/cvar.h"
 #include "xenia/base/math.h"
 #include "xenia/base/ring_buffer.h"
 #include "xenia/gpu/register_file.h"
@@ -32,6 +33,9 @@
 #include "xenia/gpu/xenos_zpd_report.h"
 #include "xenia/kernel/xthread.h"
 #include "xenia/memory.h"
+
+DECLARE_uint32(log_fps);
+DECLARE_bool(log_draws);
 #include "xenia/ui/presenter.h"
 
 namespace xe {
@@ -192,6 +196,18 @@ class CommandProcessor {
   // Called after IssueSwap to limit host frame rate without affecting guest
   // vblank timing.
   void ThrottlePresentation();
+  // Counts a guest present for the log_fps report.
+  void NoteGuestSwapForFpsLog();
+  // Called by VdSwap when the guest queues a frame's swap.
+  void NoteGuestSwapQueued() {
+    guest_swaps_queued_.fetch_add(1, std::memory_order_relaxed);
+  }
+  // The host GPU's busy time per guest frame by kind of work, accumulated
+  // since the last call, appended to the log_fps report. Empty if the backend
+  // doesn't measure it.
+  virtual std::string TakeGpuTimeReport(uint32_t frames) { return {}; }
+  // Time the command processor spent blocked on the GPU since the last call.
+  virtual int64_t TakeGpuAwaitNanoseconds() { return 0; }
 
   // May be called not only from the command processor thread when the command
   // processor is paused, and the termination of this function may be explicitly
@@ -756,7 +772,14 @@ class CommandProcessor {
   std::atomic<bool> worker_running_;
   kernel::object_ref<kernel::XHostThread> worker_thread_;
 
+  // Pushed from any thread (UI, title launch), drained by the worker, so every
+  // access goes through pending_fns_mutex_. pending_fns_queued_ mirrors
+  // !empty() for the worker's lock-free idle spin.
+  std::mutex pending_fns_mutex_;
   std::queue<std::function<void()>> pending_fns_;
+  std::atomic<bool> pending_fns_queued_{false};
+  // Runs queued calls in order on the worker. A call may queue another.
+  void RunPendingFns();
 
   // MicroEngine binary from PM4_ME_INIT
   std::vector<uint32_t> me_bin_;
@@ -795,6 +818,25 @@ class CommandProcessor {
 
   // For host frame rate limiting at IssueSwap
   uint64_t last_swap_time_ = 0;
+  // log_fps window, in steady_clock nanoseconds.
+  int64_t fps_window_start_ns_ = 0;
+  int64_t fps_last_swap_ns_ = 0;
+  int64_t fps_worst_frame_ns_ = 0;
+  // Where the command processor spent the longest frame - idle with no
+  // commands from the guest, or blocked on the GPU.
+  int64_t fps_worst_frame_idle_ns_ = 0;
+  int64_t fps_worst_frame_gpu_await_ns_ = 0;
+  int64_t fps_worst_frame_guest_wait_ns_ = 0;
+  int64_t fps_frame_idle_ns_ = 0;
+  // In PM4_WAIT_REG_MEM, for vertical blank or a fence written by the guest.
+  int64_t fps_frame_guest_wait_ns_ = 0;
+  uint32_t fps_window_frames_ = 0;
+  // Swaps the guest has queued (VdSwap) against those processed here. Data a
+  // game rotates through a few buffers per frame is only safe while the
+  // command processor stays within that many frames of the guest CPU.
+  std::atomic<uint64_t> guest_swaps_queued_{0};
+  uint64_t guest_swaps_processed_ = 0;
+  uint64_t fps_max_frames_queued_ = 0;
 
  private:
   void SetTitleStateSuffix(std::string suffix);

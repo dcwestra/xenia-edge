@@ -23,6 +23,19 @@
 namespace xe {
 namespace ui {
 
+namespace {
+// Which GDK backend a display is, by the name of its type. GDK_IS_*_DISPLAY
+// call gdk_<backend>_display_get_type(), which a GTK built without that
+// backend doesn't export - Batocera's is X11-only - so the binary would stop
+// there with an undefined symbol. That backend's functions are only called
+// once the name has matched.
+bool IsGdkDisplayOfBackend(GdkDisplay* display, const char* type_prefix) {
+  const char* type_name = G_OBJECT_TYPE_NAME(display);
+  return type_name &&
+         std::strncmp(type_name, type_prefix, std::strlen(type_prefix)) == 0;
+}
+}  // namespace
+
 bool XcbWindowSurface::GetSizeImpl(uint32_t& width_out,
                                    uint32_t& height_out) const {
   xcb_get_geometry_reply_t* reply = xcb_get_geometry_reply(
@@ -89,7 +102,7 @@ std::unique_ptr<Surface> GtkSurfaceFactory::Create(
   GdkDisplay* display = gdk_window_get_display(gdk_window);
 
 #ifdef GDK_WINDOWING_WAYLAND
-  if (GDK_IS_WAYLAND_DISPLAY(display) &&
+  if (IsGdkDisplayOfBackend(display, "GdkWayland") &&
       (allowed_types & Surface::kTypeFlag_WaylandWindow)) {
     wl_display* wl_dpy = gdk_wayland_display_get_wl_display(display);
     GtkWidget* toplevel_widget = gtk_widget_get_toplevel(widget);
@@ -173,7 +186,7 @@ std::unique_ptr<Surface> GtkSurfaceFactory::Create(
   }
 #endif
 
-  if (GDK_IS_X11_DISPLAY(display) &&
+  if (IsGdkDisplayOfBackend(display, "GdkX11") &&
       (allowed_types & Surface::kTypeFlag_XcbWindow)) {
     // The Vulkan X11 WSI runs a present-queue thread that issues xcb requests
     // on whatever connection the surface was created from, and GetSizeImpl

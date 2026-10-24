@@ -57,6 +57,11 @@ bool SDLHelper::SetHints() {
 
   suc &= setHint(SDL_HINT_AUDIO_CATEGORY, "playback");
 
+  // SDL otherwise turns SIGINT and SIGTERM into an SDL_EVENT_QUIT, which
+  // nothing here reads, so Ctrl+C, kill and a session logout could not end
+  // the process (logout then waits out systemd's SIGKILL timeout).
+  suc &= setHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
+
   // SDL3 replaced SDL_HINT_AUDIO_DEVICE_APP_NAME with app metadata. Backends
   // (PulseAudio, PipeWire, WASAPI session names, etc.) read this for the
   // user-facing device label.

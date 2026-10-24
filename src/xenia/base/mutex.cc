@@ -135,9 +135,13 @@ void xe_global_mutex::lock() {
 void xe_global_mutex::lock_slow() {
   uint64_t self = xe_current_thread_id();
 
-  // Spin phase
+  // Spin phase. Test before the CAS, so spinners share the line read-only
+  // instead of pulling it exclusive from the holder on every iteration.
   for (int i = 0; i < XE_LINUX_MUTEX_SPINCOUNT; ++i) {
     SpinPause();
+    if (state_.load(std::memory_order_relaxed) != 0) {
+      continue;
+    }
     uint32_t expected = 0;
     if (state_.compare_exchange_strong(expected, 1, std::memory_order_acquire,
                                        std::memory_order_relaxed)) {
@@ -221,9 +225,12 @@ void xe_fast_mutex::lock() {
 }
 
 void xe_fast_mutex::lock_slow() {
-  // Spin phase
+  // Spin phase, testing before the CAS as in xe_global_mutex.
   for (int i = 0; i < XE_LINUX_MUTEX_SPINCOUNT; ++i) {
     SpinPause();
+    if (state_.load(std::memory_order_relaxed) != 0) {
+      continue;
+    }
     uint32_t expected = 0;
     if (state_.compare_exchange_strong(expected, 1, std::memory_order_acquire,
                                        std::memory_order_relaxed)) {

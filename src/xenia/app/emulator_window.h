@@ -13,6 +13,7 @@
 #include <atomic>
 #include <memory>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -67,6 +68,9 @@ class EmulatorWindow {
 
   std::unique_ptr<xe::threading::Thread> gamepad_poll_thread_;
   std::atomic<bool> gamepad_poll_running_ = {false};
+  std::thread screenshot_burst_thread_;
+  std::atomic<bool> screenshot_burst_running_ = {false};
+  std::atomic<bool> screenshot_burst_stop_ = {false};
 
   static constexpr int64_t diff_in_ms(
       const steady_clock::time_point t1,
@@ -104,6 +108,9 @@ class EmulatorWindow {
   void SetCompilingShaders(bool compiling);
 
   void TakeScreenshot();
+  // Saves every guest frame for a few seconds, to catch brief flicker that a
+  // single screenshot misses.
+  void TakeScreenshotBurst();
   void ExportScreenshot(const xe::ui::RawImage& image);
   void SaveImage(const std::filesystem::path& path,
                  const xe::ui::RawImage& image);

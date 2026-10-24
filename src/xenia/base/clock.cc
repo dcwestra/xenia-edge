@@ -9,6 +9,9 @@
 
 #include "xenia/base/clock.h"
 
+#include <algorithm>
+#include <atomic>
+#include <bit>
 #include <mutex>
 
 #include "xenia/base/assert.h"
@@ -19,6 +22,10 @@
 
 #include "xenia/base/platform_win.h"
 
+#endif
+
+#if XE_COMPILER_MSVC
+#include <intrin.h>
 #endif
 
 DEFINE_bool(clock_no_scaling, false,
@@ -52,16 +59,87 @@ std::pair<uint64_t, uint64_t> guest_system_time_ratio_ =
 // Computed by RecomputeGuestTickScalar.
 std::pair<uint64_t, uint64_t> guest_tick_ratio_ = std::make_pair(1, 1);
 
-// Native guest ticks.
+// Native guest ticks, as of a recent read. Exposed to the JIT for
+// inline_loadclock, which accepts a slightly stale value.
 uint64_t last_guest_tick_count_ = 0;
-// Last sampled host tick count.
-uint64_t last_host_tick_count_ = Clock::QueryHostTickCount();
 
 using tick_mutex_type = std::mutex;
 
-// Mutex to ensure last_host_tick_count_ and last_guest_tick_count_ are in sync
-// std::mutex tick_mutex_;
+// Serializes the rare writers of the ratios and the conversion below.
 static tick_mutex_type tick_mutex_;
+
+// (a * b) >> shift over the full 128-bit product, shift in [0, 63].
+static inline uint64_t MulShift64(uint64_t a, uint64_t b, uint32_t shift) {
+#if XE_COMPILER_MSVC && XE_ARCH_AMD64
+  uint64_t high;
+  uint64_t low = _umul128(a, b, &high);
+  return __shiftright128(low, high, static_cast<unsigned char>(shift));
+#elif XE_COMPILER_MSVC && XE_ARCH_ARM64
+  uint64_t low = a * b;
+  uint64_t high = __umulh(a, b);
+  return shift ? (low >> shift) | (high << (64 - shift)) : low;
+#else
+  return static_cast<uint64_t>((static_cast<unsigned __int128>(a) * b) >>
+                               shift);
+#endif
+}
+
+// Host to guest tick conversion, guest = guest_base + (host - host_base) *
+// mult >> shift, with mult a fixed-point form of guest_tick_ratio_. A guest
+// mftb reads this, which some titles do millions of times a second, so it is
+// published through a sequence lock rather than a mutex. Converting from a
+// fixed base also keeps the fraction of a tick: the accumulator this replaced
+// dropped it on every read, so polling slowed guest time down, by a fifth at
+// reads 100 ns apart and to a standstill under one guest tick apart.
+static std::atomic<uint32_t> guest_clock_seq_{0};
+static std::atomic<uint64_t> guest_clock_host_base_{0};
+static std::atomic<uint64_t> guest_clock_guest_base_{0};
+static std::atomic<uint64_t> guest_clock_mult_{1};
+static std::atomic<uint32_t> guest_clock_shift_{0};
+// Guest time counts from startup, as the accumulator it replaced did.
+[[maybe_unused]] static const bool guest_clock_based_ = [] {
+  guest_clock_host_base_.store(Clock::QueryHostTickCount(),
+                               std::memory_order_relaxed);
+  return true;
+}();
+
+// Guest ticks at host tick count |host_ticks|.
+static uint64_t GuestTicksAtHostTicks(uint64_t host_ticks) {
+  uint32_t seq;
+  uint64_t host_base, guest_base, mult;
+  uint32_t shift;
+  do {
+    seq = guest_clock_seq_.load(std::memory_order_acquire);
+    host_base = guest_clock_host_base_.load(std::memory_order_relaxed);
+    guest_base = guest_clock_guest_base_.load(std::memory_order_relaxed);
+    mult = guest_clock_mult_.load(std::memory_order_relaxed);
+    shift = guest_clock_shift_.load(std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_acquire);
+  } while ((seq & 1) ||
+           guest_clock_seq_.load(std::memory_order_relaxed) != seq);
+  // A host tick count from before the base (another source) adds nothing.
+  uint64_t host_delta = host_ticks > host_base ? host_ticks - host_base : 0;
+  return guest_base + MulShift64(host_delta, mult, shift);
+}
+
+// Rebases the conversion on the current guest time and switches it to
+// |ratio|, keeping guest time continuous. Caller holds tick_mutex_.
+static void PublishGuestClockRatio(std::pair<uint64_t, uint64_t> ratio) {
+  uint64_t host_now = Clock::QueryHostTickCount();
+  uint64_t guest_now = GuestTicksAtHostTicks(host_now);
+  // As many fraction bits as keep ratio.first << shift within 64 bits.
+  int shift = std::min(40, 63 - int(std::bit_width(ratio.first)));
+  shift = std::max(shift, 0);
+  uint64_t mult = ratio.second ? (ratio.first << shift) / ratio.second : 0;
+  uint32_t seq = guest_clock_seq_.load(std::memory_order_relaxed);
+  guest_clock_seq_.store(seq + 1, std::memory_order_relaxed);
+  std::atomic_thread_fence(std::memory_order_release);
+  guest_clock_host_base_.store(host_now, std::memory_order_relaxed);
+  guest_clock_guest_base_.store(guest_now, std::memory_order_relaxed);
+  guest_clock_mult_.store(mult, std::memory_order_relaxed);
+  guest_clock_shift_.store(uint32_t(shift), std::memory_order_relaxed);
+  guest_clock_seq_.store(seq + 2, std::memory_order_release);
+}
 
 static void RecomputeGuestSystemTimeRatio() {
   std::pair<uint64_t, uint64_t> frac(uint64_t(10000000), guest_tick_frequency_);
@@ -88,6 +166,7 @@ void RecomputeGuestTickScalar() {
 
   std::lock_guard<tick_mutex_type> lock(tick_mutex_);
   guest_tick_ratio_ = frac;
+  PublishGuestClockRatio(frac);
 }
 
 // Update the guest timer for all threads.
@@ -100,22 +179,14 @@ uint64_t UpdateGuestClock() {
     return host_tick_count * guest_tick_ratio_.first / guest_tick_ratio_.second;
   }
 
-  std::unique_lock<tick_mutex_type> lock(tick_mutex_, std::defer_lock);
-  if (lock.try_lock()) {
-    // Translate host tick count to guest tick count.
-    uint64_t host_tick_delta = host_tick_count > last_host_tick_count_
-                                   ? host_tick_count - last_host_tick_count_
-                                   : 0;
-    last_host_tick_count_ = host_tick_count;
-    uint64_t guest_tick_delta =
-        host_tick_delta * guest_tick_ratio_.first / guest_tick_ratio_.second;
-    last_guest_tick_count_ += guest_tick_delta;
-    return last_guest_tick_count_;
-  } else {
-    // Wait until another thread has finished updating the clock.
-    lock.lock();
-    return last_guest_tick_count_;
+  uint64_t guest_tick_count = GuestTicksAtHostTicks(host_tick_count);
+  // Refresh the copy inline_loadclock reads. Only once it has fallen a little
+  // behind, so threads polling the clock don't all keep writing one line.
+  std::atomic_ref<uint64_t> published(last_guest_tick_count_);
+  if (guest_tick_count > published.load(std::memory_order_relaxed) + 64) {
+    published.store(guest_tick_count, std::memory_order_relaxed);
   }
+  return guest_tick_count;
 }
 
 // Offset of the current guest system file time relative to the guest base time.

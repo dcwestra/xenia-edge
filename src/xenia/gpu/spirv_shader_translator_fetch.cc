@@ -11,15 +11,21 @@
 
 #include <climits>
 #include <cmath>
+#include <cstdlib>
+#include <string>
 
 #include "third_party/fmt/include/fmt/format.h"
 #include "third_party/glslang/SPIRV/GLSL.std.450.h"
 #include "xenia/base/assert.h"
+#include "xenia/base/cvar.h"
+#include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/gpu/render_target_cache.h"
 #include "xenia/gpu/spirv_compatibility.h"
 
 DECLARE_bool(spirv_fine_derivatives);
+DECLARE_string(shader_texture_fetch_zero);
+DECLARE_bool(texture_fetch_offsets_at_lod);
 
 namespace xe {
 namespace gpu {
@@ -564,6 +570,39 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
   BisectSnapshotAfterInstruction();
 }
 
+bool SpirvShaderTranslator::IsTextureFetchZeroed(
+    uint32_t fetch_constant) const {
+  const std::string& setting = cvars::shader_texture_fetch_zero;
+  if (setting.empty()) {
+    return false;
+  }
+  // Parsed per fetch instruction, which is only at translation, and the list
+  // is a few entries.
+  const uint64_t hash = current_shader().ucode_data_hash();
+  size_t entry_start = 0;
+  while (entry_start <= setting.size()) {
+    size_t entry_end = setting.find(',', entry_start);
+    if (entry_end == std::string::npos) {
+      entry_end = setting.size();
+    }
+    std::string entry = setting.substr(entry_start, entry_end - entry_start);
+    entry_start = entry_end + 1;
+    size_t colon = entry.find(':');
+    char* hash_end = nullptr;
+    uint64_t entry_hash =
+        std::strtoull(entry.substr(0, colon).c_str(), &hash_end, 16);
+    if (hash_end == nullptr || entry_hash != hash) {
+      continue;
+    }
+    if (colon == std::string::npos ||
+        uint32_t(std::strtoul(entry.c_str() + colon + 1, nullptr, 10)) ==
+            fetch_constant) {
+      return true;
+    }
+  }
+  return false;
+}
+
 void SpirvShaderTranslator::ProcessTextureFetchInstruction(
     const ParsedTextureFetchInstruction& instr) {
   if (BisectSkipsInstruction()) {
@@ -602,6 +641,19 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
   uint32_t used_result_nonzero_components = instr.GetNonZeroResultComponents();
   switch (instr.opcode) {
     case ucode::FetchOpcode::kTextureFetch:
+      if (IsTextureFetchZeroed(instr.operands[1].storage_index)) {
+        if (!texture_fetch_zero_logged_) {
+          texture_fetch_zero_logged_ = true;
+          XELOGI(
+              "Shader {:016X}: texture fetches from tf{} return 0 "
+              "(shader_texture_fetch_zero)",
+              current_shader().ucode_data_hash(),
+              instr.operands[1].storage_index);
+        }
+        // Stored as constant zeros below, like a fetch with no non-zero
+        // result components.
+        used_result_nonzero_components = 0;
+      }
       break;
     case ucode::FetchOpcode::kGetTextureBorderColorFrac:
       // Cube maps don't use the border.
@@ -859,7 +911,10 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
     // Xenos, they can't be passed directly as ConstOffset to the image sample
     // instruction (plus-minus 0.5 offsets are very common in games). But
     // offsetting at mip levels is a rare usage case, mostly offsets are used
-    // for things like shadow maps and blur, where there are no mips.
+    // for things like shadow maps and blur, where there are no mips. Applied
+    // at the sampled level for 2D fetches with an explicit LOD and point mip
+    // filtering (texture_fetch_offsets_at_lod), as depth pyramid builders need.
+    // Computed LODs and linear mip filtering still use LOD 0.
     float offset_values[3] = {};
     // MSDN doesn't list offsets as getCompTexLOD parameters.
     if (instr.opcode != ucode::FetchOpcode::kGetTextureComputedLod) {
@@ -1418,6 +1473,77 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
       // without the loss of precision caused by normalization.
       spv::Id coordinate_x_original = coordinates[0];
 
+      // Offsets are in texels of the mip being sampled. With an explicit LOD
+      // and point mip filtering that's a single level known here, so divide
+      // the offset by that level's size rather than the base's. Depth pyramid
+      // reducers that build each level from 2x2 texels of the previous one
+      // with OffsetX/Y of 0.5 and 1.5 (4D5308D6) otherwise read one texel
+      // from the second reduction on, and their visibility tests then hide
+      // geometry next to nearer surfaces.
+      spv::Id offset_level_scale = spv::NoResult;
+      if (cvars::texture_fetch_offsets_at_lod &&
+          !instr.attributes.unnormalized_coordinates &&
+          instr.dimension == xenos::FetchOpDimension::k2D &&
+          (offset_values[0] || offset_values[1]) && !use_computed_lod &&
+          instr.attributes.mip_filter == xenos::TextureFilter::kPoint) {
+        id_vector_temp_.clear();
+        id_vector_temp_.push_back(const_int_0_);
+        id_vector_temp_.push_back(builder_->makeIntConstant(
+            int((fetch_constant_word_0_index + 4) >> 2)));
+        id_vector_temp_.push_back(builder_->makeIntConstant(
+            int((fetch_constant_word_0_index + 4) & 3)));
+        spv::Id offset_word_4 =
+            builder_->createLoad(builder_->createAccessChain(
+                                     spv::StorageClassUniform,
+                                     uniform_fetch_constants_, id_vector_temp_),
+                                 spv::NoPrecision);
+        // The same LOD sum as for sampling: fetch constant, register and
+        // instruction LOD.
+        spv::Id offset_lod = builder_->createNoContractionBinOp(
+            spv::OpFMul, type_float_,
+            builder_->createUnaryOp(
+                spv::OpConvertSToF, type_float_,
+                builder_->createTriOp(
+                    spv::OpBitFieldSExtract, type_int_,
+                    builder_->createUnaryOp(spv::OpBitcast, type_int_,
+                                            offset_word_4),
+                    builder_->makeUintConstant(12),
+                    builder_->makeUintConstant(10))),
+            builder_->makeFloatConstant(1.0f / 32.0f));
+        if (instr.attributes.use_register_lod) {
+          offset_lod = builder_->createNoContractionBinOp(
+              spv::OpFAdd, type_float_,
+              builder_->createLoad(var_main_tfetch_lod_, spv::NoPrecision),
+              offset_lod);
+        }
+        if (instr.attributes.lod_bias) {
+          offset_lod = builder_->createNoContractionBinOp(
+              spv::OpFAdd, type_float_, offset_lod,
+              builder_->makeFloatConstant(instr.attributes.lod_bias));
+        }
+        // Point mip filtering takes the nearest level, within the fetch
+        // constant's mip range (MipMinLevel 2:5, MipMaxLevel 6:9 of word 4).
+        spv::Id offset_level = builder_->createUnaryBuiltinCall(
+            type_float_, ext_inst_glsl_std_450_, GLSLstd450Floor,
+            builder_->createNoContractionBinOp(
+                spv::OpFAdd, type_float_, offset_lod,
+                builder_->makeFloatConstant(0.5f)));
+        auto mip_bound = [&](uint32_t offset) {
+          return builder_->createUnaryOp(
+              spv::OpConvertUToF, type_float_,
+              builder_->createTriOp(spv::OpBitFieldUExtract, type_uint_,
+                                    offset_word_4,
+                                    builder_->makeUintConstant(offset),
+                                    builder_->makeUintConstant(4)));
+        };
+        offset_level = builder_->createTriBuiltinCall(
+            type_float_, ext_inst_glsl_std_450_, GLSLstd450NClamp, offset_level,
+            mip_bound(2), mip_bound(6));
+        offset_level_scale = builder_->createUnaryBuiltinCall(
+            type_float_, ext_inst_glsl_std_450_, GLSLstd450Exp2,
+            builder_->createUnaryOp(spv::OpFNegate, type_float_, offset_level));
+      }
+
       // Normalize the XY coordinates, and apply the offset. When the texture
       // is resolution-scaled, size has already been scaled up to host texels
       // above so dividing the offset by it yields a 1-host-texel step.
@@ -1456,9 +1582,21 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         } else {
           if (component_offset != spv::NoResult) {
             assert_true(size_component != spv::NoResult);
+            spv::Id offset_size = size_component;
+            if (offset_level_scale != spv::NoResult) {
+              // max(floor(size >> level), 1), like the host's mip sizes.
+              offset_size = builder_->createBinBuiltinCall(
+                  type_float_, ext_inst_glsl_std_450_, GLSLstd450FMax,
+                  builder_->createUnaryBuiltinCall(
+                      type_float_, ext_inst_glsl_std_450_, GLSLstd450Floor,
+                      builder_->createNoContractionBinOp(
+                          spv::OpFMul, type_float_, size_component,
+                          offset_level_scale)),
+                  const_float_1_);
+            }
             spv::Id component_offset_normalized =
                 builder_->createNoContractionBinOp(
-                    spv::OpFDiv, type_float_, component_offset, size_component);
+                    spv::OpFDiv, type_float_, component_offset, offset_size);
             coordinate_ref = builder_->createNoContractionBinOp(
                 spv::OpFAdd, type_float_, coordinate_ref,
                 component_offset_normalized);

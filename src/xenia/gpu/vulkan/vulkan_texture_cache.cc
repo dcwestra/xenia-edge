@@ -1226,6 +1226,8 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
                                                                bool load_base,
                                                                bool load_mips) {
   SCOPE_profile_cpu_f("gpu");
+  command_processor_.SetGpuPhase(
+      VulkanCommandProcessor::GpuPhase::kTextureLoad);
   VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
   TextureKey texture_key = vulkan_texture.key();
 

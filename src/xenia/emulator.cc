@@ -13,6 +13,11 @@
 
 #include <algorithm>
 #include <cstring>
+
+#if !XE_PLATFORM_WIN32
+#include <dlfcn.h>
+#endif
+
 #include "config.h"
 #include "third_party/fmt/include/fmt/format.h"
 #include "xenia/apu/audio_system.h"
@@ -1938,6 +1943,13 @@ bool Emulator::ExceptionCallback(Exception* ex) {
       uint64_t module_base = 0;
 #if XE_PLATFORM_WIN32 == 1
       module_base = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
+#else
+      // Resolves with "addr2line -fCe <binary> 0x<offset>" on Linux.
+      Dl_info dl_info;
+      if (dladdr(reinterpret_cast<const void*>(ex->pc()), &dl_info) &&
+          dl_info.dli_fbase) {
+        module_base = reinterpret_cast<uint64_t>(dl_info.dli_fbase);
+      }
 #endif
       uint64_t module_offset =
           (module_base && ex->pc() >= module_base) ? ex->pc() - module_base : 0;

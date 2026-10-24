@@ -396,6 +396,33 @@ TEST_CASE("Reset Event", "[event]") {
   REQUIRE(result == WaitResult::kSuccess);
 }
 
+TEST_CASE("Multi-object wait wakes on signal, not on a poll", "[event]") {
+  // A parked WaitAny has to be woken by the signal itself. The POSIX park
+  // only has a backstop timeout, well above the bound checked here, so a lost
+  // wake shows up as a slow return rather than passing silently.
+  for (int round = 0; round < 20; ++round) {
+    auto event_a = Event::CreateAutoResetEvent(false);
+    auto event_b = Event::CreateAutoResetEvent(false);
+    std::atomic<bool> waiting(false);
+    std::atomic<int64_t> woke_ns(0);
+    std::thread waiter([&] {
+      waiting = true;
+      auto res = WaitAny({event_a.get(), event_b.get()}, false);
+      REQUIRE(res.first == WaitResult::kSuccess);
+      REQUIRE(res.second == 1);
+      woke_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+    });
+    REQUIRE(spin_wait_for(1s, [&] { return waiting.load(); }));
+    // Let it get past its first check and park.
+    Sleep(5ms);
+    const int64_t set_ns =
+        std::chrono::steady_clock::now().time_since_epoch().count();
+    event_b->Set();
+    waiter.join();
+    REQUIRE(woke_ns.load() - set_ns < int64_t(50'000'000));
+  }
+}
+
 TEST_CASE("Wait on Multiple Events", "[event]") {
   auto events = std::array<std::unique_ptr<Event>, 4>{
       Event::CreateAutoResetEvent(false),

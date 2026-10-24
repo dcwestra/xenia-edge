@@ -32,6 +32,13 @@
 #include "xenia/ui/vulkan/vulkan_util.h"
 
 DECLARE_bool(vulkan_dynamic_rendering);
+DEFINE_bool(
+    vulkan_skip_unused_transfer_stencil_bits, true,
+    "Without VK_EXT_shader_stencil_export (on Nvidia, for instance), copying "
+    "depth between render targets rebuilds the stencil one bit per draw. Check "
+    "on the GPU which stencil bits the source actually holds, and skip the "
+    "draws of the others with conditional rendering.",
+    "GPU");
 
 namespace xe {
 namespace gpu {
@@ -349,13 +356,14 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
   VkDescriptorPoolSize edram_storage_buffer_descriptor_pool_size;
   edram_storage_buffer_descriptor_pool_size.type =
       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  edram_storage_buffer_descriptor_pool_size.descriptorCount = 1;
+  // The EDRAM buffer, and the stencil bit predicates.
+  edram_storage_buffer_descriptor_pool_size.descriptorCount = 2;
   VkDescriptorPoolCreateInfo edram_storage_buffer_descriptor_pool_create_info;
   edram_storage_buffer_descriptor_pool_create_info.sType =
       VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
   edram_storage_buffer_descriptor_pool_create_info.pNext = nullptr;
   edram_storage_buffer_descriptor_pool_create_info.flags = 0;
-  edram_storage_buffer_descriptor_pool_create_info.maxSets = 1;
+  edram_storage_buffer_descriptor_pool_create_info.maxSets = 2;
   edram_storage_buffer_descriptor_pool_create_info.poolSizeCount = 1;
   edram_storage_buffer_descriptor_pool_create_info.pPoolSizes =
       &edram_storage_buffer_descriptor_pool_size;
@@ -750,6 +758,50 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
       Shutdown();
       return false;
     }
+
+    // Stencil bit predicates, optional - the transfers draw every bit without.
+    if (!vulkan_device->extensions().ext_EXT_shader_stencil_export &&
+        vulkan_device->properties().conditionalRendering) {
+      if (ui::vulkan::util::CreateDedicatedAllocationBuffer(
+              vulkan_device,
+              kStencilBitPredicateSlots * kStencilBitPredicateSlotBytes,
+              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                  VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                  VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT,
+              ui::vulkan::util::MemoryPurpose::kDeviceLocal,
+              stencil_bit_predicate_buffer_,
+              stencil_bit_predicate_buffer_memory_)) {
+        VkDescriptorSetAllocateInfo predicate_descriptor_set_allocate_info =
+            edram_storage_buffer_descriptor_set_allocate_info;
+        VkDescriptorBufferInfo predicate_descriptor_buffer_info;
+        predicate_descriptor_buffer_info.buffer = stencil_bit_predicate_buffer_;
+        predicate_descriptor_buffer_info.offset = 0;
+        predicate_descriptor_buffer_info.range = VK_WHOLE_SIZE;
+        VkWriteDescriptorSet predicate_descriptor_write =
+            edram_storage_buffer_descriptor_write;
+        predicate_descriptor_write.pBufferInfo =
+            &predicate_descriptor_buffer_info;
+        if (dfn.vkAllocateDescriptorSets(
+                device, &predicate_descriptor_set_allocate_info,
+                &stencil_bit_predicate_descriptor_set_) == VK_SUCCESS) {
+          predicate_descriptor_write.dstSet =
+              stencil_bit_predicate_descriptor_set_;
+          dfn.vkUpdateDescriptorSets(device, 1, &predicate_descriptor_write, 0,
+                                     nullptr);
+        } else {
+          stencil_bit_predicate_descriptor_set_ = VK_NULL_HANDLE;
+        }
+      }
+      if (stencil_bit_predicate_descriptor_set_ == VK_NULL_HANDLE) {
+        XELOGW(
+            "VulkanRenderTargetCache: Failed to create the stencil bit "
+            "predicate buffer, depth transfers will draw every stencil bit");
+        ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
+                                               stencil_bit_predicate_buffer_);
+        ui::vulkan::util::DestroyAndNullHandle(
+            dfn.vkFreeMemory, device, stencil_bit_predicate_buffer_memory_);
+      }
+    }
   } else if (path_ == Path::kPixelShaderInterlock) {
     // Pixel (fragment) shader interlock.
 
@@ -940,6 +992,17 @@ void VulkanRenderTargetCache::Shutdown(bool from_destructor) {
       dfn.vkDestroyPipeline(device, dump_pipeline_pair.second, nullptr);
     }
   }
+  for (VkPipeline& pipeline : stencil_bit_predicate_pipelines_) {
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
+                                           pipeline);
+  }
+  stencil_bit_predicate_pipelines_tried_ = {};
+  // Freed with the EDRAM buffer descriptor pool.
+  stencil_bit_predicate_descriptor_set_ = VK_NULL_HANDLE;
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
+                                         stencil_bit_predicate_buffer_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
+                                         stencil_bit_predicate_buffer_memory_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
                                          dump_pipeline_layout_depth_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
@@ -1107,6 +1170,7 @@ bool VulkanRenderTargetCache::Resolve(
   const VkDevice device = vulkan_device->device();
   DeferredCommandBuffer& command_buffer =
       command_processor_.deferred_command_buffer();
+  command_processor_.SetGpuPhase(VulkanCommandProcessor::GpuPhase::kResolve);
 
   // Copy at 1x1 if all render targets owning the source are native.
   bool copy_native = false;
@@ -1202,9 +1266,13 @@ bool VulkanRenderTargetCache::Resolve(
           shared_memory.RequestRange(resolve_info.copy_dest_extent_start,
                                      resolve_info.copy_dest_extent_length);
       if (!copy_dest_committed) {
-        XELOGE(
-            "VulkanRenderTargetCache: Failed to obtain the resolve destination "
-            "memory region");
+        static uint32_t commit_failure_count = 0;
+        if (xe::is_pow2(++commit_failure_count)) {
+          XELOGE(
+              "VulkanRenderTargetCache: Failed to obtain the resolve "
+              "destination memory region ({} times so far)",
+              commit_failure_count);
+        }
       } else {
         // TODO(Triang3l): Switching between descriptors if exceeding
         // maxStorageBufferRange.
@@ -2862,6 +2930,8 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
   if (!has_transfers) {
     return;
   }
+  command_processor_.SetGpuPhase(
+      VulkanCommandProcessor::GpuPhase::kRenderTargetCopy);
 
   LogTransfers(render_target_count, render_targets, render_target_transfers,
                resolve_clear_needed ? resolve_clear_rectangle : nullptr);
@@ -3246,6 +3316,26 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
                                          : EdramTransferMode::kColorToColor;
             }
           }
+          if (!j) {
+            Transfer::Rectangle
+                stats_rectangles[Transfer::kMaxRectanglesWithCutout];
+            uint32_t stats_rectangle_count = transfer.GetRectangles(
+                dest_rt_key, stats_rectangles, resolve_clear_rectangle);
+            uint64_t stats_pixels = 0;
+            for (uint32_t k = 0; k < stats_rectangle_count; ++k) {
+              stats_pixels += uint64_t(stats_rectangles[k].width_pixels) *
+                              stats_rectangles[k].height_pixels;
+            }
+            size_t stats_kind = size_t(dest_rt_key.is_depth) * 2 +
+                                size_t(source_rt_key.is_depth);
+            ++transfer_stats_.count[stats_kind];
+            transfer_stats_.samples[stats_kind] +=
+                stats_pixels << uint32_t(dest_rt_key.msaa_samples);
+            if (dest_rt_key.is_depth) {
+              ++transfer_stats_.to_depth_by_msaa[std::min(
+                  uint32_t(dest_rt_key.msaa_samples), uint32_t(2))];
+            }
+          }
           current_transfer_invocations_.emplace_back(transfer,
                                                      new_transfer_shader_key);
           if (j) {
@@ -3257,12 +3347,54 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
       std::sort(current_transfer_invocations_.begin(),
                 current_transfer_invocations_.end());
 
+      // A predicate slot for each depth source of stencil bit draws.
+      stencil_bit_predicate_slots_.clear();
+      if (need_stencil_bit_draws &&
+          stencil_bit_predicate_descriptor_set_ != VK_NULL_HANDLE &&
+          cvars::vulkan_skip_unused_transfer_stencil_bits) {
+        for (const TransferInvocation& invocation :
+             current_transfer_invocations_) {
+          if (invocation.shader_key.mode !=
+              EdramTransferMode::kDepthToStencilBit) {
+            continue;
+          }
+          RenderTarget* source = invocation.transfer.source;
+          if (std::find_if(stencil_bit_predicate_slots_.cbegin(),
+                           stencil_bit_predicate_slots_.cend(),
+                           [source](const auto& source_slot) {
+                             return source_slot.first == source;
+                           }) != stencil_bit_predicate_slots_.cend() ||
+              GetStencilBitPredicatePipeline(
+                  GetHostSamplesLog2(source->key())) == VK_NULL_HANDLE) {
+            continue;
+          }
+          stencil_bit_predicate_slots_.emplace_back(source, 0);
+        }
+        uint32_t slot_count = uint32_t(stencil_bit_predicate_slots_.size());
+        if (slot_count > kStencilBitPredicateSlots) {
+          // Not expected - just draw every bit then.
+          stencil_bit_predicate_slots_.clear();
+        } else if (slot_count) {
+          if (stencil_bit_predicate_next_slot_ + slot_count >
+              kStencilBitPredicateSlots) {
+            stencil_bit_predicate_next_slot_ = 0;
+          }
+          for (auto& source_slot : stencil_bit_predicate_slots_) {
+            source_slot.second = stencil_bit_predicate_next_slot_++;
+          }
+        }
+      }
+      VkPipelineStageFlags source_stage_mask = kSourceStageMask;
+      if (!stencil_bit_predicate_slots_.empty()) {
+        source_stage_mask |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+      }
+
       for (auto it = current_transfer_invocations_.cbegin();
            it != current_transfer_invocations_.cend(); ++it) {
         assert_not_null(it->transfer.source);
         auto& source_vulkan_rt =
             *static_cast<VulkanRenderTarget*>(it->transfer.source);
-        TransitionRenderTarget(source_vulkan_rt, kSourceStageMask,
+        TransitionRenderTarget(source_vulkan_rt, source_stage_mask,
                                kSourceAccessMask, kSourceLayout);
         auto host_depth_source_vulkan_rt =
             static_cast<VulkanRenderTarget*>(it->transfer.host_depth_source);
@@ -3281,6 +3413,105 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
                                    kSourceLayout);
           }
         }
+      }
+
+      // Check which stencil bits the depth sources hold where transferred.
+      if (!stencil_bit_predicate_slots_.empty()) {
+        VkDeviceSize predicates_offset =
+            VkDeviceSize(stencil_bit_predicate_slots_.front().second) *
+            kStencilBitPredicateSlotBytes;
+        VkDeviceSize predicates_size =
+            VkDeviceSize(stencil_bit_predicate_slots_.size()) *
+            kStencilBitPredicateSlotBytes;
+        // Earlier transfers may still be checking or drawing with the slots.
+        command_processor_.PushBufferMemoryBarrier(
+            stencil_bit_predicate_buffer_, predicates_offset, predicates_size,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                VK_PIPELINE_STAGE_CONDITIONAL_RENDERING_BIT_EXT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                VK_ACCESS_CONDITIONAL_RENDERING_READ_BIT_EXT,
+            VK_ACCESS_TRANSFER_WRITE_BIT);
+        command_processor_.SubmitBarriers(true);
+        command_buffer.CmdVkFillBuffer(stencil_bit_predicate_buffer_,
+                                       predicates_offset, predicates_size, 0);
+        command_processor_.PushBufferMemoryBarrier(
+            stencil_bit_predicate_buffer_, predicates_offset, predicates_size,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        command_processor_.SubmitBarriers(true);
+        command_buffer.CmdVkBindDescriptorSets(
+            VK_PIPELINE_BIND_POINT_COMPUTE, dump_pipeline_layout_depth_,
+            kDumpDescriptorSetEdram, 1, &stencil_bit_predicate_descriptor_set_,
+            0, nullptr);
+        for (const auto& source_slot : stencil_bit_predicate_slots_) {
+          auto& source_vulkan_rt =
+              *static_cast<VulkanRenderTarget*>(source_slot.first);
+          RenderTargetKey source_rt_key = source_vulkan_rt.key();
+          command_processor_.BindExternalComputePipeline(
+              GetStencilBitPredicatePipeline(
+                  GetHostSamplesLog2(source_rt_key)));
+          VkDescriptorSet source_descriptor_set =
+              source_vulkan_rt.GetDescriptorSetTransferSource();
+          command_buffer.CmdVkBindDescriptorSets(
+              VK_PIPELINE_BIND_POINT_COMPUTE, dump_pipeline_layout_depth_,
+              kDumpDescriptorSetSource, 1, &source_descriptor_set, 0, nullptr);
+          uint32_t source_scale_x = GetKeyScaleX(source_rt_key);
+          uint32_t source_scale_y = GetKeyScaleY(source_rt_key);
+          // Origin, size, index of the predicate of the lowest bit.
+          uint32_t constants[3];
+          constants[2] = source_slot.second * 8;
+          for (const TransferInvocation& invocation :
+               current_transfer_invocations_) {
+            if (invocation.transfer.source != source_slot.first ||
+                invocation.shader_key.mode !=
+                    EdramTransferMode::kDepthToStencilBit) {
+              continue;
+            }
+            // The area in the source, split where EDRAM addressing wraps
+            // around relative to the source.
+            uint32_t range_start = invocation.transfer.start_tiles;
+            uint32_t range_end = invocation.transfer.end_tiles;
+            uint32_t source_base = source_rt_key.base_tiles;
+            uint32_t ranges[2][2] = {{range_start, range_end}, {0, 0}};
+            if (range_start < source_base && range_end > source_base) {
+              ranges[0][1] = source_base;
+              ranges[1][0] = source_base;
+              ranges[1][1] = range_end;
+            }
+            for (const auto& range : ranges) {
+              Transfer::Rectangle
+                  source_rectangles[Transfer::kMaxRectanglesWithCutout];
+              uint32_t source_rectangle_count = Transfer::GetRangeRectangles(
+                  range[0], range[1], source_rt_key, source_rectangles);
+              for (uint32_t k = 0; k < source_rectangle_count; ++k) {
+                const Transfer::Rectangle& rectangle = source_rectangles[k];
+                uint32_t width = rectangle.width_pixels * source_scale_x;
+                uint32_t height = rectangle.height_pixels * source_scale_y;
+                if (!width || !height) {
+                  continue;
+                }
+                constants[0] = rectangle.x_pixels * source_scale_x |
+                               (rectangle.y_pixels * source_scale_y) << 16;
+                constants[1] = width | height << 16;
+                command_buffer.CmdVkPushConstants(
+                    dump_pipeline_layout_depth_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                    sizeof(constants), constants);
+                command_buffer.CmdVkDispatch((width + 7) / 8, (height + 7) / 8,
+                                             1);
+              }
+            }
+          }
+        }
+        command_processor_.PushBufferMemoryBarrier(
+            stencil_bit_predicate_buffer_, predicates_offset, predicates_size,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_CONDITIONAL_RENDERING_BIT_EXT,
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+            VK_ACCESS_CONDITIONAL_RENDERING_READ_BIT_EXT);
+        transfer_stats_.stencil_bit_checks +=
+            stencil_bit_predicate_slots_.size();
       }
 
       // Perform the transfers for the render target.
@@ -3394,6 +3625,17 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
         bool transfer_is_stencil_bit =
             (transfer_pipeline_layout_info.used_push_constant_dwords &
              kEdramTransferUsedPushConstantDwordStencilMaskBit) != 0;
+        // Set if the GPU has checked which bits the source holds.
+        VkDeviceSize stencil_bit_predicates_offset = VK_WHOLE_SIZE;
+        if (transfer_is_stencil_bit) {
+          for (const auto& source_slot : stencil_bit_predicate_slots_) {
+            if (source_slot.first == it->transfer.source) {
+              stencil_bit_predicates_offset = VkDeviceSize(source_slot.second) *
+                                              kStencilBitPredicateSlotBytes;
+              break;
+            }
+          }
+        }
 
         uint32_t transfer_vertex_count = 6 * transfer_rectangle_count;
         VkBuffer transfer_vertex_buffer;
@@ -3652,7 +3894,17 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
               command_buffer.CmdVkSetStencilWriteMask(
                   VK_STENCIL_FACE_FRONT_AND_BACK, transfer_stencil_bit);
             }
+            bool draw_predicated =
+                stencil_bit_predicates_offset != VK_WHOLE_SIZE;
+            if (draw_predicated) {
+              command_buffer.CmdVkBeginConditionalRenderingEXT(
+                  stencil_bit_predicate_buffer_,
+                  stencil_bit_predicates_offset + sizeof(uint32_t) * k, 0);
+            }
             command_buffer.CmdVkDraw(transfer_vertex_count, 1, 0, 0);
+            if (draw_predicated) {
+              command_buffer.CmdVkEndConditionalRenderingEXT();
+            }
           }
         }
       }
@@ -3768,6 +4020,273 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
   }
 
   command_processor_.PopDebugMarker();
+}
+
+namespace {
+
+// ORs the stencil of a depth render target over a rectangle into one predicate
+// per stencil bit at predicates[first + bit], nonzero if any sample there has
+// that bit. One thread per pixel, 8x8 pixels per group.
+std::vector<uint32_t> BuildStencilBitPredicateShader(
+    unsigned int spirv_version, uint32_t host_samples_log2,
+    uint32_t descriptor_set_predicates, uint32_t descriptor_set_source) {
+  SpirvBuilder builder(spirv_version,
+                       (SpirvShaderTranslator::kSpirvMagicToolId << 16) | 1,
+                       nullptr);
+  builder.addCapability(spv::CapabilityShader);
+  builder.setMemoryModel(spv::AddressingModelLogical, spv::MemoryModelGLSL450);
+  builder.setSource(spv::SourceLanguageUnknown, 0);
+
+  spv::Id type_void = builder.makeVoidType();
+  spv::Id type_bool = builder.makeBoolType();
+  spv::Id type_int = builder.makeIntType(32);
+  spv::Id type_int2 = builder.makeVectorType(type_int, 2);
+  spv::Id type_uint = builder.makeUintType(32);
+  spv::Id type_uint3 = builder.makeVectorType(type_uint, 3);
+  spv::Id type_uint4 = builder.makeVectorType(type_uint, 4);
+  std::vector<spv::Id> id_vector_temp;
+
+  // Predicates, set atomically.
+  id_vector_temp.push_back(builder.makeRuntimeArray(type_uint));
+  builder.addDecoration(id_vector_temp.back(), spv::DecorationArrayStride,
+                        sizeof(uint32_t));
+  spv::Id type_predicates =
+      builder.makeStructType(id_vector_temp, "XeStencilBitPredicates");
+  builder.addMemberName(type_predicates, 0, "predicates");
+  builder.addMemberDecoration(type_predicates, 0, spv::DecorationOffset, 0);
+  // BufferBlock and Uniform rather than Block and StorageBuffer, valid since
+  // SPIR-V 1.0, like the EDRAM dump shaders.
+  builder.addDecoration(type_predicates, spv::DecorationBufferBlock);
+  spv::Id predicates =
+      builder.createVariable(spv::NoPrecision, spv::StorageClassUniform,
+                             type_predicates, "xe_stencil_bit_predicates");
+  builder.addDecoration(predicates, spv::DecorationDescriptorSet,
+                        int(descriptor_set_predicates));
+  builder.addDecoration(predicates, spv::DecorationBinding, 0);
+  // The stencil view of the source, binding 1 after the depth one.
+  bool multisampled = host_samples_log2 != 0;
+  spv::Id source = builder.createVariable(
+      spv::NoPrecision, spv::StorageClassUniformConstant,
+      builder.makeImageType(type_uint, spv::Dim2D, false, false, multisampled,
+                            1, spv::ImageFormatUnknown),
+      "xe_stencil_bit_predicate_source");
+  builder.addDecoration(source, spv::DecorationDescriptorSet,
+                        int(descriptor_set_source));
+  builder.addDecoration(source, spv::DecorationBinding, 1);
+  // Push constants - the rectangle origin and size in host pixels as X | Y <<
+  // 16, and the index of the predicate of the lowest bit.
+  static const char* const kPushConstantNames[] = {"origin", "size", "first"};
+  id_vector_temp.assign(xe::countof(kPushConstantNames), type_uint);
+  spv::Id type_push_constants =
+      builder.makeStructType(id_vector_temp, "XeStencilBitPredicateConstants");
+  for (uint32_t i = 0; i < xe::countof(kPushConstantNames); ++i) {
+    builder.addMemberName(type_push_constants, i, kPushConstantNames[i]);
+    builder.addMemberDecoration(type_push_constants, i, spv::DecorationOffset,
+                                int(sizeof(uint32_t) * i));
+  }
+  builder.addDecoration(type_push_constants, spv::DecorationBlock);
+  spv::Id push_constants = builder.createVariable(
+      spv::NoPrecision, spv::StorageClassPushConstant, type_push_constants,
+      "xe_stencil_bit_predicate_constants");
+  spv::Id input_global_invocation_id =
+      builder.createVariable(spv::NoPrecision, spv::StorageClassInput,
+                             type_uint3, "gl_GlobalInvocationID");
+  builder.addDecoration(input_global_invocation_id, spv::DecorationBuiltIn,
+                        int(spv::BuiltIn::GlobalInvocationId));
+  spv::Id input_local_invocation_index =
+      builder.createVariable(spv::NoPrecision, spv::StorageClassInput,
+                             type_uint, "gl_LocalInvocationIndex");
+  builder.addDecoration(input_local_invocation_index, spv::DecorationBuiltIn,
+                        int(spv::BuiltIn::LocalInvocationIndex));
+  // The bits of the whole group, so only one thread per group touches the
+  // predicates.
+  spv::Id group_bits =
+      builder.createVariable(spv::NoPrecision, spv::StorageClass::Workgroup,
+                             type_uint, "xe_group_bits");
+
+  std::vector<spv::Id> main_param_types;
+  std::vector<std::vector<spv::Decoration>> main_precisions;
+  spv::Block* main_entry;
+  spv::Function* main_function =
+      builder.makeFunctionEntry(spv::NoPrecision, type_void, "main",
+                                main_param_types, main_precisions, &main_entry);
+
+  spv::Id const_uint_0 = builder.makeUintConstant(0);
+  auto load_push_constant = [&](int index) {
+    id_vector_temp.assign(1, builder.makeIntConstant(index));
+    return builder.createLoad(
+        builder.createAccessChain(spv::StorageClassPushConstant, push_constants,
+                                  id_vector_temp),
+        spv::NoPrecision);
+  };
+  auto atomic_or = [&](spv::Id pointer, spv::Scope scope, spv::Id value) {
+    id_vector_temp.clear();
+    id_vector_temp.push_back(pointer);
+    id_vector_temp.push_back(builder.makeUintConstant(uint32_t(scope)));
+    id_vector_temp.push_back(
+        builder.makeUintConstant(uint32_t(spv::MemorySemanticsMask::MaskNone)));
+    id_vector_temp.push_back(value);
+    builder.createOp(spv::OpAtomicOr, type_uint, id_vector_temp);
+  };
+  auto group_barrier = [&]() {
+    builder.createControlBarrier(spv::Scope::Workgroup, spv::Scope::Workgroup,
+                                 spv::MemorySemanticsMask::AcquireRelease |
+                                     spv::MemorySemanticsMask::WorkgroupMemory);
+  };
+
+  spv::Id is_first_in_group = builder.createBinOp(
+      spv::OpIEqual, type_bool,
+      builder.createLoad(input_local_invocation_index, spv::NoPrecision),
+      const_uint_0);
+  {
+    SpirvBuilder::IfBuilder if_first(is_first_in_group,
+                                     spv::SelectionControlMaskNone, builder);
+    builder.createStore(const_uint_0, group_bits);
+    if_first.makeEndIf();
+  }
+  group_barrier();
+
+  spv::Id global_invocation_id =
+      builder.createLoad(input_global_invocation_id, spv::NoPrecision);
+  spv::Id pixel_x =
+      builder.createCompositeExtract(global_invocation_id, type_uint, 0);
+  spv::Id pixel_y =
+      builder.createCompositeExtract(global_invocation_id, type_uint, 1);
+  spv::Id size = load_push_constant(1);
+  spv::Id const_uint_16 = builder.makeUintConstant(16);
+  spv::Id const_uint_0xffff = builder.makeUintConstant(0xFFFF);
+  spv::Id in_rectangle = builder.createBinOp(
+      spv::OpLogicalAnd, type_bool,
+      builder.createBinOp(spv::OpULessThan, type_bool, pixel_x,
+                          builder.createBinOp(spv::OpBitwiseAnd, type_uint,
+                                              size, const_uint_0xffff)),
+      builder.createBinOp(spv::OpULessThan, type_bool, pixel_y,
+                          builder.createBinOp(spv::OpShiftRightLogical,
+                                              type_uint, size, const_uint_16)));
+  {
+    SpirvBuilder::IfBuilder if_in_rectangle(
+        in_rectangle, spv::SelectionControlMaskNone, builder);
+    spv::Id origin = load_push_constant(0);
+    id_vector_temp.clear();
+    id_vector_temp.push_back(builder.createUnaryOp(
+        spv::OpBitcast, type_int,
+        builder.createBinOp(spv::OpIAdd, type_uint, pixel_x,
+                            builder.createBinOp(spv::OpBitwiseAnd, type_uint,
+                                                origin, const_uint_0xffff))));
+    id_vector_temp.push_back(builder.createUnaryOp(
+        spv::OpBitcast, type_int,
+        builder.createBinOp(
+            spv::OpIAdd, type_uint, pixel_y,
+            builder.createBinOp(spv::OpShiftRightLogical, type_uint, origin,
+                                const_uint_16))));
+    spv::Builder::TextureParameters texture_parameters = {};
+    texture_parameters.coords =
+        builder.createCompositeConstruct(type_int2, id_vector_temp);
+    if (!multisampled) {
+      texture_parameters.lod = builder.makeIntConstant(0);
+    }
+    // Every host sample, which with 2x emulated as 4x includes unused ones -
+    // that only makes the check more conservative.
+    spv::Id bits = spv::NoResult;
+    for (uint32_t i = 0; i < (uint32_t(1) << host_samples_log2); ++i) {
+      texture_parameters.sampler = builder.createLoad(source, spv::NoPrecision);
+      if (multisampled) {
+        texture_parameters.sample = builder.makeIntConstant(int(i));
+      }
+      spv::Id sample_stencil = builder.createCompositeExtract(
+          builder.createTextureCall(spv::NoPrecision, type_uint4, false, true,
+                                    false, false, false, texture_parameters,
+                                    spv::ImageOperandsMaskNone),
+          type_uint, 0);
+      bits = bits != spv::NoResult
+                 ? builder.createBinOp(spv::OpBitwiseOr, type_uint, bits,
+                                       sample_stencil)
+                 : sample_stencil;
+    }
+    bits = builder.createBinOp(spv::OpBitwiseAnd, type_uint, bits,
+                               builder.makeUintConstant(0xFF));
+    {
+      SpirvBuilder::IfBuilder if_any_bits(
+          builder.createBinOp(spv::OpINotEqual, type_bool, bits, const_uint_0),
+          spv::SelectionControlMaskNone, builder);
+      atomic_or(group_bits, spv::Scope::Workgroup, bits);
+      if_any_bits.makeEndIf();
+    }
+    if_in_rectangle.makeEndIf();
+  }
+  group_barrier();
+
+  {
+    SpirvBuilder::IfBuilder if_first(is_first_in_group,
+                                     spv::SelectionControlMaskNone, builder);
+    spv::Id group_bits_value = builder.createLoad(group_bits, spv::NoPrecision);
+    spv::Id first = load_push_constant(2);
+    spv::Id const_uint_1 = builder.makeUintConstant(1);
+    for (uint32_t i = 0; i < 8; ++i) {
+      SpirvBuilder::IfBuilder if_bit(
+          builder.createBinOp(
+              spv::OpINotEqual, type_bool,
+              builder.createBinOp(spv::OpBitwiseAnd, type_uint,
+                                  group_bits_value,
+                                  builder.makeUintConstant(uint32_t(1) << i)),
+              const_uint_0),
+          spv::SelectionControlMaskNone, builder);
+      id_vector_temp.clear();
+      // The only buffer structure member.
+      id_vector_temp.push_back(builder.makeIntConstant(0));
+      id_vector_temp.push_back(builder.createBinOp(
+          spv::OpIAdd, type_uint, first, builder.makeUintConstant(i)));
+      atomic_or(builder.createAccessChain(spv::StorageClassUniform, predicates,
+                                          id_vector_temp),
+                spv::Scope::Device, const_uint_1);
+      if_bit.makeEndIf();
+    }
+    if_first.makeEndIf();
+  }
+
+  builder.leaveFunction();
+  builder.addExecutionMode(main_function, spv::ExecutionModeLocalSize, 8, 8, 1);
+  spv::Instruction* entry_point = builder.addEntryPoint(
+      spv::ExecutionModelGLCompute, main_function, "main");
+  entry_point->addIdOperand(input_global_invocation_id);
+  entry_point->addIdOperand(input_local_invocation_index);
+  if (spirv_version >= spv::Spv_1_4) {
+    // Since SPIR-V 1.4, the interface lists every global the entry point uses.
+    entry_point->addIdOperand(predicates);
+    entry_point->addIdOperand(source);
+    entry_point->addIdOperand(push_constants);
+    entry_point->addIdOperand(group_bits);
+  }
+
+  std::vector<unsigned int> shader_code;
+  builder.dump(shader_code);
+  return std::vector<uint32_t>(shader_code.begin(), shader_code.end());
+}
+
+}  // namespace
+
+VkPipeline VulkanRenderTargetCache::GetStencilBitPredicatePipeline(
+    uint32_t host_samples_log2) {
+  assert_true(host_samples_log2 < stencil_bit_predicate_pipelines_.size());
+  if (stencil_bit_predicate_pipelines_tried_[host_samples_log2]) {
+    return stencil_bit_predicate_pipelines_[host_samples_log2];
+  }
+  stencil_bit_predicate_pipelines_tried_[host_samples_log2] = true;
+  std::vector<uint32_t> shader_code = BuildStencilBitPredicateShader(
+      spirv_version_, host_samples_log2, kDumpDescriptorSetEdram,
+      kDumpDescriptorSetSource);
+  VkPipeline pipeline = ui::vulkan::util::CreateComputePipeline(
+      command_processor_.GetVulkanDevice(), dump_pipeline_layout_depth_,
+      shader_code.data(), sizeof(uint32_t) * shader_code.size());
+  if (pipeline == VK_NULL_HANDLE) {
+    XELOGE(
+        "VulkanRenderTargetCache: Failed to create the stencil bit predicate "
+        "pipeline for {} host samples, depth transfers from them will draw "
+        "every stencil bit",
+        uint32_t(1) << host_samples_log2);
+  }
+  stencil_bit_predicate_pipelines_[host_samples_log2] = pipeline;
+  return pipeline;
 }
 
 VkPipeline VulkanRenderTargetCache::GetDumpPipeline(EdramDumpShaderKey key) {

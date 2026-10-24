@@ -24,6 +24,13 @@ DECLARE_bool(gpu_allow_invalid_upload_range);
 DECLARE_bool(enable_host_buffer);
 DECLARE_bool(shared_memory_zero_copy);
 
+DEFINE_bool(
+    vulkan_hoist_shared_memory_uploads, true,
+    "Copy guest memory the GPU needs to the start of the submission when "
+    "nothing earlier in the submission used those pages, instead of ending "
+    "the render pass and draining the pipeline for each upload in mid-frame. "
+    "Turn off if a title shows stale geometry or textures.",
+    "Vulkan");
 DEFINE_bool(vulkan_sparse_shared_memory, true,
             "Enable sparse binding for shared memory emulation. Disabling it "
             "increases video memory usage - a 512 MB buffer is created - but "
@@ -220,6 +227,10 @@ bool VulkanSharedMemory::Initialize() {
   // readback on the device-local path, so their output stays coherent with the
   // CPU.
   TryInitializeHostBuffer();
+
+  if (cvars::vulkan_hoist_shared_memory_uploads) {
+    EnableSubmissionPageUse();
+  }
 
   return true;
 }
@@ -585,9 +596,27 @@ bool VulkanSharedMemory::AllocateSparseHostGpuMemoryRange(
       length_allocations << host_gpu_memory_sparse_granularity_log2();
   memory_allocate_info.memoryTypeIndex = buffer_memory_type_;
   VkDeviceMemory memory;
-  if (dfn.vkAllocateMemory(device, &memory_allocate_info, nullptr, &memory) !=
-      VK_SUCCESS) {
-    XELOGE("Shared memory: Failed to allocate sparse buffer memory");
+  const VkResult allocate_result =
+      dfn.vkAllocateMemory(device, &memory_allocate_info, nullptr, &memory);
+  if (allocate_result != VK_SUCCESS) {
+    // Retried for every draw touching the range, so unthrottled this logged
+    // millions of lines, its own drag on a title already short of memory.
+    static uint32_t failure_count = 0;
+    if (++failure_count == 1 &&
+        allocate_result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+      XELOGE(
+          "Shared memory: The GPU is out of video memory. Draws reading guest "
+          "memory that couldn't be placed are dropped, which shows as missing "
+          "or black geometry. Linux GPU drivers don't spill video memory into "
+          "system RAM the way Windows does, so lower draw_resolution_scale_x "
+          "and draw_resolution_scale_y, or close other GPU-heavy programs.");
+    }
+    if (xe::is_pow2(failure_count)) {
+      XELOGE(
+          "Shared memory: Failed to allocate sparse buffer memory ({}), {} "
+          "times so far",
+          int(allocate_result), failure_count);
+    }
     return false;
   }
   buffer_memory_.push_back(memory);
@@ -652,31 +681,51 @@ bool VulkanSharedMemory::UploadRanges(
   }
   upload_page_ranges = cpu_upload_ranges_.data();
   num_upload_ranges = uint32_t(cpu_upload_ranges_.size());
+  ++upload_batches_;
+  for (uint32_t i = 0; i < num_upload_ranges; ++i) {
+    upload_bytes_ += uint64_t(upload_page_ranges[i].second) << page_size_log2();
+  }
 
   auto& range_front = upload_page_ranges[0];
   auto& range_back = upload_page_ranges[num_upload_ranges - 1];
 
-  // upload_page_ranges are sorted, use them to determine the range for the
-  // ordering barrier.
-  Use(Usage::kTransferDestination,
-      std::make_pair(range_front.first << page_size_log2(),
-                     (range_back.first + range_back.second - range_front.first)
-                         << page_size_log2()));
-  // Submit barriers (may end render pass) before pushing debug marker so
-  // EndRenderPass is not inside the SharedMem Upload marker.
-  command_processor_.SubmitBarriers(true);
+  // Pages nothing earlier in the submission used can be copied in its
+  // prologue, ahead of all of it, which no earlier command can tell apart.
+  // Otherwise the copy goes in order, ending the render pass to do so.
+  bool hoist = cvars::vulkan_hoist_shared_memory_uploads;
+  for (uint32_t i = 0; hoist && i < num_upload_ranges; ++i) {
+    hoist = !AnyPageUsedInSubmission(
+        upload_page_ranges[i].first,
+        upload_page_ranges[i].first + upload_page_ranges[i].second - 1);
+  }
+  if (hoist) {
+    ++hoisted_upload_batches_;
+  } else {
+    command_processor_.SetGpuPhase(VulkanCommandProcessor::GpuPhase::kUpload);
+    // upload_page_ranges are sorted, use them to determine the range for the
+    // ordering barrier.
+    Use(Usage::kTransferDestination,
+        std::make_pair(
+            range_front.first << page_size_log2(),
+            (range_back.first + range_back.second - range_front.first)
+                << page_size_log2()));
+    // Submit barriers (may end render pass) before pushing debug marker so
+    // EndRenderPass is not inside the SharedMem Upload marker.
+    command_processor_.SubmitBarriers(true);
 
-  // Calculate total upload size for debug marker.
-  uint32_t total_upload_bytes =
-      (range_back.first + range_back.second - range_front.first)
-      << page_size_log2();
-  command_processor_.PushDebugMarker(
-      "UploadRanges (SharedMem): 0x%08X-0x%08X (%u KB, %u ranges)",
-      range_front.first << page_size_log2(),
-      (range_back.first + range_back.second) << page_size_log2(),
-      total_upload_bytes / 1024, num_upload_ranges);
+    // Calculate total upload size for debug marker.
+    uint32_t total_upload_bytes =
+        (range_back.first + range_back.second - range_front.first)
+        << page_size_log2();
+    command_processor_.PushDebugMarker(
+        "UploadRanges (SharedMem): 0x%08X-0x%08X (%u KB, %u ranges)",
+        range_front.first << page_size_log2(),
+        (range_back.first + range_back.second) << page_size_log2(),
+        total_upload_bytes / 1024, num_upload_ranges);
+  }
   DeferredCommandBuffer& command_buffer =
-      command_processor_.deferred_command_buffer();
+      hoist ? command_processor_.deferred_upload_command_buffer()
+            : command_processor_.deferred_command_buffer();
   uint64_t submission_current = command_processor_.GetCurrentSubmission();
   bool successful = true;
   upload_regions_.clear();
@@ -768,7 +817,9 @@ bool VulkanSharedMemory::UploadRanges(
                                    upload_regions_.data());
     upload_regions_.clear();
   }
-  command_processor_.PopDebugMarker();
+  if (!hoist) {
+    command_processor_.PopDebugMarker();
+  }
   return successful;
 }
 

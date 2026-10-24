@@ -32,6 +32,7 @@ class DeferredCommandBuffer {
 
   void Reset();
   void Execute(VkCommandBuffer command_buffer);
+  bool empty() const { return command_stream_.empty(); }
 
   // render_pass_begin->pNext must be null.
   void CmdVkBeginRenderPass(
@@ -195,6 +196,15 @@ class DeferredCommandBuffer {
 
   void CmdVkEndConditionalRenderingEXT() {
     WriteCommand(Command::kVkEndConditionalRenderingEXT, 0);
+  }
+
+  void CmdVkWriteTimestamp(VkPipelineStageFlagBits pipeline_stage,
+                           VkQueryPool query_pool, uint32_t query) {
+    auto& args = *reinterpret_cast<ArgsVkWriteTimestamp*>(
+        WriteCommand(Command::kVkWriteTimestamp, sizeof(ArgsVkWriteTimestamp)));
+    args.pipeline_stage = pipeline_stage;
+    args.query_pool = query_pool;
+    args.query = query;
   }
 
   void CmdVkResetQueryPool(VkQueryPool query_pool, uint32_t first_query,
@@ -541,6 +551,7 @@ class DeferredCommandBuffer {
     kVkEndQuery,
     kVkCopyQueryPoolResults,
     kVkResetQueryPool,
+    kVkWriteTimestamp,
     kVkBeginConditionalRenderingEXT,
     kVkEndConditionalRenderingEXT,
     kVkClearAttachments,
@@ -668,6 +679,12 @@ class DeferredCommandBuffer {
     VkQueryPool query_pool;
     uint32_t first_query;
     uint32_t query_count;
+  };
+
+  struct ArgsVkWriteTimestamp {
+    VkPipelineStageFlagBits pipeline_stage;
+    VkQueryPool query_pool;
+    uint32_t query;
   };
 
   struct ArgsVkClearAttachments {

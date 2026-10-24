@@ -9,13 +9,44 @@
 
 #include "xenia/gpu/shared_memory.h"
 
+#include <cstdlib>
+
 #include "xenia/base/assert.h"
 #include "xenia/base/bit_range.h"
+#include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/profiling.h"
 
+DEFINE_string(
+    log_shared_memory_range, "",
+    "Physical address range in hex as <first>-<end>, such as "
+    "1FAB0000-1FAB6000. CPU writes invalidating it, and the GPU uploading or "
+    "reusing it, are logged with the frame, to tell whether a buffer a game "
+    "rewrites every frame is read before or after the CPU writes it.",
+    "GPU");
+
 namespace xe {
 namespace gpu {
+
+void SharedMemory::UpdateLoggedRange() {
+  if (cvars::log_shared_memory_range == logged_range_string_) {
+    return;
+  }
+  logged_range_string_ = cvars::log_shared_memory_range;
+  uint32_t first = 0, end = 0;
+  const char* text = logged_range_string_.c_str();
+  char* dash = nullptr;
+  first = uint32_t(std::strtoul(text, &dash, 16));
+  if (dash && *dash == '-') {
+    end = uint32_t(std::strtoul(dash + 1, nullptr, 16));
+  }
+  logged_range_first_.store(first, std::memory_order_relaxed);
+  logged_range_end_.store(end, std::memory_order_relaxed);
+  logged_range_reuse_frames_.clear();
+  if (end > first) {
+    XELOGI("log_shared_memory_range: logging {:08X}-{:08X}", first, end);
+  }
+}
 
 SharedMemory::SharedMemory(Memory& memory) : memory_(memory) {
   page_size_log2_ = xe::log2_ceil(uint32_t(xe::memory::page_size()));
@@ -147,6 +178,19 @@ void SharedMemory::ClearCache() {
 void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
   auto global_lock = global_critical_region_.Acquire();
 
+  // Valid pages in log_shared_memory_range before the refresh below.
+  const uint32_t logged_first =
+      logged_range_first_.load(std::memory_order_relaxed);
+  const uint32_t logged_end = logged_range_end_.load(std::memory_order_relaxed);
+  uint32_t logged_valid_before = 0;
+  if (logged_end > logged_first && gpu_written_data_dirty_) [[unlikely]] {
+    for (uint32_t page = logged_first >> page_size_log2_;
+         page < ((logged_end - 1) >> page_size_log2_) + 1; ++page) {
+      logged_valid_before +=
+          uint32_t(system_page_flags_valid_[page >> 6] >> (page & 63)) & 1;
+    }
+  }
+
   if (gpu_written_data_dirty_) {
     // Only copy the chunks that changed. Read and reset the dirty bitmap.
     uint32_t dirty_mask = dirty_blocks_;
@@ -172,6 +216,21 @@ void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
         std::memcpy(&system_page_flags_valid_[entry_offset],
                     &system_page_flags_valid_and_gpu_written_[entry_offset],
                     64 * sizeof(uint64_t));
+      }
+    }
+
+    if (logged_end > logged_first) [[unlikely]] {
+      uint32_t logged_valid_after = 0;
+      for (uint32_t page = logged_first >> page_size_log2_;
+           page < ((logged_end - 1) >> page_size_log2_) + 1; ++page) {
+        logged_valid_after +=
+            uint32_t(system_page_flags_valid_[page >> 6] >> (page & 63)) & 1;
+      }
+      if (logged_valid_after != logged_valid_before) {
+        XELOGI(
+            "log_shared_memory_range: frame end refresh, {} valid pages "
+            "before, {} after",
+            logged_valid_before, logged_valid_after);
       }
     }
   }
@@ -332,6 +391,7 @@ void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length,
   uint32_t end = start + length - 1;
   uint32_t page_first = start >> page_size_log2_;
   uint32_t page_last = end >> page_size_log2_;
+  MarkPagesUsedInSubmission(page_first, page_last);
 
   // Trigger modification callbacks so, for instance, resolved data is loaded to
   // the texture.
@@ -359,6 +419,9 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length,
     return;
   }
   length = std::min(length, kBufferSize - start);
+  if (written_by_gpu && IsLoggedRange(start, length)) [[unlikely]] {
+    XELOGI("log_shared_memory_range: GPU writes {:08X} (+{})", start, length);
+  }
   uint32_t last = start + length - 1;
   uint32_t valid_page_first = start >> page_size_log2_;
   uint32_t valid_page_last = last >> page_size_log2_;
@@ -424,6 +487,64 @@ void SharedMemory::UnlinkWatchRange(WatchRange* range) {
 }
 
 // todo: optimize, an enormous amount of cpu time (1.34%) is spent here.
+void SharedMemory::EnableSubmissionPageUse() {
+  const size_t block_count = size_t(kBufferSize >> page_size_log2_) >> 6;
+  submission_page_use_block_generation_.assign(block_count, 0);
+  submission_page_use_block_bits_.assign(block_count, 0);
+}
+
+bool SharedMemory::AnyPageUsedInSubmission(uint32_t page_first,
+                                           uint32_t page_last) const {
+  if (submission_page_use_block_bits_.empty()) {
+    // Not recorded, so anything may have been used.
+    return true;
+  }
+  const uint32_t block_first = page_first >> 6;
+  const uint32_t block_last = page_last >> 6;
+  for (uint32_t i = block_first; i <= block_last; ++i) {
+    if (submission_page_use_block_generation_[i] !=
+        submission_page_use_generation_) {
+      continue;
+    }
+    uint64_t mask = ~uint64_t(0);
+    if (i == block_first) {
+      mask &= ~((uint64_t(1) << (page_first & 63)) - 1);
+    }
+    if (i == block_last && (page_last & 63) != 63) {
+      mask &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
+    }
+    if (submission_page_use_block_bits_[i] & mask) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void SharedMemory::MarkPagesUsedInSubmission(uint32_t page_first,
+                                             uint32_t page_last) {
+  if (submission_page_use_block_bits_.empty()) {
+    return;
+  }
+  const uint32_t block_first = page_first >> 6;
+  const uint32_t block_last = page_last >> 6;
+  for (uint32_t i = block_first; i <= block_last; ++i) {
+    uint64_t mask = ~uint64_t(0);
+    if (i == block_first) {
+      mask &= ~((uint64_t(1) << (page_first & 63)) - 1);
+    }
+    if (i == block_last && (page_last & 63) != 63) {
+      mask &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
+    }
+    if (submission_page_use_block_generation_[i] !=
+        submission_page_use_generation_) {
+      submission_page_use_block_generation_[i] =
+          submission_page_use_generation_;
+      submission_page_use_block_bits_[i] = 0;
+    }
+    submission_page_use_block_bits_[i] |= mask;
+  }
+}
+
 bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
   if (!length) {
     // Some texture or buffer is empty, for example - safe to draw in this case.
@@ -469,6 +590,16 @@ bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
     }
     if (all_valid) {
       // All pages already valid, nothing to upload
+      MarkPagesUsedInSubmission(page_first, page_last);
+      if (IsLoggedRange(start, length)) [[unlikely]] {
+        uint32_t& logged_frame = logged_range_reuse_frames_[start];
+        const uint32_t frame = logging::GetFrameNumber();
+        if (logged_frame != frame + 1) {
+          logged_frame = frame + 1;
+          XELOGI("log_shared_memory_range: GPU reuses {:08X} (+{}), valid",
+                 start, length);
+        }
+      }
       return true;
     }
   }
@@ -491,10 +622,25 @@ bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
         (std::make_pair(range_start, page_last + 1 - range_start));
   }
   if (!current_upload_range) {
+    MarkPagesUsedInSubmission(page_first, page_last);
     return true;
   }
+  if (IsLoggedRange(start, length)) [[unlikely]] {
+    for (unsigned int i = 0; i < current_upload_range; ++i) {
+      XELOGI(
+          "log_shared_memory_range: GPU uploads {:08X}-{:08X} for {:08X} "
+          "(+{})",
+          uploads[i].first << page_size_log2_,
+          (uploads[i].first + uploads[i].second) << page_size_log2_, start,
+          length);
+    }
+  }
 
-  return UploadRanges(uploads, current_upload_range);
+  // Marked after the upload, which may only be moved ahead of the
+  // submission's earlier work if that work never used these pages.
+  const bool uploaded = UploadRanges(uploads, current_upload_range);
+  MarkPagesUsedInSubmission(page_first, page_last);
+  return uploaded;
 }
 
 bool SharedMemory::IsRangeValid(uint32_t start, uint32_t length) const {
@@ -680,6 +826,14 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
   dirty_blocks_ |= dirty_blocks_mask;
 
   FireWatches(page_first, page_last, false);
+
+  if (IsLoggedRange(physical_address_start, length)) [[unlikely]] {
+    XELOGI(
+        "log_shared_memory_range: CPU write at {:08X} (+{}) invalidates "
+        "{:08X}-{:08X}",
+        physical_address_start, length, page_first << page_size_log2_,
+        (page_last + 1) << page_size_log2_);
+  }
 
   return std::make_pair(page_first << page_size_log2_,
                         (page_last - page_first + 1) << page_size_log2_);

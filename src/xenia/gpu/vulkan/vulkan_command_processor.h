@@ -181,8 +181,40 @@ class VulkanCommandProcessor final : public CommandProcessor {
     assert_true(submission_open_);
     return deferred_command_buffer_;
   }
+  // Commands replayed at the start of the open submission, before everything
+  // in deferred_command_buffer(), fenced off from both sides by barriers. For
+  // shared memory uploads no earlier command in the submission depends on,
+  // which then don't end a render pass and drain the pipeline in mid-frame.
+  DeferredCommandBuffer& deferred_upload_command_buffer() {
+    assert_true(submission_open_);
+    return deferred_upload_command_buffer_;
+  }
 
   bool submission_open() const { return submission_open_; }
+
+  // What the host GPU is busy with, for the log_fps GPU time breakdown.
+  enum class GpuPhase : uint8_t {
+    kOther,
+    kDraw,
+    kRenderTargetCopy,
+    kResolve,
+    kTextureLoad,
+    kUpload,
+    kPresent,
+    kCount,
+  };
+  // Marks where |phase|'s GPU work starts in the open submission. Free unless
+  // log_fps is timing this submission and the phase actually changes, so it
+  // goes only where work of that kind is recorded.
+  void SetGpuPhase(GpuPhase phase) {
+    if (gpu_phase_slot_ != kNoGpuPhaseSlot && phase != gpu_phase_current_) {
+      WriteGpuPhaseMarker(phase);
+    }
+  }
+  std::string TakeGpuTimeReport(uint32_t frames) override;
+  int64_t TakeGpuAwaitNanoseconds() override {
+    return int64_t(completion_timeline_.TakeAwaitNanoseconds());
+  }
   uint64_t GetCurrentSubmission() const {
     return completion_timeline_.GetUpcomingSubmission();
   }
@@ -356,7 +388,8 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // fault copies, each of which is awaited.
   ReadbackStagingBuffer resolve_fault_readback_;
   uint32_t resolve_fault_readback_size_ = 0;
-  void PrepareReadbackStagingEviction();
+  // Staging destruction is deferred, so an eviction has nothing to drain.
+  void PrepareReadbackStagingEviction() {}
   void InvalidateReadbackStaging(const ReadbackStagingBuffer& buffer);
   // The staging pool, shared with the D3D12 backend. Included here rather than
   // with the other fragments because the declarations below name its
@@ -599,11 +632,17 @@ class VulkanCommandProcessor final : public CommandProcessor {
     viz_predicate_buffer_failed_ = false;
   }
 
+  // Extra host depth bias the shader_depth_bias option gives draws with this
+  // guest pixel shader, in host depth bias units.
+  float GetShaderDepthBias(const Shader* pixel_shader);
+  std::string shader_depth_bias_parsed_;
+  std::unordered_map<uint64_t, float> shader_depth_bias_units_;
   void UpdateDynamicState(const draw_util::ViewportInfo& viewport_info,
                           bool primitive_polygonal,
                           reg::RB_DEPTHCONTROL normalized_depth_control,
                           uint32_t draw_resolution_scale_x,
                           uint32_t draw_resolution_scale_y,
+                          float extra_depth_bias_constant,
                           bool depth_bias_in_pixel_shader,
                           bool window_offset_in_edram);
   void UpdateSystemConstantValues(
@@ -723,6 +762,38 @@ class VulkanCommandProcessor final : public CommandProcessor {
   void CreateGpuTimeQueryPool();
   void DestroyGpuTimeQueryPool();
   void CollectCompletedGpuTimeQueries();
+
+  // log_fps GPU phase timing. Each phase change records a bottom-of-pipe
+  // timestamp, and the time to the next one is charged to that phase, so the
+  // cost is a few hundred queries per frame rather than one pair per draw.
+  static constexpr uint32_t kGpuPhaseSlots = 8;
+  static constexpr uint32_t kGpuPhaseQueriesPerSlot = 1024;
+  static constexpr uint32_t kNoGpuPhaseSlot = UINT32_MAX;
+  VkQueryPool gpu_phase_query_pool_ = VK_NULL_HANDLE;
+  bool gpu_phase_pool_failed_ = false;
+  // Submission timed in each slot, 0 while the slot is free.
+  uint64_t gpu_phase_slot_submission_[kGpuPhaseSlots] = {};
+  uint32_t gpu_phase_slot_marker_count_[kGpuPhaseSlots] = {};
+  // Whether the slot's submission replayed deferred uploads, timed by one more
+  // query after its markers.
+  bool gpu_phase_slot_has_upload_prologue_[kGpuPhaseSlots] = {};
+  GpuPhase gpu_phase_slot_phases_[kGpuPhaseSlots][kGpuPhaseQueriesPerSlot];
+  // Slot of the open submission, kNoGpuPhaseSlot when it isn't timed.
+  uint32_t gpu_phase_slot_ = kNoGpuPhaseSlot;
+  uint32_t gpu_phase_next_slot_ = 0;
+  GpuPhase gpu_phase_current_ = GpuPhase::kOther;
+  uint64_t gpu_phase_ns_[size_t(GpuPhase::kCount)] = {};
+  // Report window starts for the counters published beside the GPU times.
+  uint64_t gpu_report_upload_batches_start_ = 0;
+  uint64_t gpu_report_hoisted_upload_batches_start_ = 0;
+  uint64_t gpu_report_upload_bytes_start_ = 0;
+  uint64_t gpu_report_render_passes_start_ = 0;
+  // Submissions not timed because every slot was still in flight.
+  uint32_t gpu_phase_untimed_submissions_ = 0;
+  void BeginGpuPhaseSubmission();
+  void WriteGpuPhaseMarker(GpuPhase phase);
+  void CollectCompletedGpuPhases();
+  void DestroyGpuPhaseQueryPool();
   // Guest frame index, since some transient resources can be reused across
   // submissions. Values updated in the beginning of a frame.
   uint64_t frame_current_ = 1;
@@ -740,6 +811,7 @@ class VulkanCommandProcessor final : public CommandProcessor {
   std::vector<CommandBuffer> command_buffers_writable_;
   std::deque<std::pair<uint64_t, CommandBuffer>> command_buffers_submitted_;
   DeferredCommandBuffer deferred_command_buffer_;
+  DeferredCommandBuffer deferred_upload_command_buffer_;
 
   std::vector<VkSparseMemoryBind> sparse_memory_binds_;
   std::vector<SparseBufferBind> sparse_buffer_binds_;

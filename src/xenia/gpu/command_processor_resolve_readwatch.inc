@@ -93,6 +93,11 @@ void MarkResolvePagesRead(uint32_t physical_address, uint32_t length) {
   uint64_t last_owner = 0;
   for (uint32_t page = first_page; page <= last_page; ++page) {
     uint64_t owner = resolve_page_owners_[page].load(std::memory_order_relaxed);
+    if (owner && owner != last_owner && cvars::log_draws) {
+      // The CPU reading back what the GPU rendered, from the guest thread.
+      XELOGI("log_draws: CPU read of resolve output at {:08X} (+{} bytes)",
+             physical_address, length);
+    }
     if (owner && owner != last_owner) {
       std::lock_guard<std::mutex> lock(resolve_read_mutex_);
       resolve_read_keys_.insert(owner);
@@ -203,6 +208,8 @@ void ProvideResolveOutput(uint32_t address, uint32_t length, bool write) {
       if (write) {
         ClipResolveEdgePagesWritten(owner, owner_first_page, owner_last_page,
                                     first_page, last_page);
+      } else {
+        resolve_reads_unsubmitted_.fetch_add(1, std::memory_order_relaxed);
       }
       RearmResolveAfterSubmission(owner);
       continue;
@@ -243,7 +250,13 @@ void ProvideResolveOutput(uint32_t address, uint32_t length, bool write) {
     }
     if (FaultCopyResolveToGuestRam(resolve_fault_copy_ranges_)) {
       owner.in_guest_ram = true;
+      resolve_fault_copies_.fetch_add(1, std::memory_order_relaxed);
+      for (const auto& range : resolve_fault_copy_ranges_) {
+        resolve_fault_copy_bytes_.fetch_add(range.second,
+                                            std::memory_order_relaxed);
+      }
     } else {
+      resolve_fault_copies_failed_.fetch_add(1, std::memory_order_relaxed);
       if (write) {
         ClipResolveEdgePagesWritten(owner, owner_first_page, owner_last_page,
                                     first_page, last_page);
@@ -253,15 +266,16 @@ void ProvideResolveOutput(uint32_t address, uint32_t length, bool write) {
   }
 }
 
-// Copies ranges packed back to back in source into guest RAM, through the
-// physical view, which the read watch does not protect.
+// Copies ranges packed back to back in source into guest RAM. Not through the
+// physical view: it carries the guest's protection when guest RAM has no GPU
+// import, and this runs from access callbacks, under the global critical
+// region, where a fault halts the guest thread holding it.
 void CopyPackedRangesToGuestRam(
     const void* source,
     const std::vector<std::pair<uint32_t, uint32_t>>& ranges) {
   const uint8_t* source_bytes = static_cast<const uint8_t*>(source);
   for (const auto& range : ranges) {
-    std::memcpy(memory_->TranslatePhysical(range.first), source_bytes,
-                range.second);
+    memory_->WritePhysicalUnprotected(range.first, source_bytes, range.second);
     source_bytes += range.second;
   }
 }
@@ -631,6 +645,28 @@ void ClipResolveEdgePagesWritten(ResolveOwner& owner, uint32_t owner_first_page,
   }
 }
 std::vector<std::pair<uint32_t, uint32_t>> resolve_fault_copy_ranges_;
+// For the log_fps report. A read of output whose resolve the host hasn't
+// submitted yet gets what guest RAM held before the resolve, even though the
+// command processor has already passed the resolve and any fence after it.
+std::atomic<uint64_t> resolve_fault_copies_{0};
+std::atomic<uint64_t> resolve_fault_copy_bytes_{0};
+std::atomic<uint64_t> resolve_fault_copies_failed_{0};
+std::atomic<uint64_t> resolve_reads_unsubmitted_{0};
+// ", readback ..." for the log_fps report, empty without any, and resets.
+std::string TakeResolveReadbackReport(uint32_t frames) {
+  const uint64_t copies = resolve_fault_copies_.exchange(0);
+  const uint64_t bytes = resolve_fault_copy_bytes_.exchange(0);
+  const uint64_t failed = resolve_fault_copies_failed_.exchange(0);
+  const uint64_t unsubmitted = resolve_reads_unsubmitted_.exchange(0);
+  if (!copies && !failed && !unsubmitted) {
+    return {};
+  }
+  return fmt::format(
+      ", readback per frame: {:.1f} copies ({:.0f} KB), {} reads got the "
+      "previous contents as the resolve wasn't submitted yet, {} copies failed",
+      double(copies) / frames, double(bytes) / 1024.0 / frames, unsubmitted,
+      failed);
+}
 // Owners whose watch a read used up before they could be copied, to arm again
 // when the next submission ends. Under resolve_read_mutex_, and the GPU
 // thread's copy of them.

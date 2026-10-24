@@ -119,3 +119,5 @@ CMakeUserPresets.json
 /cache0
 /devkit
 recent.toml
+# Portable Linux build (cmake -DXENIA_PORTABLE_LINUX=ON) for Batocera.
+/build-batocera/

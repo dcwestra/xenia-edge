@@ -1259,6 +1259,29 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     last_update_used_render_targets_[i] =
         (depth_and_color_rts_used_bits & (uint32_t(1) << i)) ? rts[i] : nullptr;
   }
+  if (cvars::log_transfers) {
+    // Each change of the bound targets, to read the transfers in order.
+    static std::string last_draw_log;
+    std::string draw_log;
+    for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+      if (last_update_used_render_targets_[i]) {
+        draw_log += fmt::format(
+            " [{}] {}", i,
+            last_update_used_render_targets_[i]->key().GetDebugName());
+      }
+    }
+    if (last_update_used_render_targets_[0]) {
+      draw_log +=
+          fmt::format(", z write {}, stencil {} write mask {:02X}",
+                      uint32_t(normalized_depth_control.z_write_enable),
+                      uint32_t(normalized_depth_control.stencil_enable),
+                      regs.Get<reg::RB_STENCILREFMASK>().stencilwritemask);
+    }
+    if (draw_log != last_draw_log) {
+      XELOGI("log_transfers: draw{}", draw_log);
+      last_draw_log = std::move(draw_log);
+    }
+  }
   if (are_accumulated_render_targets_valid_) {
     // Check if the only re-enabling a previously bound render target.
     for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
@@ -1865,6 +1888,23 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
     ChangeOwnership(
         color_render_target_key, color_clear_start_tiles_base_relative,
         color_clear_length_tiles, &color_transfers_out, &clear_rectangle);
+  }
+  if (cvars::log_transfers) {
+    XELOGI("log_transfers: resolve clears{}{}",
+           depth_render_target
+               ? fmt::format(" depth {}, tiles +[{}, {})",
+                             depth_render_target_key.GetDebugName(),
+                             depth_clear_start_tiles_base_relative,
+                             depth_clear_start_tiles_base_relative +
+                                 depth_clear_length_tiles)
+               : std::string(),
+           color_render_target
+               ? fmt::format(" color {}, tiles +[{}, {})",
+                             color_render_target_key.GetDebugName(),
+                             color_clear_start_tiles_base_relative,
+                             color_clear_start_tiles_base_relative +
+                                 color_clear_length_tiles)
+               : std::string());
   }
   return true;
 }

@@ -189,9 +189,12 @@ WxWindow::WxWindow(WindowedAppContext& app_context,
 WxWindow::~WxWindow() {
   EnterDestructor();
 #if XE_PLATFORM_LINUX
-  if (pending_paint_source_) {
-    g_source_remove(pending_paint_source_);
-    pending_paint_source_ = 0;
+  {
+    std::lock_guard<std::mutex> lock(pending_paint_mutex_);
+    if (pending_paint_source_) {
+      g_source_remove(pending_paint_source_);
+      pending_paint_source_ = 0;
+    }
   }
 #endif
 #if XE_PLATFORM_WIN32
@@ -378,6 +381,14 @@ bool WxWindow::OpenImpl() {
 
   RestoreGeometryFromConfig();
 
+#if XE_PLATFORM_LINUX
+  frame_->Show(true);
+  if (IsFullscreen()) {
+    frame_->ShowFullScreen(true,
+                           wxFULLSCREEN_ALL & ~long(wxFULLSCREEN_NOMENUBAR));
+    ApplyMenuBarVisibility();
+  }
+#else
   if (IsFullscreen()) {
     frame_->ShowFullScreen(true);
   }
@@ -389,6 +400,7 @@ bool WxWindow::OpenImpl() {
 #endif
 
   frame_->Show(true);
+#endif
   render_target()->SetFocus();
 
   wxSize client_size = render_target()->GetClientSize();
@@ -419,11 +431,37 @@ void WxWindow::ApplyNewFullscreen() {
   if (fullscreen && !frame_->IsFullScreen()) {
     SaveGeometryToConfig();
   }
+#if XE_PLATFORM_LINUX
+  frame_->ShowFullScreen(fullscreen,
+                         wxFULLSCREEN_ALL & ~long(wxFULLSCREEN_NOMENUBAR));
+  ApplyMenuBarVisibility();
+#else
   frame_->ShowFullScreen(fullscreen);
+#endif
   if (content_visibility_callback_) {
     content_visibility_callback_();
   }
 }
+
+#if XE_PLATFORM_LINUX
+void WxWindow::ApplyMenuBarVisibility() {
+  wxMenuBar* menu_bar = frame_ ? frame_->GetMenuBar() : nullptr;
+  if (!menu_bar) {
+    return;
+  }
+  // wxGTK's ShowFullScreen hides the menu bar only if wxMenuBar::IsShown,
+  // which is false for one attached before the frame was shown even though GTK
+  // draws it - so it stayed across the top of a title started in fullscreen
+  // until fullscreen was toggled off and on. Showing it first brings that
+  // state in line with GTK's, so hiding it then takes effect.
+  const bool visible = !IsFullscreen();
+  if (!visible) {
+    menu_bar->Show(true);
+  }
+  menu_bar->Show(visible);
+  frame_->SendSizeEvent();
+}
+#endif
 
 void WxWindow::SetContentVisibilityCallback(std::function<void()> cb) {
   content_visibility_callback_ = std::move(cb);
@@ -592,7 +630,9 @@ void WxWindow::RequestPaintImpl() {
   }
 #elif XE_PLATFORM_LINUX
   // Schedule via glib's main loop (not wx's pending-event queue) so X11 input
-  // events at higher priority preempt back-to-back paints.
+  // events at higher priority preempt back-to-back paints. May be called from
+  // the guest output thread, see pending_paint_mutex_.
+  std::lock_guard<std::mutex> lock(pending_paint_mutex_);
   if (pending_paint_source_) {
     return;
   }
@@ -600,7 +640,12 @@ void WxWindow::RequestPaintImpl() {
       G_PRIORITY_LOW,
       [](gpointer user_data) -> gboolean {
         auto* self = static_cast<WxWindow*>(user_data);
-        self->pending_paint_source_ = 0;
+        {
+          // Cleared before painting, so a request made during the paint
+          // schedules another one.
+          std::lock_guard<std::mutex> lock(self->pending_paint_mutex_);
+          self->pending_paint_source_ = 0;
+        }
         if (self->render_panel_) {
           self->OnPaint(true);
         }

@@ -12,6 +12,7 @@
 #include <signal.h>
 #include <unistd.h>
 #include <atomic>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 
@@ -21,6 +22,10 @@
 #include "xenia/base/math.h"
 #include "xenia/base/platform.h"
 #include "xenia/base/threading.h"
+
+#if !XE_PLATFORM_ANDROID
+#include <execinfo.h>
+#endif
 
 namespace xe {
 
@@ -38,6 +43,71 @@ constexpr size_t kMaxHandlerCount = 8;
 // All custom handlers, left-aligned and null terminated.
 // Executed in order.
 std::pair<ExceptionHandler::Handler, void*> handlers_[kMaxHandlerCount];
+
+#if !XE_PLATFORM_ANDROID
+static void WriteAllToFd(int fd, const char* data, size_t size) {
+  while (size) {
+    ssize_t written = ::write(fd, data, size);
+    if (written < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      return;
+    }
+    data += written;
+    size -= size_t(written);
+  }
+}
+
+// A fatal host crash otherwise ends the process with nothing in the log, as
+// the asynchronous logger never runs again. Writes a backtrace to stderr and
+// the log file with write(2) only, apart from snprintf as above.
+static void WriteFatalSignalReport(int signal_number,
+                                   const siginfo_t* signal_info, uint64_t pc) {
+  // Only the first crashing thread reports, the rest would interleave.
+  static std::atomic<bool> reported{false};
+  if (reported.exchange(true)) {
+    return;
+  }
+  const char* signal_name = "signal";
+  switch (signal_number) {
+    case SIGSEGV:
+      signal_name = "SIGSEGV";
+      break;
+    case SIGBUS:
+      signal_name = "SIGBUS";
+      break;
+    case SIGILL:
+      signal_name = "SIGILL";
+      break;
+  }
+  char header[320];
+  int header_length = std::snprintf(
+      header, sizeof(header),
+      "\n==== FATAL HOST CRASH: %s (code %d) at pc 0x%llx, fault address %p "
+      "====\nResolve a frame with: addr2line -fCe <module> <+offset, or the "
+      "[address] where there is none>\n",
+      signal_name, signal_info->si_code, static_cast<unsigned long long>(pc),
+      signal_info->si_addr);
+  if (header_length < 0) {
+    header_length = 0;
+  } else if (size_t(header_length) >= sizeof(header)) {
+    header_length = int(sizeof(header) - 1);
+  }
+  void* frames[64];
+  const int frame_count = backtrace(frames, int(xe::countof(frames)));
+  static const char kFooter[] = "==== END OF HOST CRASH REPORT ====\n";
+  const int fds[] = {STDERR_FILENO, xe::GetLogFileDescriptor()};
+  for (int fd : fds) {
+    if (fd < 0) {
+      continue;
+    }
+    WriteAllToFd(fd, header, size_t(header_length));
+    backtrace_symbols_fd(frames, frame_count, fd);
+    WriteAllToFd(fd, kFooter, sizeof(kFooter) - 1);
+  }
+}
+#endif  // !XE_PLATFORM_ANDROID
 
 static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
                                      void* signal_context) {
@@ -452,6 +522,15 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
       break;
   }
   if (original_handler) {
+#if !XE_PLATFORM_ANDROID
+    // Only when the re-delivered signal will kill the process, not when an
+    // earlier-installed handler may still claim it.
+    if (!(original_handler->sa_flags & SA_SIGINFO) &&
+        (original_handler->sa_handler == SIG_DFL ||
+         original_handler->sa_handler == SIG_IGN)) {
+      WriteFatalSignalReport(signal_number, signal_info, ex.pc());
+    }
+#endif  // !XE_PLATFORM_ANDROID
     sigaction(signal_number, original_handler, nullptr);
   }
 }
@@ -483,6 +562,12 @@ void ExceptionHandler::Install(Handler fn, void* data) {
     if (sigaction(SIGTRAP, &signal_handler, &original_sigtrap_handler_) != 0) {
       assert_always("Failed to install new SIGTRAP handler");
     }
+#if !XE_PLATFORM_ANDROID
+    // glibc loads the unwinder on the first backtrace(), which allocates, so do
+    // that now rather than inside a crash.
+    void* prime_frame;
+    backtrace(&prime_frame, 1);
+#endif  // !XE_PLATFORM_ANDROID
     signal_handlers_installed_ = true;
   }
 

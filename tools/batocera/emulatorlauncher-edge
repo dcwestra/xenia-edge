@@ -1,0 +1,33 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+# Batocera's emulatorlauncher, with the native Xenia Edge build added as the
+# "xenia-edge" emulator. The xbox360 system's command runs this instead of
+# /usr/bin/emulatorlauncher (see es_systems_xbox360.cfg), so every other
+# emulator still goes through Batocera's own generators, and xenia-edge gets
+# the same controller, hotkey, power mode and video mode handling. Batocera's
+# configgen lives in its read-only image, so this adds the generator from
+# /userdata instead of changing it.
+import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from configgen import emulatorlauncher  # noqa: E402
+from configgen.generators import get_generator as batocera_get_generator  # noqa: E402
+
+from xeniaEdgeGenerator import XeniaEdgeGenerator  # noqa: E402
+
+
+def get_generator(emulator, core):
+    if emulator == 'xenia-edge':
+        return XeniaEdgeGenerator()
+    return batocera_get_generator(emulator, core)
+
+
+# emulatorlauncher imported get_generator by name, so replace its copy.
+emulatorlauncher.get_generator = get_generator
+
+if __name__ == "__main__":
+    sys.argv[0] = re.sub(r"(-script\.pyw|\.exe)?$", "", sys.argv[0])
+    sys.exit(emulatorlauncher.launch())

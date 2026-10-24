@@ -113,17 +113,11 @@ void ReadbackStagingToGuestRam(const ReadbackStagingBuffer& buffer,
   if (buffer.mapped == nullptr || !length) {
     return;
   }
-  uint8_t* dest = memory_->TranslatePhysical(address);
-  uint8_t* source = static_cast<uint8_t*>(buffer.mapped) + source_offset;
-  // vastcpy's non-temporal stores need both pointers and the length to be
-  // cache-line aligned.
-  uintptr_t unaligned = reinterpret_cast<uintptr_t>(dest) |
-                        reinterpret_cast<uintptr_t>(source) | uintptr_t(length);
-  if (unaligned & 63) {
-    std::memcpy(dest, source, length);
-  } else {
-    memory::vastcpy(dest, source, length);
-  }
+  // Not through the physical view, which carries the guest's protection when
+  // guest RAM has no GPU import - see Memory::WritePhysicalUnprotected.
+  memory_->WritePhysicalUnprotected(
+      address, static_cast<const uint8_t*>(buffer.mapped) + source_offset,
+      length);
 }
 
 // Trims staged export output a later resolve overwrote, keeping the rest.

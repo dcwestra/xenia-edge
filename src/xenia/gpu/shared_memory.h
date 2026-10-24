@@ -10,6 +10,12 @@
 #ifndef XENIA_GPU_SHARED_MEMORY_H_
 #define XENIA_GPU_SHARED_MEMORY_H_
 
+#include <atomic>
+#include <cstdint>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
 #include "xenia/memory.h"
 
 namespace xe {
@@ -111,7 +117,21 @@ class SharedMemory {
   void RangeWrittenByGpu(uint32_t start, uint32_t length,
                          bool written_to_buffer = true);
 
+  // Starts a new host submission for the submission page use record below.
+  void BeginSubmissionPageUse() {
+    ++submission_page_use_generation_;
+    UpdateLoggedRange();
+  }
+
  protected:
+  // Records which pages the GPU may use (read, or write after requesting) in
+  // the current host submission, once a backend enables it. An upload of pages
+  // nothing earlier in the submission used can then run at the submission's
+  // start rather than in order, as no earlier command can observe the new data.
+  void EnableSubmissionPageUse();
+  bool AnyPageUsedInSubmission(uint32_t page_first, uint32_t page_last) const;
+  void MarkPagesUsedInSubmission(uint32_t page_first, uint32_t page_last);
+
   SharedMemory(Memory& memory);
   // Call in implementation-specific initialization.
   bool InitializeCommon();
@@ -179,7 +199,26 @@ class SharedMemory {
   // Log2 of invalidation granularity (the system page size, but the dependency
   // on it is not hard - the access callback takes a range as an argument, and
   // touched pages of the buffer of this size will be invalidated).
+  // Per 64-page block, the bits valid only while the block's generation
+  // matches the current submission's, so a new submission resets in O(1).
+  std::vector<uint32_t> submission_page_use_block_generation_;
+  std::vector<uint64_t> submission_page_use_block_bits_;
+  uint32_t submission_page_use_generation_ = 1;
   uint32_t page_size_log2_;
+
+  // log_shared_memory_range, parsed on the command processor thread and read
+  // by guest threads in the invalidation callback. Empty when end <= first.
+  void UpdateLoggedRange();
+  bool IsLoggedRange(uint32_t start, uint32_t length) const {
+    const uint32_t end = logged_range_end_.load(std::memory_order_relaxed);
+    const uint32_t first = logged_range_first_.load(std::memory_order_relaxed);
+    return start < end && start + length > first;
+  }
+  std::atomic<uint32_t> logged_range_first_{0};
+  std::atomic<uint32_t> logged_range_end_{0};
+  std::string logged_range_string_;
+  // Request start -> the frame its reuse of valid pages was last logged in.
+  std::unordered_map<uint32_t, uint32_t> logged_range_reuse_frames_;
 
   bool EnsureHostGpuMemoryAllocated(uint32_t start, uint32_t length);
   uint32_t host_gpu_memory_sparse_granularity_log2_ = UINT32_MAX;

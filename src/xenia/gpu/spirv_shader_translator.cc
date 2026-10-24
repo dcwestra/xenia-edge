@@ -45,6 +45,26 @@ DEFINE_bool(
     "capability.",
     "GPU");
 
+DEFINE_bool(
+    texture_fetch_offsets_at_lod, true,
+    "Apply texture fetch offsets (OffsetX/Y) in texels of the mip level being "
+    "sampled, as the Xbox 360 does, for 2D fetches with an explicit LOD and "
+    "point mip filtering. Depth pyramid builders such as Fable III's rely on "
+    "it; off applies them at the base level size, as before. Takes effect for "
+    "shaders translated after it is set.",
+    "GPU");
+
+DEFINE_string(
+    shader_texture_fetch_zero, "",
+    "Comma-separated guest shader ucode hashes (hex), each optionally followed "
+    "by :<fetch constant>, whose texture fetches (of that fetch constant, or "
+    "all) return 0 instead of sampling. A per-title compatibility workaround "
+    "for GPU visibility tests that wrongly reject geometry, such as Fable "
+    "III's mesh visibility shader against its depth pyramid "
+    "(A2B8940498EECECB:16), where 0 means nothing occludes. Takes effect for "
+    "shaders translated after it is set, so set it in the game's config.",
+    "GPU");
+
 DEFINE_string(shader_bisect_ps_hash, "",
               "Ucode hash (hex) of the pixel shader to bisect. Empty disables "
               "the bisect entirely.",
@@ -359,6 +379,7 @@ void SpirvShaderTranslator::Reset() {
   bisect_instruction_index_ = 0;
   bisect_current_instruction_ = UINT32_MAX;
   bisect_snapshot_emitted_ = false;
+  texture_fetch_zero_logged_ = false;
   var_main_bisect_snapshot_ = spv::NoResult;
   var_main_registers_ = spv::NoResult;
   main_interpolators_unmodified_ = 0;

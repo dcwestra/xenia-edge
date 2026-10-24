@@ -240,6 +240,11 @@ class GuestScheduler {
     // parked, or the backstop. Written only by this CPU's dispatch thread,
     // which also reads it to size the idle sleep. 0 = due now.
     uint64_t next_timed_repoll_ms = 0;
+    // next_timed_repoll_ms as a raw host tick, 0 = due now. YieldExecution
+    // tests it on every guest NtYieldExecution, which a spin-waiting title
+    // calls millions of times a second, and a raw tick read is far cheaper
+    // than the system clock. Kept by SetNextTimedRepoll.
+    uint64_t next_timed_repoll_tick = 0;
     // Highest blocked-fiber priority, so WakeAll only preempts a runner a
     // waiter could outrank. Raised on block, recomputed by RereadyBlocked.
     // Guarded by lock_.
@@ -248,6 +253,9 @@ class GuestScheduler {
 
   // The dispatch thread a thread is pinned to by its guest current_cpu.
   int CpuOf(XThread* thread) const;
+  // Sets |cpu|'s next timed re-poll, in host uptime ms (0 = due now), and its
+  // raw tick form.
+  void SetNextTimedRepoll(Cpu& cpu, uint64_t due_ms) const;
 
   // |yield_to_other| marks the thread as that CPU's yielder as it is linked.
   void EnqueueReady(XThread* thread, int cpu_index,

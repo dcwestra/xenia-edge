@@ -21,8 +21,10 @@
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <climits>
 #include <cstddef>
 #include <cstring>
 #include <ctime>
@@ -41,6 +43,7 @@
 #endif
 
 #if XE_PLATFORM_LINUX
+#include <linux/futex.h>
 #include <semaphore.h>
 #endif
 
@@ -65,6 +68,18 @@ DEFINE_bool(wfe_precise_sleep, false,
             "default: the spin holds threads on-CPU (~18% in profiling) for "
             "frame-pacing precision that plain nanosleep matches in practice.",
             "CPU");
+#endif
+
+#if XE_PLATFORM_LINUX
+#include "xenia/base/cvar.h"
+
+DEFINE_bool(
+    linux_realtime_thread_priority, false,
+    "Map host thread priorities onto SCHED_FIFO real-time scheduling where the "
+    "user is allowed it (RLIMIT_RTPRIO or CAP_SYS_NICE). Off by default: a "
+    "real-time thread that spins can starve the desktop, compositor and audio "
+    "server. Off, priorities map to nice values under normal scheduling.",
+    "CPU");
 #endif
 
 #if XE_PLATFORM_LINUX
@@ -337,38 +352,74 @@ bool SetTlsValue(TlsHandle handle, uintptr_t value) {
   return pthread_setspecific(handle, reinterpret_cast<void*>(value)) == 0;
 }
 
-// Multi-object waits: each signal bumps a generation and notifies this
-// condvar so WaitMultiple wakes at once; the timeout cap covers a miss.
+// Multi-object waits: each signal bumps a generation and wakes the parked
+// WaitMultiple callers, which then re-check their handles.
+// 32 bits, the width a futex waits on. Wrapping is harmless, waiters only
+// compare it for inequality.
+static std::atomic<uint32_t> g_multi_wait_gen{0};
+static std::atomic<uint32_t> g_multi_waiters{0};
+#if XE_PLATFORM_LINUX
+// Parked on with a futex, which compares the generation in the kernel as it
+// sleeps, so with the sequentially consistent register / bump pairing below a
+// wake can't be lost. The park cap is only a backstop.
+static constexpr std::chrono::milliseconds kMultiWaitParkCap{100};
+#else
+// Elsewhere a condvar, notified without its mutex so the realtime audio
+// callback never blocks on it. A wake lost to the register / sleep race costs
+// at most this cap.
+static constexpr std::chrono::milliseconds kMultiWaitParkCap{1};
 static std::mutex g_multi_wait_mutex;
 static std::condition_variable g_multi_wait_cv;
-static std::atomic<uint64_t> g_multi_wait_gen{0};
-static std::atomic<uint32_t> g_multi_waiters{0};
+#endif
 static void PokeMultiWaiters() {
-  // Bump before reading the count so a waiter that re-checks gen after
-  // registering sees it. Not a guarantee: neither this nor the notify below is
-  // ordered against a waiter mid-park. The waiter's 1ms cap is the real bound.
-  g_multi_wait_gen.fetch_add(1, std::memory_order_release);
-  if (g_multi_waiters.load(std::memory_order_acquire) == 0) {
-    // Nobody is parked, so skip the process-global mutex entirely. This path
-    // runs from the realtime audio callback, where blocking on a lock held by
-    // an ordinary guest thread costs an audio deadline.
+  // Bump before reading the count, both sequentially consistent, pairing with
+  // the waiter registering before it re-reads the generation: either the
+  // waiter sees this bump, or this sees the waiter.
+  g_multi_wait_gen.fetch_add(1, std::memory_order_seq_cst);
+  if (g_multi_waiters.load(std::memory_order_seq_cst) == 0) {
+    // Nobody is parked, so skip the wake entirely. This path runs from the
+    // realtime audio callback.
     return;
   }
-  // Notified without holding the mutex, so a realtime caller never blocks on
-  // it. A wakeup lost to the register/sleep race costs at most the 1ms park
-  // cap the waiter already applies.
+#if XE_PLATFORM_LINUX
+  syscall(SYS_futex, reinterpret_cast<uint32_t*>(&g_multi_wait_gen),
+          FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0);
+#else
   g_multi_wait_cv.notify_all();
+#endif
 }
 
 // Scopes the parked-waiter count; a cancelled wait must not leak it.
 struct ScopedMultiWaiter {
   ScopedMultiWaiter() {
-    g_multi_waiters.fetch_add(1, std::memory_order_release);
+    g_multi_waiters.fetch_add(1, std::memory_order_seq_cst);
   }
   ~ScopedMultiWaiter() {
     g_multi_waiters.fetch_sub(1, std::memory_order_release);
   }
 };
+
+// Sleeps until the generation moves off |wait_gen| or |timeout| passes.
+static void ParkMultiWaiter(uint32_t wait_gen,
+                            std::chrono::milliseconds timeout) {
+  ScopedMultiWaiter parked;
+  // Re-read after registering, the other half of PokeMultiWaiters' pairing.
+  if (g_multi_wait_gen.load(std::memory_order_seq_cst) != wait_gen) {
+    return;
+  }
+#if XE_PLATFORM_LINUX
+  timespec timeout_spec = DurationToTimeSpec(timeout);
+  // EAGAIN (the generation already moved), EINTR and ETIMEDOUT all mean
+  // re-check, which the caller's loop does.
+  syscall(SYS_futex, reinterpret_cast<uint32_t*>(&g_multi_wait_gen),
+          FUTEX_WAIT_PRIVATE, wait_gen, &timeout_spec, nullptr, 0);
+#else
+  std::unique_lock<std::mutex> mw_lock(g_multi_wait_mutex);
+  g_multi_wait_cv.wait_for(mw_lock, timeout, [wait_gen] {
+    return g_multi_wait_gen.load(std::memory_order_acquire) != wait_gen;
+  });
+#endif
+}
 
 // Parked on from the suspend signal handler, so it must stay async-signal-safe.
 class SuspendGate {
@@ -599,13 +650,17 @@ class PosixConditionBase {
                         ? std::chrono::steady_clock::time_point::max()
                         : start_time + timeout;
 
+    // Reused across passes, so a re-check doesn't allocate.
+    std::vector<std::unique_lock<std::mutex>> locks;
+    locks.reserve(handles.size());
+
     while (true) {
 #if !XE_PLATFORM_ANDROID
       // Cancellation point, clear of the alloc below.
       pthread_testcancel();
 #endif
       // Snapshot the gen before checking so a racing signal isn't missed.
-      uint64_t wait_gen = g_multi_wait_gen.load(std::memory_order_acquire);
+      uint32_t wait_gen = g_multi_wait_gen.load(std::memory_order_seq_cst);
 
       // Check all handles to see if any/all are signaled.
       // Use try_lock to avoid deadlocks from lock ordering issues.
@@ -613,8 +668,6 @@ class PosixConditionBase {
       bool condition_met = false;
 
       // Try to acquire all locks without blocking.
-      std::vector<std::unique_lock<std::mutex>> locks;
-      locks.reserve(handles.size());
       bool all_locked = true;
 
       for (size_t i = 0; i < handles.size(); ++i) {
@@ -704,17 +757,12 @@ class PosixConditionBase {
         return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
       }
 
-      // Park on the shared condvar (any signal wakes us); 1ms caps a lost poke.
+      // Park until any signal (it bumps the generation) or the cap.
       auto remaining =
           std::chrono::duration_cast<std::chrono::milliseconds>(end_time - now);
-      auto park = std::min(remaining, std::chrono::milliseconds(1));
-      {
-        ScopedMultiWaiter parked;
-        std::unique_lock<std::mutex> mw_lock(g_multi_wait_mutex);
-        g_multi_wait_cv.wait_for(mw_lock, park, [&] {
-          return g_multi_wait_gen.load(std::memory_order_acquire) != wait_gen;
-        });
-      }
+      // A sub-millisecond remainder still parks, briefly, rather than spin.
+      remaining = std::max(remaining, std::chrono::milliseconds(1));
+      ParkMultiWaiter(wait_gen, std::min(remaining, kMultiWaitParkCap));
     }
   }
 
@@ -806,8 +854,9 @@ class PosixCondition<Semaphore> final : public PosixConditionBase {
  private:
   [[nodiscard]] bool signaled() const override { return count_ > 0; }
   void post_execution() override {
+    // Taking a count can't let another waiter through, so no wake. Notifying
+    // here woke every parked waiter to re-check and park again.
     count_--;
-    NotifyAll();
   }
   uint32_t count_;
   const uint32_t maximum_count_;
@@ -1217,7 +1266,7 @@ class PosixCondition<Thread> final : public PosixConditionBase {
   int priority() const {
     WaitStarted();
 #if XE_PLATFORM_LINUX
-    if (fifo_failed_) {
+    if (!UseFifoPriority()) {
       // Report nice values mapped back into the SCHED_FIFO 1..32 range so
       // callers see a consistent priority space.
       int nice_val = getpriority(PRIO_PROCESS, tid_);
@@ -1248,7 +1297,7 @@ class PosixCondition<Thread> final : public PosixConditionBase {
   void set_priority(int new_priority) const {
     WaitStarted();
 #if XE_PLATFORM_LINUX
-    if (!fifo_failed_) {
+    if (UseFifoPriority()) {
 #endif
       sched_param param{};
 #if XE_PLATFORM_MAC
@@ -1474,6 +1523,10 @@ class PosixCondition<Thread> final : public PosixConditionBase {
 #if XE_PLATFORM_LINUX
   pid_t tid_ = 0;                     // Kernel TID for setpriority() fallback.
   mutable bool fifo_failed_ = false;  // True after SCHED_FIFO was rejected.
+  // SCHED_FIFO only on request, nice values otherwise.
+  bool UseFifoPriority() const {
+    return cvars::linux_realtime_thread_priority && !fifo_failed_;
+  }
 #endif
   bool signaled_;
   int exit_code_;

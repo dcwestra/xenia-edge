@@ -947,7 +947,7 @@ inline void FormatResolveClearDebugMarker(char* buffer, size_t buffer_size,
 inline void FormatDrawDebugMarker(
     char* buffer, size_t buffer_size, xenos::PrimitiveType prim_type,
     const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
-    uint64_t vs_hash, uint64_t ps_hash) {
+    uint64_t vs_hash, uint64_t ps_hash, uint32_t guest_index_base = 0) {
   const char* index_info = "auto";
   if (primitive_processing_result.index_buffer_type ==
       PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA) {
@@ -989,7 +989,12 @@ inline void FormatDrawDebugMarker(
                   static_cast<unsigned long long>(ps_hash));
   }
   if (cvars::log_draws) {
-    XELOGI("log_draws: {}", buffer);
+    // The guest index buffer address tells apart draws of the same shaders.
+    if (guest_index_base) {
+      XELOGI("log_draws: {} ib:{:08X}", buffer, guest_index_base);
+    } else {
+      XELOGI("log_draws: {}", buffer);
+    }
   }
 }
 

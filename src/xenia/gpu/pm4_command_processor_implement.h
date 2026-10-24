@@ -806,6 +806,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_XE_SWAP(uint32_t packet,
 
   // Advance the present-frame counter shown in the log prefix.
   logging::IncrementFrameNumber();
+  COMMAND_PROCESSOR::NoteGuestSwapForFpsLog();
 
   // Apply host frame rate limiting (separate from guest vblank timing)
   COMMAND_PROCESSOR::ThrottlePresentation();
@@ -873,6 +874,9 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
                 : register_file_->values[poll_reg_addr];
 
   bool matched = false;
+  auto wait_start = cvars::log_fps ? std::chrono::steady_clock::now()
+                                   : std::chrono::steady_clock::time_point();
+  bool waited = false;
   // Don't read what a held-back fence is yet to write there.
   if (is_memory) {
     COMMAND_PROCESSOR::AwaitHeldSignalsWriting(poll_reg_addr & ~uint32_t(0x3));
@@ -911,6 +915,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
           continue;
         }
       }
+      waited = true;
       // Wait using the duration specified by the guest.
       if (wait >= 0x100) {
         PrepareForWait();
@@ -938,6 +943,12 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
     }
   } while (!matched);
 
+  if (waited && cvars::log_fps) {
+    fps_frame_guest_wait_ns_ +=
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - wait_start)
+            .count();
+  }
   return true;
 }
 XE_NOINLINE
@@ -1356,6 +1367,15 @@ bool COMMAND_PROCESSOR::ExecutePacketType3Draw(
   // we don't support yet.
   reader_.AdvanceRead(count_remaining * sizeof(uint32_t));
 
+  if (cvars::log_draws) {
+    // Every draw the guest submits, before anything can drop it.
+    XELOGI("log_draws: PM4 {} prim:{} count:{} ib:{:08X} viz:{:03X}",
+           opcode_name, uint32_t(vgt_draw_initiator.prim_type),
+           uint32_t(vgt_draw_initiator.num_indices),
+           is_indexed ? register_file_->values[XE_GPU_REG_VGT_DMA_BASE] : 0,
+           viz_query_condition);
+  }
+
   if (draw_succeeded) {
     // A consumer draw whose survey is still outstanding runs under the
     // backend's predicate instead of blocking. Surveys themselves are
@@ -1379,10 +1399,15 @@ bool COMMAND_PROCESSOR::ExecutePacketType3Draw(
       }
 
       if (!draw_succeeded) {
-        XELOGE("{}({}, {}, {}): Failed in backend", opcode_name,
-               vgt_draw_initiator.num_indices,
-               uint32_t(vgt_draw_initiator.prim_type),
-               uint32_t(vgt_draw_initiator.source_select));
+        // Throttled, a persistent cause fails every draw of every frame.
+        static uint32_t backend_failure_count = 0;
+        if (xe::is_pow2(++backend_failure_count)) {
+          XELOGE("{}({}, {}, {}): Failed in backend, {} draws so far",
+                 opcode_name, vgt_draw_initiator.num_indices,
+                 uint32_t(vgt_draw_initiator.prim_type),
+                 uint32_t(vgt_draw_initiator.source_select),
+                 backend_failure_count);
+        }
       }
     }
   }

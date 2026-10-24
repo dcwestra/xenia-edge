@@ -17,6 +17,7 @@
 #include "third_party/fmt/include/fmt/format.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/byte_order.h"
+#include "xenia/base/clock.h"
 #include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
@@ -72,6 +73,64 @@ DECLARE_bool(precise_interpolation);
 namespace xe {
 namespace gpu {
 namespace vulkan {
+
+namespace {
+
+// How often, at most, the driver pipeline cache is saved while pipelines keep
+// being created.
+constexpr uint64_t kVkPipelineCacheSaveIntervalMs = 60 * 1000;
+
+// Writes |cache| to |path| through a temporary file and a rename, so a crash
+// or a full disk mid-write never leaves a truncated cache for the next launch.
+void SaveVkPipelineCache(const ui::vulkan::VulkanDevice* vulkan_device,
+                         VkPipelineCache cache,
+                         const std::filesystem::path& path) {
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  // Pipelines created on other threads can grow the cache between the size
+  // query and the read. A short read is still a valid cache, so take it.
+  std::vector<uint8_t> cache_data;
+  size_t cache_size = 0;
+  VkResult result = VK_INCOMPLETE;
+  for (int attempt = 0; attempt < 3 && result == VK_INCOMPLETE; ++attempt) {
+    if (dfn.vkGetPipelineCacheData(device, cache, &cache_size, nullptr) !=
+            VK_SUCCESS ||
+        !cache_size) {
+      return;
+    }
+    cache_data.resize(cache_size);
+    result = dfn.vkGetPipelineCacheData(device, cache, &cache_size,
+                                        cache_data.data());
+  }
+  if ((result != VK_SUCCESS && result != VK_INCOMPLETE) || !cache_size) {
+    return;
+  }
+  std::filesystem::path temp_path = path;
+  temp_path += ".tmp";
+  FILE* cache_file = xe::filesystem::OpenFile(temp_path, "wb");
+  if (!cache_file) {
+    XELOGW("Failed to open {} to save the VkPipelineCache",
+           xe::strip_pii(xe::path_to_utf8(temp_path)));
+    return;
+  }
+  bool written =
+      fwrite(cache_data.data(), 1, cache_size, cache_file) == cache_size;
+  written = fflush(cache_file) == 0 && written;
+  written = fclose(cache_file) == 0 && written;
+  std::error_code ec;
+  if (written) {
+    std::filesystem::rename(temp_path, path, ec);
+  }
+  if (!written || ec) {
+    std::filesystem::remove(temp_path, ec);
+    XELOGW("Failed to save {} bytes of VkPipelineCache data to {}", cache_size,
+           xe::strip_pii(xe::path_to_utf8(path)));
+    return;
+  }
+  XELOGI("Saved {} bytes of VkPipelineCache data", cache_size);
+}
+
+}  // namespace
 
 VulkanPipelineCache::VulkanPipelineCache(
     VulkanCommandProcessor& command_processor,
@@ -864,6 +923,8 @@ void VulkanPipelineCache::EndSubmission() {
     shader_storage_file_flush_needed_ = false;
     pipeline_storage_file_flush_needed_ = false;
   }
+
+  MaybeSaveVkPipelineCacheInBackground();
 
   // Release placeholder pipelines the GPU is now done with.
   ProcessDeferredDestructions();
@@ -2340,6 +2401,9 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
   VkPipeline pipeline;
   VkResult result = dfn.vkCreateGraphicsPipelines(
       device, vk_pipeline_cache_, 1, &pipeline_create_info, nullptr, &pipeline);
+  if (result == VK_SUCCESS && vk_pipeline_cache_ != VK_NULL_HANDLE) {
+    vk_pipeline_cache_creations_.fetch_add(1, std::memory_order_relaxed);
+  }
   if (result == VK_SUCCESS && profile) {
     // Driver SPIR-V->ISA compile + link time.
     XELOGI(
@@ -2539,19 +2603,32 @@ void VulkanPipelineCache::InitializeShaderStorage(
     std::error_code ec;
     std::filesystem::create_directories(shader_storage_local_root, ec);
   }
-  vk_pipeline_cache_path_ =
-      shader_storage_local_root /
-      fmt::format("{:08X}.vk.bin", shader_storage_title_id_);
-
   const ui::vulkan::VulkanDevice* const vulkan_device =
       command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
 
+  // Named per GPU, so the two GPUs of a hybrid laptop don't each discard and
+  // overwrite the other's cache on every switch.
+  vk_pipeline_cache_path_ =
+      shader_storage_local_root /
+      fmt::format("{:08X}.{:04X}-{:04X}.vk.bin", shader_storage_title_id_,
+                  vulkan_device->properties().vendorID,
+                  vulkan_device->properties().deviceID);
+  std::filesystem::path load_path = vk_pipeline_cache_path_;
+  if (!std::filesystem::exists(load_path)) {
+    // The pre-per-GPU name. The driver rejects it if it is another GPU's.
+    std::filesystem::path legacy_path =
+        shader_storage_local_root /
+        fmt::format("{:08X}.vk.bin", shader_storage_title_id_);
+    if (std::filesystem::exists(legacy_path)) {
+      load_path = legacy_path;
+    }
+  }
+
   // Try to load existing VkPipelineCache data.
   std::vector<uint8_t> pipeline_cache_data;
-  if (FILE* cache_file =
-          xe::filesystem::OpenFile(vk_pipeline_cache_path_, "rb")) {
+  if (FILE* cache_file = xe::filesystem::OpenFile(load_path, "rb")) {
     xe::filesystem::Seek(cache_file, 0, SEEK_END);
     int64_t cache_size = xe::filesystem::Tell(cache_file);
     if (cache_size > 0) {
@@ -2563,6 +2640,29 @@ void VulkanPipelineCache::InitializeShaderStorage(
     fclose(cache_file);
     XELOGI("Loaded {} bytes of VkPipelineCache data",
            pipeline_cache_data.size());
+  }
+  // The driver silently ignores data from another driver version or GPU, and
+  // every pipeline then compiles from scratch while the title runs. Say so.
+  // The header is headerSize, headerVersion, vendorID, deviceID, then the
+  // pipelineCacheUUID.
+  if (pipeline_cache_data.size() >= sizeof(uint32_t) * 4 + VK_UUID_SIZE) {
+    VkPhysicalDeviceProperties physical_device_properties;
+    vulkan_device->vulkan_instance()->functions().vkGetPhysicalDeviceProperties(
+        vulkan_device->physical_device(), &physical_device_properties);
+    uint32_t header[4];
+    std::memcpy(header, pipeline_cache_data.data(), sizeof(header));
+    if (header[2] != physical_device_properties.vendorID ||
+        header[3] != physical_device_properties.deviceID ||
+        std::memcmp(pipeline_cache_data.data() + sizeof(header),
+                    physical_device_properties.pipelineCacheUUID,
+                    VK_UUID_SIZE)) {
+      XELOGW(
+          "VkPipelineCache data is from another GPU driver version, likely a "
+          "driver update. Every pipeline compiles again, so expect stutter or "
+          "briefly missing or flashing objects for the first minutes of play, "
+          "once.");
+      pipeline_cache_data.clear();
+    }
   }
 
   // Recreate the VkPipelineCache with the loaded data.
@@ -2587,6 +2687,9 @@ void VulkanPipelineCache::InitializeShaderStorage(
     dfn.vkCreatePipelineCache(device, &pipeline_cache_create_info, nullptr,
                               &vk_pipeline_cache_);
   }
+  vk_pipeline_cache_saved_creations_ =
+      vk_pipeline_cache_creations_.load(std::memory_order_relaxed);
+  vk_pipeline_cache_last_save_ms_ = Clock::QueryHostUptimeMillis();
 
   if (ReplayStoredPipelines(
           pipeline_stored_descriptions,
@@ -2736,30 +2839,51 @@ const char* VulkanPipelineCache::QueueStoredPipeline(
   return nullptr;
 }
 
+void VulkanPipelineCache::MaybeSaveVkPipelineCacheInBackground() {
+  if (vk_pipeline_cache_ == VK_NULL_HANDLE || vk_pipeline_cache_path_.empty() ||
+      vk_pipeline_cache_save_busy_.load(std::memory_order_acquire)) {
+    return;
+  }
+  const uint64_t creations =
+      vk_pipeline_cache_creations_.load(std::memory_order_relaxed);
+  if (creations == vk_pipeline_cache_saved_creations_) {
+    return;
+  }
+  const uint64_t now_ms = Clock::QueryHostUptimeMillis();
+  if (now_ms - vk_pipeline_cache_last_save_ms_ <
+      kVkPipelineCacheSaveIntervalMs) {
+    return;
+  }
+  // The previous save has finished (not busy), reap its thread.
+  JoinVkPipelineCacheSave();
+  vk_pipeline_cache_saved_creations_ = creations;
+  vk_pipeline_cache_last_save_ms_ = now_ms;
+  vk_pipeline_cache_save_busy_.store(true, std::memory_order_release);
+  // VkPipelineCache is internally synchronized, so this may read it while the
+  // creation threads keep adding to it. ShutdownShaderStorage joins before the
+  // cache is destroyed.
+  vk_pipeline_cache_save_thread_ = std::thread(
+      [this, vulkan_device = command_processor_.GetVulkanDevice(),
+       cache = vk_pipeline_cache_, path = vk_pipeline_cache_path_]() {
+        xe::threading::set_name("VkPipelineCache Save");
+        SaveVkPipelineCache(vulkan_device, cache, path);
+        vk_pipeline_cache_save_busy_.store(false, std::memory_order_release);
+      });
+}
+
+void VulkanPipelineCache::JoinVkPipelineCacheSave() {
+  if (vk_pipeline_cache_save_thread_.joinable()) {
+    vk_pipeline_cache_save_thread_.join();
+  }
+}
+
 void VulkanPipelineCache::ShutdownShaderStorage() {
+  JoinVkPipelineCacheSave();
   // Save VkPipelineCache to disk before shutting down storage.
   if (vk_pipeline_cache_ != VK_NULL_HANDLE &&
       !vk_pipeline_cache_path_.empty()) {
-    const ui::vulkan::VulkanDevice* const vulkan_device =
-        command_processor_.GetVulkanDevice();
-    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
-    const VkDevice device = vulkan_device->device();
-
-    size_t cache_size = 0;
-    if (dfn.vkGetPipelineCacheData(device, vk_pipeline_cache_, &cache_size,
-                                   nullptr) == VK_SUCCESS &&
-        cache_size > 0) {
-      std::vector<uint8_t> cache_data(cache_size);
-      if (dfn.vkGetPipelineCacheData(device, vk_pipeline_cache_, &cache_size,
-                                     cache_data.data()) == VK_SUCCESS) {
-        if (FILE* cache_file =
-                xe::filesystem::OpenFile(vk_pipeline_cache_path_, "wb")) {
-          fwrite(cache_data.data(), 1, cache_size, cache_file);
-          fclose(cache_file);
-          XELOGI("Saved {} bytes of VkPipelineCache data", cache_size);
-        }
-      }
-    }
+    SaveVkPipelineCache(command_processor_.GetVulkanDevice(),
+                        vk_pipeline_cache_, vk_pipeline_cache_path_);
   }
   vk_pipeline_cache_path_.clear();
 

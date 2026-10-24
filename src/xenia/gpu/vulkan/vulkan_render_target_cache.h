@@ -224,6 +224,23 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       xenos::ColorRenderTargetFormat format,
       bool* is_integer_out = nullptr) const;
 
+  // EDRAM ownership transfers performed, for the frame rate log.
+  struct TransferStats {
+    // Indexed by (destination is depth) * 2 + (source is depth).
+    uint64_t count[4] = {};
+    // Destination pixels times MSAA samples, at 1x resolution scale.
+    uint64_t samples[4] = {};
+    // Transfers into depth by destination MSAA sample count - 1x, 2x, 4x.
+    uint64_t to_depth_by_msaa[3] = {};
+    // Sources whose stencil bits were checked on the GPU before drawing them.
+    uint64_t stencil_bit_checks = 0;
+  };
+  TransferStats TakeTransferStats() {
+    TransferStats stats = transfer_stats_;
+    transfer_stats_ = {};
+    return stats;
+  }
+
  protected:
   bool IsGammaFormatHostStorageSeparate() const override;
 
@@ -743,11 +760,37 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   std::unordered_map<EdramDumpShaderKey, VkPipeline, EdramDumpShaderKey::Hasher>
       dump_pipelines_;
 
+  // Without VK_EXT_shader_stencil_export, a transfer into depth writes the
+  // stencil one bit per draw. For depth sources, a compute pass first ORs the
+  // stencil the source holds in the transferred area into one predicate per
+  // bit, and conditional rendering skips the draws of bits clear everywhere.
+  static constexpr uint32_t kStencilBitPredicateSlots = 256;
+  static constexpr uint32_t kStencilBitPredicateSlotBytes =
+      sizeof(uint32_t) * 8;
+  // By the host sample count, log2. VK_NULL_HANDLE if failed to create.
+  VkPipeline GetStencilBitPredicatePipeline(uint32_t host_samples_log2);
+  uint32_t GetHostSamplesLog2(RenderTargetKey key) const {
+    return (key.msaa_samples == xenos::MsaaSamples::k2X &&
+            !msaa_2x_attachments_supported_)
+               ? 2
+               : uint32_t(key.msaa_samples);
+  }
+  VkBuffer stencil_bit_predicate_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory stencil_bit_predicate_buffer_memory_ = VK_NULL_HANDLE;
+  VkDescriptorSet stencil_bit_predicate_descriptor_set_ = VK_NULL_HANDLE;
+  std::array<VkPipeline, 3> stencil_bit_predicate_pipelines_ = {};
+  std::array<bool, 3> stencil_bit_predicate_pipelines_tried_ = {};
+  uint32_t stencil_bit_predicate_next_slot_ = 0;
+  // Temporary storage for PerformTransfersAndResolveClears - the source and
+  // its slot.
+  std::vector<std::pair<RenderTarget*, uint32_t>> stencil_bit_predicate_slots_;
+
   // Temporary storage for Resolve.
   std::vector<Transfer> clear_transfers_[2];
 
   // Temporary storage for PerformTransfersAndResolveClears.
   std::vector<TransferInvocation> current_transfer_invocations_;
+  TransferStats transfer_stats_;
 
   // Temporary storage for DumpRenderTargets.
   std::vector<ResolveCopyDumpRectangle> dump_rectangles_;

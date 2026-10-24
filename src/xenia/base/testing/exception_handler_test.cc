@@ -24,6 +24,15 @@
 #include <intrin.h>
 #endif
 
+#if XE_PLATFORM_LINUX && !XE_PLATFORM_ANDROID
+#include <signal.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <cerrno>
+#include <string>
+#endif
+
 namespace xe {
 namespace test {
 
@@ -114,6 +123,57 @@ TEST_CASE("EXCEPTION_HANDLER_RUNS_IN_HOST_FP_MODE", "[exception]") {
   // The interrupted code got its own FP control back.
   REQUIRE(fp_control_after == kGuestLikeFpControl);
 }
+
+#if XE_PLATFORM_LINUX && !XE_PLATFORM_ANDROID
+namespace {
+bool DeclineEveryException(Exception*, void*) { return false; }
+}  // namespace
+
+// An unhandled host crash has to leave a report behind, as the asynchronous
+// logger never runs again. Crashes a child and reads what it wrote to stderr.
+TEST_CASE("UNHANDLED_FAULT_WRITES_CRASH_REPORT", "[exception]") {
+  int pipe_fds[2];
+  REQUIRE(pipe(pipe_fds) == 0);
+  const pid_t pid = fork();
+  REQUIRE(pid >= 0);
+  if (pid == 0) {
+    // RLIMIT_CORE of 1 makes the kernel skip piped core dumps, so the expected
+    // crash doesn't reach systemd-coredump or a desktop crash reporter.
+    rlimit core_limit = {1, 1};
+    setrlimit(RLIMIT_CORE, &core_limit);
+    dup2(pipe_fds[1], STDERR_FILENO);
+    close(pipe_fds[0]);
+    close(pipe_fds[1]);
+    // The test runner's own handler would claim the signal otherwise.
+    signal(SIGSEGV, SIG_DFL);
+    ExceptionHandler::Install(DeclineEveryException, nullptr);
+    *reinterpret_cast<volatile int*>(uintptr_t(16)) = 1;
+    _exit(0);
+  }
+  close(pipe_fds[1]);
+  std::string output;
+  char buffer[4096];
+  while (true) {
+    const ssize_t read_size = read(pipe_fds[0], buffer, sizeof(buffer));
+    if (read_size < 0 && errno == EINTR) {
+      continue;
+    }
+    if (read_size <= 0) {
+      break;
+    }
+    output.append(buffer, size_t(read_size));
+  }
+  close(pipe_fds[0]);
+  int status = 0;
+  REQUIRE(waitpid(pid, &status, 0) == pid);
+  INFO(output);
+  // Still dies of the original signal after reporting.
+  REQUIRE(WIFSIGNALED(status));
+  REQUIRE(WTERMSIG(status) == SIGSEGV);
+  REQUIRE(output.find("FATAL HOST CRASH: SIGSEGV") != std::string::npos);
+  REQUIRE(output.find("END OF HOST CRASH REPORT") != std::string::npos);
+}
+#endif  // XE_PLATFORM_LINUX && !XE_PLATFORM_ANDROID
 
 }  // namespace test
 }  // namespace xe

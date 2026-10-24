@@ -12,12 +12,16 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <random>
 #include <type_traits>
 
 #if XE_PLATFORM_MAC
 #include <sys/mman.h>
+#endif
+#if XE_PLATFORM_LINUX
+#include <unistd.h>
 #endif
 
 #include "third_party/fmt/include/fmt/format.h"
@@ -205,7 +209,36 @@ Memory::~Memory() {
   physical_membase_ = nullptr;
 }
 
+#if XE_PLATFORM_GNU_LINUX
+// Every mprotect of part of a mapping splits it into a separate VMA, and write
+// watches over guest memory make many. Past vm.max_map_count mprotect fails
+// with ENOMEM, which surfaces as lost watches and corrupt rendering far from
+// the cause, so say so up front where the old 65530 default is still in use.
+static void WarnIfMapCountLimitLow() {
+  constexpr uint64_t kRecommendedMapCount = 1048576;
+  constexpr uint64_t kLowMapCount = 262144;
+  FILE* file = std::fopen("/proc/sys/vm/max_map_count", "r");
+  if (!file) {
+    return;
+  }
+  unsigned long long map_count = 0;
+  const bool read = std::fscanf(file, "%llu", &map_count) == 1;
+  std::fclose(file);
+  if (!read || map_count >= kLowMapCount) {
+    return;
+  }
+  XELOGW(
+      "vm.max_map_count is {}, which demanding titles can exhaust (memory "
+      "protection then fails). Raise it with: sudo sysctl -w "
+      "vm.max_map_count={} (persist it in /etc/sysctl.d/).",
+      map_count, kRecommendedMapCount);
+}
+#endif  // XE_PLATFORM_GNU_LINUX
+
 bool Memory::Initialize() {
+#if XE_PLATFORM_GNU_LINUX
+  WarnIfMapCountLimitLow();
+#endif
   file_name_ = fmt::format("xenia_memory_{}", Clock::QueryHostTickCount());
 
   // Create main page file-backed mapping. This is all reserved but
@@ -355,6 +388,43 @@ bool Memory::Initialize() {
          sizeof(uint32_t));
 
   return true;
+}
+
+void Memory::WritePhysicalUnprotected(uint32_t guest_address, const void* data,
+                                      size_t length) {
+  guest_address &= 0x1FFFFFFF;
+  length = std::min(length, size_t(0x20000000 - guest_address));
+#if XE_PLATFORM_LINUX
+  // The physical view maps the backing file from 0x100000000, and writing the
+  // file isn't subject to any view's protection.
+  if (mapping_ != xe::memory::kFileMappingHandleInvalid) {
+    const uint8_t* source = static_cast<const uint8_t*>(data);
+    off_t offset = off_t(0x100000000ull + guest_address);
+    while (length) {
+      ssize_t written = pwrite(mapping_, source, length, offset);
+      if (written < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed)) {
+          XELOGE("Memory: Failed to write guest physical memory at {:08X}: {}",
+                 uint32_t(offset - 0x100000000ull), std::strerror(errno));
+        }
+        break;
+      }
+      source += written;
+      offset += written;
+      length -= size_t(written);
+    }
+    if (!length) {
+      return;
+    }
+    data = source;
+    guest_address = uint32_t(offset - 0x100000000ull);
+  }
+#endif
+  std::memcpy(TranslatePhysical(guest_address), data, length);
 }
 
 void Memory::SetMMIOExceptionRecordingCallback(
@@ -1787,27 +1857,6 @@ bool Memory::Restore(ByteStream* stream) {
   return true;
 }
 
-uint32_t FromPageAccess(xe::memory::PageAccess protect) {
-  switch (protect) {
-    case memory::PageAccess::kNoAccess:
-      return kMemoryProtectNoAccess;
-    case memory::PageAccess::kReadOnly:
-      return kMemoryProtectRead;
-    case memory::PageAccess::kReadWrite:
-      return kMemoryProtectRead | kMemoryProtectWrite;
-    case memory::PageAccess::kExecuteReadOnly:
-      // Guest memory cannot be executable - this should never happen :)
-      assert_always();
-      return kMemoryProtectRead;
-    case memory::PageAccess::kExecuteReadWrite:
-      // Guest memory cannot be executable - this should never happen :)
-      assert_always();
-      return kMemoryProtectRead | kMemoryProtectWrite;
-  }
-
-  return kMemoryProtectNoAccess;
-}
-
 BaseHeap::BaseHeap()
     : membase_(nullptr), heap_base_(0), heap_size_(0), page_size_(0) {}
 
@@ -2468,16 +2517,17 @@ bool BaseHeap::ApplyHostProtect(uint32_t start_page_number,
       (host_offset_aligned &&
        (((page_count << page_size_shift_) & page_size_mask) == 0) &&
        (((start_page_number << page_size_shift_) & page_size_mask) == 0))) {
-    memory::PageAccess old_protect_access;
+    // The old protection is the guest's, so the page table answers it, as on
+    // every other path here. The host's can be stricter (watches), and asking
+    // for it on POSIX parses /proc/self/maps under the global lock.
     if (!xe::memory::Protect(
             TranslateRelative(start_page_number << page_size_shift_),
-            page_count << page_size_shift_, ToPageAccess(protect),
-            old_protect ? &old_protect_access : nullptr)) {
+            page_count << page_size_shift_, ToPageAccess(protect), nullptr)) {
       XELOGE("BaseHeap::Protect failed due to host VirtualProtect failure");
       return false;
     }
     if (old_protect) {
-      *old_protect = FromPageAccess(old_protect_access);
+      *old_protect = page_table_[start_page_number].current_protect;
     }
     return true;
   }

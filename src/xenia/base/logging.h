@@ -85,6 +85,10 @@ void FlushLog();
 // Whether the calling thread is the one writing the log out, which would wait
 // on itself to log.
 bool IsLogWriterThread();
+// The log file's descriptor, so a fatal signal handler can write a crash
+// report into the log without going through the logger. -1 if there is none,
+// and always on Windows.
+int GetLogFileDescriptor();
 
 // The result of path_to_utf8, in filesystem.h.
 class Utf8Path;

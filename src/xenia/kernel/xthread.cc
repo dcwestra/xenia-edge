@@ -1294,21 +1294,29 @@ uint32_t XThread::SelfSuspend() {
 
 X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable,
                         uint64_t interval) {
-  int64_t timeout_ticks = interval;
-  uint32_t timeout_ms;
-  if (timeout_ticks > 0) {
-    // Absolute time, based on January 1, 1601.
-    // TODO(benvanik): convert time to relative time.
-    assert_always();
-    timeout_ms = 0;
-  } else if (timeout_ticks < 0) {
-    // Relative time.
-    timeout_ms = uint32_t(-timeout_ticks / 10000);  // Ticks -> MS
-  } else {
-    timeout_ms = 0;
+  // Remaining delay in 100ns ticks. Negative is relative, positive absolute
+  // (since January 1, 1601), already passed meaning no delay.
+  const int64_t interval_ticks = static_cast<int64_t>(interval);
+  uint64_t delay_ticks = 0;
+  if (interval_ticks < 0) {
+    delay_ticks = uint64_t(0) - uint64_t(interval_ticks);
+  } else if (interval_ticks > 0) {
+    const uint64_t now = Clock::QueryGuestSystemTime();
+    if (uint64_t(interval_ticks) > now) {
+      delay_ticks = uint64_t(interval_ticks) - now;
+    }
   }
-
-  timeout_ms = Clock::ScaleGuestDurationMillis(timeout_ms);
+  // Rounded up, so a nonzero delay never becomes a zero one.
+  uint64_t timeout_us = delay_ticks / 10 + (delay_ticks % 10 ? 1 : 0);
+  if (timeout_us && !cvars::clock_no_scaling) {
+    timeout_us = std::max<uint64_t>(
+        1, uint64_t(double(timeout_us) * Clock::guest_time_scalar()));
+  }
+  // A nonzero delay under 1ms waits for the next clock tick, as the console's
+  // timer does, rather than returning at once. Truncating it to 0 made a guest
+  // that sleeps in sub-millisecond steps spin a host core.
+  const uint64_t timeout_ms =
+      timeout_us ? std::max<uint64_t>(1, timeout_us / 1000) : 0;
 
   if (fiber_) {
     // Cooperative path: yield/park the fiber instead of sleeping the dispatch
@@ -1361,14 +1369,14 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable,
       }
     }
   } else {
-    if (timeout_ms == 0) {
-      if (priority_ <= xe::threading::ThreadPriority::kBelowNormal) {
-        xe::threading::NanoSleep(100);
-      } else {
-        xe::threading::MaybeYield();
-      }
+    if (timeout_us == 0) {
+      // A plain yield on every host. This used to compare the guest priority
+      // against the host ThreadPriority constants, whose values differ per
+      // platform, so low-priority threads slept here only off Windows, and for
+      // 50us+ given Linux timer slack.
+      xe::threading::MaybeYield();
     } else {
-      xe::threading::Sleep(std::chrono::milliseconds(timeout_ms));
+      xe::threading::Sleep(std::chrono::microseconds(timeout_us));
     }
   }
 
