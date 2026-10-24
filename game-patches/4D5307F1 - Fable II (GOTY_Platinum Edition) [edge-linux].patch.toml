@@ -1,0 +1,28 @@
+title_name = "Fable II" # GOTY / Platinum Edition
+title_id = "4D5307F1"
+hash = "4145F96D2DEE2AB5" # default.xex
+
+# Patches from the edge-linux fork. Xenia merges every patch file for a title,
+# so this works next to the community file for the same game - but disable
+# that file's "Unlock Collectors Edition Content" if you enable the one here,
+# as that version crashes this executable.
+
+[[patch]]
+    name = "Unlock Collectors Edition Content (working)"
+    desc = "Unlocks Hal's items in the Guild chest and the Hall of the Dead dungeon. Makes the script function IsCollectorsEdition (0x824ACAE0, lbz r3, 0x3E1(r3)) return 1; the game sets that flag only when it finds the Collector's Edition content package. The community patch at 0x824B366C instead replaces a callback's function pointer with 1, so the game calls address 1 and crashes when the Guild Cave loads."
+    author = "edge-linux fork (AI-assisted); original idea by Guy"
+    is_enabled = false
+
+    [[patch.be32]]
+        address = 0x824acae0
+        value = 0x38600001 # li r3, 1 (was lbz r3, 0x3E1(r3))
+
+[[patch]]
+    name = "Realtime Texture Morphing"
+    desc = "Every texture morph job (age, morality, scars, makeup) takes the game's realtime GPU path instead of the baked path, whose render-to-texture output the CPU reads back and compresses. Only needed when readback_resolve is off: with it on, the baked path renders correctly in this fork, without the hero's and dog's skin going black. Replaces lbz r9, 0x20(r30) at 0x82A7607C (the job's realtime flag) with li r9, 1."
+    author = "himdo (Fable-2-Recomp, MIT); diagnosis just-harry (Unofficial Xenia femtofork)"
+    is_enabled = false
+
+    [[patch.be32]]
+        address = 0x82a7607c
+        value = 0x39200001 # li r9, 1

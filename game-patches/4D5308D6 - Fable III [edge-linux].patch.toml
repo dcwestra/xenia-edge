@@ -1,0 +1,17 @@
+title_name = "Fable III"
+title_id = "4D5308D6"
+hash = "15A2B07FFF0A2754" # default.xex
+#media_id = "D99E18E7"
+
+[[patch]]
+    name = "Unlock Limited Collector's Edition Content"
+    desc = "Makes the script function IsCollectorsEdition return 1, so the game hands out what its scripts give Limited Collector's Edition owners (AddLCEItem, AddLCEMoney). Its native getter, lbz r3, 0x72(r3) at 0x827D9000, is shared with IsAdopted, so instead of changing it this points the IsCollectorsEdition registration at 0x823CC904/0x823CC910 to an existing li r3, 1 / blr function at 0x821CD0F4."
+    author = "edge-linux fork (AI-assisted)"
+    is_enabled = false
+
+    [[patch.be32]]
+        address = 0x823cc904
+        value = 0x3d60821d # lis r11, 0x821D (was lis r11, 0x827E)
+    [[patch.be32]]
+        address = 0x823cc910
+        value = 0x392bd0f4 # addi r9, r11, -0x2F0C (was addi r9, r11, -0x7000)

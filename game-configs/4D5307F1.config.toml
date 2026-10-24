@@ -1,0 +1,13 @@
+# Fable II (4D5307F1) - recommended per-game settings for the edge-linux fork.
+# Copy to <Xenia storage root>/config/4D5307F1.config.toml.
+
+[GPU]
+# The dog's fur is 15 shell layers about 0.001 units apart, which rely on exact
+# ties in the Xbox 360's 24-bit float depth. 32-bit host depth breaks the ties,
+# so about half the layers flicker; 16 units is about two 24-bit depth steps.
+# Finding by himdo (Fable-2-Recomp).
+shader_depth_bias = "014F8A02DB7B19CA:16"
+# Fable II reads occlusion query results for lighting and the moon's glow.
+# "fast" answers before the GPU has, leaning toward visible, which flashes
+# objects white and shows the glow through walls; "strict" waits for the GPU.
+occlusion_query = "strict"
