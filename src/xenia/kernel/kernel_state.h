@@ -50,6 +50,14 @@ class Processor;
 namespace xe {
 namespace kernel {
 
+namespace nui {
+class KinectMotor;
+class NuiDataStore;
+class NuiHud;
+class NuiIdentity;
+class PsCamDevice;
+}  // namespace nui
+
 constexpr fourcc_t kKernelSaveSignature = make_fourcc("KRNL");
 
 static constexpr const uint16_t kBaseKernelBuildVersion = 1888;
@@ -180,6 +188,17 @@ class KernelState {
   Emulator* emulator() const { return emulator_; }
   Memory* memory() const { return memory_; }
   cpu::Processor* processor() const { return processor_; }
+  // The Kinect camera, created when a title first asks for it.
+  nui::PsCamDevice* pscam_device();
+  // What the console keeps for Kinect titles' identity (Kinect ID) runtime.
+  nui::NuiDataStore* nui_data_store();
+  // The Kinect's tilt motor and LED, opened when first needed. Null without
+  // one.
+  nui::KinectMotor* kinect_motor();
+  // The skeletons Kinect titles hand the system's Kinect UI.
+  nui::NuiHud* nui_hud() const { return nui_hud_.get(); }
+  // The system's side of Kinect ID.
+  nui::NuiIdentity* nui_identity() const { return nui_identity_.get(); }
   vfs::VirtualFileSystem* file_system() const { return file_system_; }
 
   uint32_t title_id() const;
@@ -423,6 +442,13 @@ class KernelState {
   std::unique_ptr<SystemManagementController> smc_;
   std::unique_ptr<XmpVolumePatch> xmp_volume_patch_;
   std::unique_ptr<XConfig> xconfig_;
+  std::mutex pscam_device_mutex_;
+  std::unique_ptr<nui::PsCamDevice> pscam_device_;
+  std::unique_ptr<nui::NuiDataStore> nui_data_store_;
+  std::unique_ptr<nui::NuiHud> nui_hud_;
+  std::unique_ptr<nui::NuiIdentity> nui_identity_;
+  bool kinect_motor_opened_ = false;
+  std::unique_ptr<nui::KinectMotor> kinect_motor_;
 
   KernelVersion kernel_version_;
 

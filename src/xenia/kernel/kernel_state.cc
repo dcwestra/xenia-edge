@@ -18,6 +18,11 @@
 #include "xenia/emulator.h"
 #include "xenia/hid/input_system.h"
 #include "xenia/kernel/guest_scheduler.h"
+#include "xenia/kernel/nui/kinect_camera.h"
+#include "xenia/kernel/nui/nui_data_store.h"
+#include "xenia/kernel/nui/nui_hud.h"
+#include "xenia/kernel/nui/nui_identity.h"
+#include "xenia/kernel/nui/pscam_device.h"
 #include "xenia/kernel/user_module.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xam/xam_system_link.h"
@@ -72,6 +77,8 @@ KernelState::KernelState(Emulator* emulator)
   // Signing in a Live-enabled profile on boot reads the console's country and
   // language.
   xconfig_ = std::make_unique<XConfig>();
+  nui_hud_ = std::make_unique<nui::NuiHud>();
+  nui_identity_ = std::make_unique<nui::NuiIdentity>(this);
   xam_state_ = std::make_unique<xam::XamState>(emulator, this);
   guest_scheduler_ = std::make_unique<GuestScheduler>(this);
   smc_ = std::make_unique<SystemManagementController>();
@@ -88,6 +95,32 @@ KernelState::KernelState(Emulator* emulator)
   xenia_assert(fixed_alloc_worked);
 }
 
+nui::PsCamDevice* KernelState::pscam_device() {
+  std::lock_guard<std::mutex> lock(pscam_device_mutex_);
+  if (!pscam_device_) {
+    pscam_device_ = std::make_unique<nui::PsCamDevice>(this);
+  }
+  return pscam_device_.get();
+}
+
+nui::NuiDataStore* KernelState::nui_data_store() {
+  std::lock_guard<std::mutex> lock(pscam_device_mutex_);
+  if (!nui_data_store_) {
+    nui_data_store_ =
+        std::make_unique<nui::NuiDataStore>(emulator_->content_root() / "nui");
+  }
+  return nui_data_store_.get();
+}
+
+nui::KinectMotor* KernelState::kinect_motor() {
+  std::lock_guard<std::mutex> lock(pscam_device_mutex_);
+  if (!kinect_motor_opened_) {
+    kinect_motor_opened_ = true;
+    kinect_motor_ = nui::KinectMotor::Open();
+  }
+  return kinect_motor_.get();
+}
+
 KernelState::~KernelState() {
   // Before anything a timer callback touches goes away.
   XTimer::CancelAll();
@@ -95,6 +128,11 @@ KernelState::~KernelState() {
   SetExecutableModule(nullptr);
 
   ShutdownDispatchThread();
+
+  // Its worker calls into the title, so before the fibers go.
+  if (pscam_device_) {
+    pscam_device_->Shutdown();
+  }
 
   // Reclaiming leftover fibers releases handles, so run this while the object
   // table is still alive.

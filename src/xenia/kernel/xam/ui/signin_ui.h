@@ -24,7 +24,16 @@ class SigninUI final : public XamDialog {
 
   ~SigninUI() = default;
 
+  // For a Kinect player: their hand can choose OK or Cancel.
+  void EnableKinectCursor(uint32_t tracking_id) {
+    kinect_cursor_.Enable(tracking_id);
+  }
+  // The user index signed in with OK, or XUserIndexAny.
+  uint8_t signed_in_user() const { return signed_in_user_; }
+
  private:
+  void SignIn();
+
   void OnDraw(ImGuiIO& io) override;
 
   void ReloadProfiles(bool first_draw);
@@ -42,6 +51,9 @@ class SigninUI final : public XamDialog {
   std::vector<std::pair<uint64_t, std::string>> profile_data_;
   uint8_t chosen_slots_[XUserMaxUserCount] = {};
   uint64_t chosen_xuids_[XUserMaxUserCount] = {};
+
+  KinectCursor kinect_cursor_;
+  uint8_t signed_in_user_ = XUserIndexAny;
 
   bool creating_profile_ = false;
   char gamertag_[16] = "";

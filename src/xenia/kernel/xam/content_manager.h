@@ -274,6 +274,11 @@ class ContentManager {
                        uint32_t& content_license,
                        const uint32_t disc_number = -1);
   X_RESULT CloseContent(const std::string_view root_name);
+  // Mounts a package file named by the title rather than found by content
+  // data, for XamContentOpenFile.
+  X_RESULT OpenContentFile(const std::string_view root_name,
+                           const std::filesystem::path& package_path,
+                           uint32_t& content_license);
   X_RESULT GetContentThumbnail(const uint64_t xuid,
                                const XCONTENT_AGGREGATE_DATA& data,
                                std::vector<uint8_t>* buffer);

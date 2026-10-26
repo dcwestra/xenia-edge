@@ -13,10 +13,13 @@
 
 #include "xenia/app/emulator_window.h"
 #include "xenia/base/png_utils.h"
+#include "xenia/base/utf8.h"
 #include "xenia/base/system.h"
 #include "xenia/hid/input_system.h"
 #include "xenia/kernel/guest_scheduler.h"
 #include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/nui/nui_hud.h"
+#include "xenia/kernel/nui/nui_identity.h"
 #include "xenia/kernel/title_id_utils.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xam/content_manager.h"
@@ -38,6 +41,12 @@
 DEFINE_bool(storage_selection_dialog, false,
             "Show storage device selection dialog when the game requests it.",
             "UI");
+
+DEFINE_string(kinect_dialog_auto_buttons, "",
+              "For testing with a Kinect recording: the button to press (0 "
+              "the first) in each Kinect dialog in turn, two seconds after it "
+              "opens, comma-separated. Empty leaves them to the player.",
+              "Kernel");
 
 DECLARE_int32(license_mask);
 
@@ -177,17 +186,26 @@ X_RESULT xeXamDispatchWithoutDialog(std::function<X_RESULT()> run_callback,
 
 template <typename T>
 X_RESULT xeXamDispatchDialogAsync(T* dialog,
-                                  std::function<void(T*)> close_callback) {
+                                  std::function<void(T*)> close_callback,
+                                  std::function<void()> finish = nullptr) {
   kernel_state()->BroadcastNotification(kXNotificationSystemUI, true);
   // Important to pass captured vars by value here since we return from this
   // without waiting for the dialog to close so the original local vars will be
   // destroyed.
-  dialog->set_close_callback([dialog, close_callback]() {
+  dialog->set_close_callback([dialog, close_callback, finish]() {
     close_callback(dialog);
 
-    kernel_state()->xam_state()->is_xam_dialog_present_.store(false);
+    // What the system still does after the dialog goes, such as enrolling a
+    // Kinect player for Kinect ID, comes before the title hears it's closed.
+    if (!finish) {
+      kernel_state()->xam_state()->is_xam_dialog_present_.store(false);
+    }
 
-    auto run = []() -> void {
+    auto run = [finish]() -> void {
+      if (finish) {
+        finish();
+        kernel_state()->xam_state()->is_xam_dialog_present_.store(false);
+      }
       xe::threading::Sleep(kUIDelayMillis);
       kernel_state()->BroadcastNotification(kXNotificationSystemUI, false);
     };
@@ -217,13 +235,21 @@ void MessageBoxDialog::OnDraw(ImGuiIO& io) {
       ImGui::Text("%s", description_.c_str());
     }
 
+    kinect_cursor_.BeginFrame();
+    if (kinect_cursor_.enabled()) {
+      ImGui::TextDisabled("Hold your hand over a button to choose it.");
+    }
+    const ImVec2 button_size = kinect_cursor_.enabled()
+                                   ? ImVec2(ImGui::GetFontSize() * 9.0f,
+                                            ImGui::GetFontSize() * 3.0f)
+                                   : ImVec2(0.0f, 0.0f);
+
     // Buttons - ImGui handles navigation, A button activates via ImGui
     for (size_t i = 0; i < buttons_.size(); ++i) {
-      if (ImGui::Button(buttons_[i].c_str())) {
-        chosen_button_ = static_cast<uint32_t>(i);
-        ImGui::CloseCurrentPopup();
-        Close();
+      if (ImGui::Button(buttons_[i].c_str(), button_size)) {
+        Choose(static_cast<uint32_t>(i));
       }
+      kinect_cursor_.TrackItem(int32_t(i));
       // Set default focus on the default button
       if (i == default_button_) {
         ImGui::SetItemDefaultFocus();
@@ -232,10 +258,98 @@ void MessageBoxDialog::OnDraw(ImGuiIO& io) {
     }
     ImGui::Spacing();
     ImGui::Spacing();
+    const int32_t held = kinect_cursor_.EndFrame();
+    if (held >= 0 && uint32_t(held) < buttons_.size()) {
+      Choose(uint32_t(held));
+    }
     ImGui::EndPopup();
   } else {
     Close();
   }
+}
+
+void KinectCursor::BeginFrame() {
+  active_ = false;
+  hovered_ = -1;
+  if (!enabled_) {
+    return;
+  }
+  // The hand spans a little more than the dialog.
+  float x, y;
+  if (!kernel_state()->nui_hud()->GetHandCursor(tracking_id_, x, y)) {
+    return;
+  }
+  const ImVec2 window_pos = ImGui::GetWindowPos();
+  const ImVec2 window_size = ImGui::GetWindowSize();
+  pos_x_ = window_pos.x + (x * 1.4f - 0.2f) * window_size.x;
+  pos_y_ = window_pos.y + (y * 1.4f - 0.2f) * window_size.y;
+  active_ = true;
+}
+
+void KinectCursor::TrackItem(int32_t id) {
+  if (!active_) {
+    return;
+  }
+  const ImVec2 min = ImGui::GetItemRectMin();
+  const ImVec2 max = ImGui::GetItemRectMax();
+  if (pos_x_ >= min.x && pos_x_ < max.x && pos_y_ >= min.y &&
+      pos_y_ < max.y) {
+    hovered_ = id;
+  }
+}
+
+int32_t KinectCursor::EndFrame() {
+  if (!enabled_) {
+    return -1;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  // For testing with a Kinect recording, which can't aim at a button.
+  if (!cvars::kinect_dialog_auto_buttons.empty()) {
+    if (auto_start_ == std::chrono::steady_clock::time_point()) {
+      auto_start_ = now;
+      static uint32_t dialogs_opened = 0;
+      const auto buttons =
+          xe::utf8::split(cvars::kinect_dialog_auto_buttons, ",");
+      if (dialogs_opened < buttons.size()) {
+        auto_button_ = std::atoi(std::string(buttons[dialogs_opened]).c_str());
+      }
+      ++dialogs_opened;
+    } else if (auto_button_ >= 0 && now - auto_start_ > std::chrono::seconds(2)) {
+      return auto_button_;
+    }
+  }
+  if (!active_) {
+    held_ = -1;
+    return -1;
+  }
+  constexpr float kHoldSeconds = 1.5f;
+  if (hovered_ != held_) {
+    held_ = hovered_;
+    hold_start_ = now;
+  }
+  float progress = 0.0f;
+  if (held_ >= 0) {
+    progress = std::chrono::duration<float>(now - hold_start_).count() /
+               kHoldSeconds;
+  }
+  const ImVec2 pos(pos_x_, pos_y_);
+  ImDrawList* draw_list = ImGui::GetForegroundDrawList();
+  const float radius = ImGui::GetFontSize() * 1.2f;
+  draw_list->AddCircleFilled(pos, radius * 0.45f, IM_COL32(255, 255, 255, 230),
+                             24);
+  draw_list->AddCircle(pos, radius, IM_COL32(255, 255, 255, 160), 32, 2.0f);
+  if (progress > 0.0f) {
+    draw_list->PathArcTo(pos, radius, -1.5708f,
+                         -1.5708f + std::min(progress, 1.0f) * 6.2832f, 32);
+    draw_list->PathStroke(IM_COL32(16, 124, 16, 255), 0, 4.0f);
+  }
+  return progress >= 1.0f ? held_ : -1;
+}
+
+void MessageBoxDialog::Choose(uint32_t button) {
+  chosen_button_ = button;
+  ImGui::CloseCurrentPopup();
+  Close();
 }
 
 void KeyboardInputDialog::OnDraw(ImGuiIO& io) {
@@ -338,11 +452,14 @@ void KeyboardInputDialog::OnDraw(ImGuiIO& io) {
   ImGui::PopStyleColor(10);
 }
 
+// kinect: for the Kinect player with the tracking ID, choosing with their
+// hand.
 static dword_result_t XamShowMessageBoxUi(
     dword_t user_index, lpu16string_t title_ptr, lpu16string_t text_ptr,
     dword_t button_count, lpdword_t button_ptrs, dword_t active_button,
     dword_t flags, pointer_t<MESSAGEBOX_RESULT> result_ptr,
-    pointer_t<XAM_OVERLAPPED> overlapped) {
+    pointer_t<XAM_OVERLAPPED> overlapped, bool kinect = false,
+    uint32_t kinect_tracking_id = 0) {
   std::string title = title_ptr ? xe::to_utf8(title_ptr.value()) : "";
   std::string text = text_ptr ? xe::to_utf8(text_ptr.value()) : "";
 
@@ -399,15 +516,19 @@ static dword_result_t XamShowMessageBoxUi(
         overlapped);
   } else {
     auto close = [result_ptr](MessageBoxDialog* dialog) -> X_RESULT {
+      XELOGI("XamShowMessageBoxUI: button {} chosen", dialog->chosen_button());
       result_ptr->ButtonPressed = dialog->chosen_button();
       kernel_state()->xam_state()->is_xam_dialog_present_.store(false);
       return X_ERROR_SUCCESS;
     };
 
-    result = xeXamDispatchDialog<MessageBoxDialog>(
+    auto* dialog =
         new MessageBoxDialog(imgui_drawer, input_system, title, text, buttons,
-                             static_cast<uint32_t>(active_button)),
-        close, overlapped);
+                             static_cast<uint32_t>(active_button));
+    if (kinect) {
+      dialog->EnableKinectCursor(kinect_tracking_id);
+    }
+    result = xeXamDispatchDialog<MessageBoxDialog>(dialog, close, overlapped);
   }
 
   return result;
@@ -441,6 +562,33 @@ dword_result_t XamShowMessageBoxUIEx_entry(
                              overlapped);
 }
 DECLARE_XAM_EXPORT1(XamShowMessageBoxUIEx, kUI, kImplemented);
+
+// XamShowMessageBoxUI for a Kinect player, named by their skeleton tracking
+// ID (4D530A1A passes 255 as the user index along with it).
+dword_result_t XamShowNuiMessageBoxUI_entry(
+    dword_t tracking_id, dword_t user_index, lpu16string_t title_ptr,
+    lpu16string_t text_ptr, dword_t button_count, lpdword_t button_ptrs,
+    dword_t active_button, dword_t flags,
+    pointer_t<MESSAGEBOX_RESULT> result_ptr,
+    pointer_t<XAM_OVERLAPPED> overlapped) {
+  std::string buttons;
+  for (uint32_t i = 0; i < button_count; ++i) {
+    if (button_ptrs && button_ptrs[i]) {
+      buttons += fmt::format(
+          "{}\"{}\"", i ? ", " : "",
+          xe::to_utf8(xe::load_and_swap<std::u16string>(
+              kernel_state()->memory()->TranslateVirtual(button_ptrs[i]))));
+    }
+  }
+  XELOGI("XamShowNuiMessageBoxUI({:08X}, {}): {} [{}], flags {:X}",
+         uint32_t(tracking_id), uint32_t(user_index),
+         text_ptr ? xe::to_utf8(text_ptr.value()) : std::string(), buttons,
+         uint32_t(flags));
+  return XamShowMessageBoxUi(user_index, title_ptr, text_ptr, button_count,
+                             button_ptrs, active_button, flags, result_ptr,
+                             overlapped, true, tracking_id);
+}
+DECLARE_XAM_EXPORT1(XamShowNuiMessageBoxUI, kUI, kSketchy);
 
 dword_result_t XNotifyQueueUI_entry(dword_t exnq, dword_t dwUserIndex,
                                     qword_t qwAreas,
@@ -598,6 +746,21 @@ dword_result_t XamShowDeviceSelectorUI_entry(
       close, overlapped);
 }
 DECLARE_XAM_EXPORT1(XamShowDeviceSelectorUI, kUI, kImplemented);
+
+// XamShowDeviceSelectorUI for a Kinect player, named by their skeleton tracking
+// ID. Kinect titles pick where they save with it.
+dword_result_t XamShowNuiDeviceSelectorUI_entry(
+    dword_t tracking_id, dword_t user_index, dword_t content_type,
+    dword_t content_flags, qword_t total_requested, lpdword_t device_id_ptr,
+    pointer_t<XAM_OVERLAPPED> overlapped) {
+  XELOGI("XamShowNuiDeviceSelectorUI({:08X}, {}, {:08X}, {:08X}, {})",
+         uint32_t(tracking_id), uint32_t(user_index), uint32_t(content_type),
+         uint32_t(content_flags), uint64_t(total_requested));
+  return XamShowDeviceSelectorUI_entry(user_index, content_type, content_flags,
+                                       total_requested, device_id_ptr,
+                                       overlapped);
+}
+DECLARE_XAM_EXPORT1(XamShowNuiDeviceSelectorUI, kUI, kSketchy);
 
 const char kDiscReadErrorTitle[] = "Disc Read Error";
 const char kDiscReadErrorDescription[] =
@@ -796,6 +959,14 @@ dword_result_t XamShowMarketplaceUI_entry(dword_t user_index, dword_t ui_type,
 }
 DECLARE_XAM_EXPORT1(XamShowMarketplaceUI, kUI, kSketchy);
 
+dword_result_t XamShowNuiMarketplaceUI_entry(
+    dword_t tracking_id, dword_t user_index, dword_t ui_type, qword_t offer_id,
+    dword_t offer_type, dword_t content_category, dword_t title_id) {
+  return XamShowMarketplaceUI_entry(user_index, ui_type, offer_id, offer_type,
+                                    content_category, title_id);
+}
+DECLARE_XAM_EXPORT1(XamShowNuiMarketplaceUI, kUI, kSketchy);
+
 dword_result_t XamShowMarketplaceDownloadItemsUI_entry(
     dword_t user_index, dword_t ui_type, lpqword_t offers, dword_t num_offers,
     lpdword_t hresult_ptr, pointer_t<XAM_OVERLAPPED> overlapped) {
@@ -959,8 +1130,11 @@ bool xeDrawProfileContent(xe::ui::ImGuiDrawer* imgui_drawer,
   return true;
 }
 
+// kinect: for the Kinect player with the tracking ID, who is enrolled for
+// Kinect ID as the profile they sign in.
 X_RESULT xeXamShowSigninUI(uint32_t user_index, uint32_t users_needed,
-                           uint32_t flags) {
+                           uint32_t flags, bool kinect = false,
+                           uint32_t kinect_tracking_id = 0) {
   // Mask values vary. Probably matching user types? Local/remote?
   // Games seem to sit and loop until we trigger sign in notification.
   if (users_needed != 1 && users_needed != 2 && users_needed != 4) {
@@ -973,15 +1147,31 @@ X_RESULT xeXamShowSigninUI(uint32_t user_index, uint32_t users_needed,
 
   kernel_state()->xam_state()->is_xam_dialog_present_.store(true);
 
-  auto close = [](ui::SigninUI* dialog) -> void {};
+  auto close = [kinect, kinect_tracking_id](ui::SigninUI* dialog) -> void {
+    if (kinect && dialog->signed_in_user() != XUserIndexAny) {
+      kernel_state()->nui_identity()->RequestEnrollment(
+          kinect_tracking_id, dialog->signed_in_user());
+    }
+  };
+  // The player is the profile once enrolled, which the title looks for as
+  // the sign-in closes.
+  std::function<void()> finish;
+  if (kinect) {
+    finish = []() {
+      kernel_state()->nui_identity()->WaitForEnrollment(
+          std::chrono::seconds(10));
+    };
+  }
 
   const Emulator* emulator = kernel_state()->emulator();
   xe::ui::ImGuiDrawer* imgui_drawer = emulator->imgui_drawer();
-  return xeXamDispatchDialogAsync<ui::SigninUI>(
-      new ui::SigninUI(
-          imgui_drawer, kernel_state()->xam_state()->profile_manager(),
-          emulator->input_system()->GetLastUsedSlot(), users_needed),
-      close);
+  auto* dialog = new ui::SigninUI(
+      imgui_drawer, kernel_state()->xam_state()->profile_manager(),
+      emulator->input_system()->GetLastUsedSlot(), users_needed);
+  if (kinect) {
+    dialog->EnableKinectCursor(kinect_tracking_id);
+  }
+  return xeXamDispatchDialogAsync<ui::SigninUI>(dialog, close, finish);
 }
 
 X_RESULT xeXamShowCreateProfileUIEx(uint32_t user_index, dword_t flag,
@@ -1023,8 +1213,11 @@ dword_result_t XamShowNuiSigninUI_entry(dword_t tracking_id, dword_t user_index,
                                         dword_t flags) {
   uint32_t users_needed = 1;
   uint32_t sent_flags = flags | static_cast<uint32_t>(SigninUiFlags::NUI);
+  XELOGI("XamShowNuiSigninUI({:08X}, {}, {:X})", uint32_t(tracking_id),
+         uint32_t(user_index), uint32_t(flags));
   // xeXamNuiHudCheck(tracking_id) = success then continue else return
-  return xeXamShowSigninUI(user_index, users_needed, sent_flags);
+  return xeXamShowSigninUI(user_index, users_needed, sent_flags, true,
+                           tracking_id);
 }
 DECLARE_XAM_EXPORT1(XamShowNuiSigninUI, kUserProfiles, kSketchy);
 
@@ -1076,6 +1269,24 @@ dword_result_t XamShowAchievementsUI_entry(dword_t user_index,
       close);
 }
 DECLARE_XAM_EXPORT1(XamShowAchievementsUI, kUserProfiles, kImplemented);
+
+dword_result_t XamShowNuiAchievementsUI_entry(dword_t tracking_id,
+                                              dword_t user_index,
+                                              dword_t title_id) {
+  return XamShowAchievementsUI_entry(user_index, title_id);
+}
+DECLARE_XAM_EXPORT1(XamShowNuiAchievementsUI, kUserProfiles, kSketchy);
+
+dword_result_t XamShowNuiGamerCardUIForXUID_entry(dword_t tracking_id,
+                                                  dword_t user_index,
+                                                  qword_t xuid,
+                                                  dword_t unknown) {
+  // There is no gamer card to show.
+  XELOGI("XamShowNuiGamerCardUIForXUID({:08X}, {}, {:016X})",
+         uint32_t(tracking_id), uint32_t(user_index), uint64_t(xuid));
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamShowNuiGamerCardUIForXUID, kUI, kStub);
 
 dword_result_t XamShowGamerCardUI_entry(dword_t user_index) {
   auto user = kernel_state()->xam_state()->GetUserProfile(user_index);

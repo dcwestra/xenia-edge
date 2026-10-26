@@ -71,6 +71,37 @@ class XamGamepadDialog : public xe::ui::ImGuiGamepadDialog {
   std::function<void()> close_callback_ = nullptr;
 };
 
+// A Kinect player's hand moving a cursor over a dialog's buttons, a hand held
+// over one for a moment choosing it, as on a console.
+class KinectCursor {
+ public:
+  void Enable(uint32_t tracking_id) {
+    enabled_ = true;
+    tracking_id_ = tracking_id;
+  }
+  bool enabled() const { return enabled_; }
+
+  // Inside the dialog's window, before its buttons.
+  void BeginFrame();
+  // Right after a button.
+  void TrackItem(int32_t id);
+  // After the buttons: draws the cursor, and returns the button held long
+  // enough, else -1.
+  int32_t EndFrame();
+
+ private:
+  bool enabled_ = false;
+  uint32_t tracking_id_ = 0;
+  bool active_ = false;
+  float pos_x_ = 0.0f;
+  float pos_y_ = 0.0f;
+  int32_t hovered_ = -1;
+  int32_t held_ = -1;
+  std::chrono::steady_clock::time_point hold_start_;
+  std::chrono::steady_clock::time_point auto_start_;
+  int32_t auto_button_ = -1;
+};
+
 class MessageBoxDialog : public XamGamepadDialog {
  public:
   MessageBoxDialog(xe::ui::ImGuiDrawer* imgui_drawer,
@@ -90,11 +121,20 @@ class MessageBoxDialog : public XamGamepadDialog {
 
   uint32_t chosen_button() const { return chosen_button_; }
 
+  // Lets the hand of the Kinect player with the tracking ID (or any) choose
+  // a button by holding a cursor over it, as on a console.
+  void EnableKinectCursor(uint32_t tracking_id) {
+    kinect_cursor_.Enable(tracking_id);
+  }
+
   void OnDraw(ImGuiIO& io) override;
   virtual ~MessageBoxDialog() {}
 
  private:
+  void Choose(uint32_t button);
+
   bool has_opened_ = false;
+  KinectCursor kinect_cursor_;
   std::string title_;
   std::string description_;
   std::vector<std::string> buttons_;

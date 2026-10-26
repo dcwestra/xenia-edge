@@ -11,6 +11,7 @@
 #include <atomic>
 #include <thread>
 
+#include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/string_util.h"
@@ -30,6 +31,7 @@
 #include "xenia/kernel/xthread.h"
 #include "xenia/ui/imgui_dialog.h"
 #include "xenia/ui/imgui_drawer.h"
+#include "xenia/vfs/devices/host_path_entry.h"
 #include "xenia/vfs/devices/stfs_xbox.h"
 #include "xenia/vfs/devices/xcontent_container_device.h"
 #include "xenia/xbox.h"
@@ -558,14 +560,91 @@ dword_result_t XamContentCreateInternal_entry(
 }
 DECLARE_XAM_EXPORT1(XamContentCreateInternal, kContent, kImplemented);
 
+// A package file inside a disc image or another package can't be opened by
+// the container reader, which reads host files, so it gets a copy in the cache.
+static std::filesystem::path HostPathForPackageFile(vfs::Entry* entry) {
+  if (auto host_entry = dynamic_cast<vfs::HostPathEntry*>(entry)) {
+    return host_entry->host_path();
+  }
+  const std::filesystem::path folder =
+      kernel_state()->emulator()->cache_root() / "content_files" /
+      fmt::format("{:08X}", kernel_state()->title_id());
+  std::string name = entry->path();
+  for (char& c : name) {
+    if (c == '\\' || c == '/' || c == ':') {
+      c = '_';
+    }
+  }
+  const std::filesystem::path host_path = folder / name;
+  std::error_code ec;
+  if (std::filesystem::file_size(host_path, ec) == entry->size() && !ec) {
+    return host_path;
+  }
+  vfs::File* file = nullptr;
+  if (entry->Open(vfs::FileAccess::kFileReadData, &file) != X_STATUS_SUCCESS ||
+      !file) {
+    return {};
+  }
+  std::filesystem::create_directories(folder, ec);
+  const std::filesystem::path tmp_path = host_path.string() + ".tmp";
+  FILE* out = xe::filesystem::OpenFile(tmp_path, "wb");
+  bool ok = out != nullptr;
+  std::vector<uint8_t> buffer(1 << 20);
+  for (size_t offset = 0; ok && offset < entry->size();) {
+    size_t read = 0;
+    const size_t length =
+        std::min(buffer.size(), size_t(entry->size() - offset));
+    ok = file->ReadSync(std::span<uint8_t>(buffer.data(), length), offset,
+                        &read) == X_STATUS_SUCCESS &&
+         read && fwrite(buffer.data(), 1, read, out) == read;
+    offset += read;
+  }
+  if (out) {
+    fclose(out);
+  }
+  file->Destroy();
+  if (!ok) {
+    std::filesystem::remove(tmp_path, ec);
+    return {};
+  }
+  std::filesystem::rename(tmp_path, host_path, ec);
+  return ec ? std::filesystem::path() : host_path;
+}
+
 dword_result_t XamContentOpenFile_entry(
     dword_t user_index, lpstring_t root_name, lpstring_t path, dword_t flags,
     lpdword_t disposition_ptr, lpdword_t license_mask_ptr,
     pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
-  // TODO(gibbed): arguments assumed based on XamContentCreate.
-  return X_ERROR_FILE_NOT_FOUND;
+  // Mounts a content package file the title names by path as root_name.
+  // Kinect titles open the skeletal tracking model that ships with them this
+  // way, such as game:\Database.xmplr as stexemplar.
+  if (disposition_ptr) {
+    *disposition_ptr = 0;
+  }
+  X_RESULT result = X_ERROR_FILE_NOT_FOUND;
+  vfs::Entry* entry =
+      path ? kernel_state()->file_system()->ResolvePath(path.value()) : nullptr;
+  if (entry && !(entry->attributes() & vfs::kFileAttributeDirectory)) {
+    const std::filesystem::path host_path = HostPathForPackageFile(entry);
+    uint32_t content_license = 0;
+    if (!host_path.empty()) {
+      result = kernel_state()->content_manager()->OpenContentFile(
+          root_name.value(), host_path, content_license);
+    }
+    if (result == X_ERROR_SUCCESS) {
+      if (disposition_ptr) {
+        *disposition_ptr = uint32_t(kDispositionState::Open);
+      }
+      if (license_mask_ptr) {
+        *license_mask_ptr = content_license;
+      }
+    }
+  }
+  XELOGI("XamContentOpenFile({}, {}) = {:08X}", root_name.value(),
+         path ? path.value() : "", result);
+  return CompleteRequest(overlapped_ptr, result);
 }
-DECLARE_XAM_EXPORT1(XamContentOpenFile, kContent, kStub);
+DECLARE_XAM_EXPORT1(XamContentOpenFile, kContent, kImplemented);
 
 dword_result_t XamContentFlush_entry(lpstring_t root_name,
                                      pointer_t<XAM_OVERLAPPED> overlapped_ptr) {

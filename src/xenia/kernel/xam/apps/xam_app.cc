@@ -11,8 +11,13 @@
 
 #include "xenia/base/logging.h"
 #include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/nui/nui_data_store.h"
+#include "xenia/kernel/nui/nui_hud.h"
+#include "xenia/kernel/nui/nui_identity.h"
 #include "xenia/kernel/xam/xam_content_device.h"
 #include "xenia/kernel/xenumerator.h"
+
+DECLARE_bool(allow_nui_initialization);
 
 /* Notes:
    - Messages ids that start with 0x00021xxx are UI calls
@@ -173,6 +178,268 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
              data->deployment_type_ptr.get(), data->overlapped_ptr.get());
       return X_E_SUCCESS;
     }
+    case 0x0002A004:
+    case 0x0002A005:
+    case 0x0002A006:
+    case 0x0002A007:
+    case 0x0002A008:
+    case 0x0002A009: {
+      // The console's store for Kinect titles' identity (Kinect ID) runtime:
+      // a blob and its version by name (0x2A004 writes, 0x2A005 reads,
+      // 0x2A006 deletes) or by profile (0x2A007-0x2A009).
+      if (!cvars::allow_nui_initialization || !buffer_ptr) {
+        break;
+      }
+      struct X_NUI_DATA_REQUEST {
+        // A profile's XUID, or a name's address in the upper half.
+        xe::be<uint64_t> key;
+        // To read, the address the version goes to.
+        xe::be<uint64_t> version;
+        xe::be<uint32_t> buffer_ptr;
+        // To read, the address of the buffer's size, replaced with the data's.
+        xe::be<uint32_t> size;
+      };
+      const auto* request =
+          memory_->TranslateVirtual<const X_NUI_DATA_REQUEST*>(buffer_ptr);
+      const bool named = message <= 0x0002A006;
+      const nui::NuiDataStore::Kind kind =
+          named ? nui::NuiDataStore::Kind::kNamed
+                : nui::NuiDataStore::Kind::kProfileCache;
+      std::string key;
+      if (named) {
+        const uint32_t name_ptr = uint32_t(request->key >> 32);
+        if (!name_ptr) {
+          return X_E_INVALIDARG;
+        }
+        key = memory_->TranslateVirtual<const char*>(name_ptr);
+      } else {
+        key = nui::NuiDataStore::ProfileKey(request->key);
+      }
+      nui::NuiDataStore* store = kernel_state_->nui_data_store();
+      switch ((message - 0x0002A004) % 3) {
+        case 0: {
+          const uint32_t size = request->size;
+          const uint8_t* data = request->buffer_ptr
+                                    ? memory_->TranslateVirtual<const uint8_t*>(
+                                          request->buffer_ptr)
+                                    : nullptr;
+          XELOGI("XamApp: NUI data {} written, version {:X}, {} bytes", key,
+                 request->version.get(), size);
+          return store->Write(kind, key, request->version, data,
+                              data ? size : 0)
+                     ? X_E_SUCCESS
+                     : X_E_FAIL;
+        }
+        case 1: {
+          uint64_t version = 0;
+          std::vector<uint8_t> data;
+          store->Read(kind, key, version, data);
+          if (const uint32_t version_ptr = uint32_t(request->version)) {
+            xe::store_and_swap<uint64_t>(memory_->TranslateVirtual(version_ptr),
+                                         version);
+          }
+          if (!request->size) {
+            return X_E_INVALIDARG;
+          }
+          auto* size_ptr =
+              memory_->TranslateVirtual<xe::be<uint32_t>*>(request->size);
+          const uint32_t capacity = *size_ptr;
+          *size_ptr = uint32_t(data.size());
+          if (request->buffer_ptr) {
+            if (capacity < data.size()) {
+              return X_E_INSUFFICIENT_BUFFER;
+            }
+            std::memcpy(memory_->TranslateVirtual(request->buffer_ptr),
+                        data.data(), data.size());
+          }
+          return X_E_SUCCESS;
+        }
+        default:
+          XELOGI("XamApp: NUI data {} deleted", key);
+          store->Delete(kind, key);
+          return X_E_SUCCESS;
+      }
+    }
+    case 0x0002C00C: {
+      // A service of Kinect titles' identity runtime: an operation on a
+      // buffer, 0 and 1 decrypting what the NUI data store gave back, which
+      // is kept unencrypted here, and 2 looking up a tuning setting by name.
+      if (!cvars::allow_nui_initialization || !buffer_ptr) {
+        break;
+      }
+      struct X_NUI_IDENTITY_SERVICE_REQUEST {
+        xe::be<uint32_t> operation;
+        xe::be<uint32_t> unknown_04;
+        xe::be<uint64_t> parameter;
+        xe::be<uint32_t> in_ptr;
+        xe::be<uint32_t> in_size;
+        xe::be<uint32_t> out_ptr;
+        xe::be<uint32_t> out_size_ptr;
+      };
+      const auto* request =
+          memory_->TranslateVirtual<const X_NUI_IDENTITY_SERVICE_REQUEST*>(
+              buffer_ptr);
+      switch (request->operation) {
+        case 0:
+        case 1: {
+          if (!request->out_size_ptr ||
+              (request->in_size && !request->in_ptr)) {
+            return X_E_INVALIDARG;
+          }
+          auto* out_size = memory_->TranslateVirtual<xe::be<uint32_t>*>(
+              request->out_size_ptr);
+          const uint32_t capacity = *out_size;
+          *out_size = request->in_size;
+          if (!request->out_ptr) {
+            return X_E_SUCCESS;
+          }
+          if (capacity < request->in_size) {
+            return X_E_INSUFFICIENT_BUFFER;
+          }
+          std::memmove(memory_->TranslateVirtual(request->out_ptr),
+                       memory_->TranslateVirtual(request->in_ptr),
+                       request->in_size);
+          return X_E_SUCCESS;
+        }
+        case 2:
+          // Titles fall back to their own defaults.
+          return X_E_NOTFOUND;
+        default:
+          XELOGW("XamApp: NUI identity service operation {} ({:X})",
+                 request->operation.get(), request->parameter.get());
+          return X_E_FAIL;
+      }
+    }
+    case 0x0002C00D: {
+      // A Kinect title's identity runtime asking which player it sees: for
+      // each of its eight identity slots it sends four (status, score)
+      // pairs it measured against the slot's biometric data - status 4 and
+      // score -1 where it has none - and xam answers with a slot. One the
+      // title has a player in means it's them, an empty one means someone
+      // new, to enroll there, and 8 or more means not decided yet.
+      if (!cvars::allow_nui_initialization || !buffer_ptr) {
+        break;
+      }
+      struct X_NUI_IDENTITY_MATCH_REQUEST {
+        xe::be<uint32_t> buffer_ptr;
+        xe::be<uint32_t> unknown_04;
+        xe::be<uint64_t> parameter;
+        xe::be<uint32_t> result_ptr;
+        xe::be<uint32_t> buffer_size;
+      };
+      struct X_NUI_IDENTITY_MATCH_BUFFER {
+        xe::be<uint32_t> status[8][4];
+        xe::be<float> score[8][4];
+        xe::be<uint32_t> tracking_id;
+        xe::be<uint32_t> flags;
+        xe::be<uint32_t> slot_flags[8];
+      };
+      static_assert_size(X_NUI_IDENTITY_MATCH_BUFFER, 296);
+      const auto* request =
+          memory_->TranslateVirtual<const X_NUI_IDENTITY_MATCH_REQUEST*>(
+              buffer_ptr);
+      if (!request->buffer_ptr || !request->result_ptr ||
+          request->buffer_size < sizeof(X_NUI_IDENTITY_MATCH_BUFFER)) {
+        return X_E_INVALIDARG;
+      }
+      const auto* match =
+          memory_->TranslateVirtual<const X_NUI_IDENTITY_MATCH_BUFFER*>(
+              request->buffer_ptr);
+      // The slot whose measurements agree best, or the first slot with none
+      // for someone new.
+      int32_t best_slot = -1;
+      float best_score = -1.0f;
+      int32_t free_slot = -1;
+      std::string summary;
+      for (int32_t slot = 0; slot < 8; ++slot) {
+        float total = 0.0f;
+        uint32_t measured = 0;
+        for (int i = 0; i < 4; ++i) {
+          if (match->status[slot][i] != 4 && match->score[slot][i] >= 0.0f) {
+            total += match->score[slot][i];
+            ++measured;
+          }
+        }
+        if (!measured) {
+          if (free_slot < 0 && !(match->slot_flags[slot] & 1)) {
+            free_slot = slot;
+          }
+          continue;
+        }
+        const float score = total / float(measured);
+        summary += fmt::format(" slot {}: {} {} {} {} / {:.3f} {:.3f} {:.3f} {:.3f}"
+                               " flags {:X};",
+                               slot, match->status[slot][0].get(),
+                               match->status[slot][1].get(),
+                               match->status[slot][2].get(),
+                               match->status[slot][3].get(),
+                               match->score[slot][0].get(),
+                               match->score[slot][1].get(),
+                               match->score[slot][2].get(),
+                               match->score[slot][3].get(),
+                               match->slot_flags[slot].get());
+        if (score > best_score) {
+          best_score = score;
+          best_slot = slot;
+        }
+      }
+      const uint32_t answer = best_slot >= 0   ? uint32_t(best_slot)
+                              : free_slot >= 0 ? uint32_t(free_slot)
+                                               : 0x80000000u;
+      static uint32_t logged = 0;
+      if (logged < 64 || best_slot >= 0) {
+        ++logged;
+        XELOGI("XamApp: NUI identity match for {:08X} (flags {:X}, {:X}):{} "
+               "answered {:X}",
+               match->tracking_id.get(), match->flags.get(),
+               request->parameter.get(), summary, answer);
+      }
+      xe::store_and_swap<uint32_t>(
+          memory_->TranslateVirtual(request->result_ptr), answer);
+      kernel_state_->nui_identity()->OnMatchAnswered(match->tracking_id,
+                                                     answer);
+      return X_E_SUCCESS;
+    }
+    case 0x0002C003:
+    case 0x0002C004: {
+      // A Kinect title's identity runtime answering what the system asked of
+      // it: 0x2C003 an enrollment, 0x2C004 an identification. {result,
+      // tracking ID, enrollment slot, unknown, u64 unknown}.
+      if (!cvars::allow_nui_initialization || !buffer_ptr) {
+        break;
+      }
+      const uint32_t result = xe::load_and_swap<uint32_t>(buffer);
+      const uint32_t tracking_id = xe::load_and_swap<uint32_t>(buffer + 4);
+      const uint32_t slot = xe::load_and_swap<uint32_t>(buffer + 8);
+      XELOGI("XamApp: NUI identity {} result {:08X}, tracking ID {:X}, slot "
+             "{}, {:08X} {:016X}",
+             message == 0x0002C003 ? "enrollment" : "identification", result,
+             tracking_id, slot, xe::load_and_swap<uint32_t>(buffer + 12),
+             xe::load_and_swap<uint64_t>(buffer + 16));
+      if (message == 0x0002C003) {
+        kernel_state_->nui_identity()->OnEnrollmentResult(result, tracking_id,
+                                                          slot);
+      }
+      return X_E_SUCCESS;
+    }
+    case 0x0002B001:
+      // A Kinect title keeping the camera awake for the milliseconds given, 0
+      // releasing it. Titles ignore the answer.
+      if (!cvars::allow_nui_initialization) {
+        break;
+      }
+      return X_E_SUCCESS;
+    case 0x0002B002:
+      // A Kinect title's skeleton frame, sent each frame for the system to
+      // spot its own Kinect Guide gesture in - which it would answer with
+      // 0x8301000B to have the title pause.
+      if (!cvars::allow_nui_initialization) {
+        break;
+      }
+      if (buffer_ptr) {
+        kernel_state_->nui_hud()->OnSkeletonFrame(buffer, buffer_length);
+      }
+      return X_E_SUCCESS;
     case 0x0002B003: {
       // Games used in:
       // 4D5309C9
@@ -201,6 +468,8 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       }
       XELOGD("XamApp: Kinect identity callback {:08X}",
              xe::load_and_swap<uint32_t>(buffer));
+      kernel_state_->nui_identity()->SetHandler(
+          xe::load_and_swap<uint32_t>(buffer));
       return X_E_SUCCESS;
     }
     // Causes dashboard to correctly process language/region change. It does not

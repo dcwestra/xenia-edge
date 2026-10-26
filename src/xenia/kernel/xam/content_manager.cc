@@ -592,6 +592,34 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name,
   return X_ERROR_SUCCESS;
 }
 
+X_RESULT ContentManager::OpenContentFile(
+    const std::string_view root_name, const std::filesystem::path& package_path,
+    uint32_t& content_license) {
+  auto global_lock = global_critical_region_.Acquire();
+
+  if (open_packages_.count(string_key_insensitive(root_name))) {
+    return X_ERROR_ALREADY_EXISTS;
+  }
+  XCONTENT_AGGREGATE_DATA data = {};
+  auto header = vfs::XContentContainerDevice::ReadContainerHeader(package_path);
+  if (!header || !header->content_header.is_magic_valid()) {
+    return X_ERROR_FILE_NOT_FOUND;
+  }
+  data = vfs::XContentContainerDevice::ContentDataFromHeader(*header);
+  auto package = std::make_unique<ContentPackage>(kernel_state_, root_name,
+                                                  data, package_path);
+  if (!package->is_mounted()) {
+    return X_ERROR_FILE_NOT_FOUND;
+  }
+  content_license = package->GetPackageLicense();
+  if (static_cast<uint32_t>(cvars::license_mask) > 0) {
+    content_license |= cvars::license_mask;
+  }
+  open_packages_.insert(
+      {string_key_insensitive::create(root_name), package.release()});
+  return X_ERROR_SUCCESS;
+}
+
 X_RESULT ContentManager::CloseContent(const std::string_view root_name) {
   auto global_lock = global_critical_region_.Acquire();
 

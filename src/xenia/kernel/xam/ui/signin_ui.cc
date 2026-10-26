@@ -23,6 +23,24 @@ SigninUI::SigninUI(xe::ui::ImGuiDrawer* imgui_drawer,
       users_needed_(users_needed),
       title_("Sign In") {}
 
+void SigninUI::SignIn() {
+  std::map<uint8_t, uint64_t> profile_map;
+  for (uint32_t i = 0; i < users_needed_; i++) {
+    uint8_t slot = chosen_slots_[i];
+    uint64_t xuid = chosen_xuids_[i];
+    if (slot != XUserIndexAny && xuid != 0) {
+      profile_map[slot] = xuid;
+      if (signed_in_user_ == XUserIndexAny) {
+        signed_in_user_ = slot;
+      }
+    }
+  }
+  profile_manager_->LoginMultiple(profile_map);
+
+  ImGui::CloseCurrentPopup();
+  Close();
+}
+
 void SigninUI::OnDraw(ImGuiIO& io) {
   bool first_draw = false;
   if (!has_opened_) {
@@ -207,29 +225,37 @@ void SigninUI::OnDraw(ImGuiIO& io) {
       }
     }
 
-    if (ImGui::Button("OK")) {
-      std::map<uint8_t, uint64_t> profile_map;
-      for (uint32_t i = 0; i < users_needed_; i++) {
-        uint8_t slot = chosen_slots_[i];
-        uint64_t xuid = chosen_xuids_[i];
-        if (slot != XUserIndexAny && xuid != 0) {
-          profile_map[slot] = xuid;
-        }
-      }
-      profile_manager_->LoginMultiple(profile_map);
-
-      ImGui::CloseCurrentPopup();
-      Close();
+    kinect_cursor_.BeginFrame();
+    if (kinect_cursor_.enabled()) {
+      ImGui::TextDisabled("Hold your hand over a button to choose it.");
     }
+    const ImVec2 button_size =
+        kinect_cursor_.enabled()
+            ? ImVec2(ImGui::GetFontSize() * 9.0f, ImGui::GetFontSize() * 3.0f)
+            : ImVec2(0.0f, 0.0f);
+    if (ImGui::Button("OK", button_size)) {
+      SignIn();
+    }
+    kinect_cursor_.TrackItem(0);
     ImGui::SameLine();
 
-    if (ImGui::Button("Cancel")) {
+    if (ImGui::Button("Cancel", button_size)) {
       ImGui::CloseCurrentPopup();
       Close();
     }
+    kinect_cursor_.TrackItem(1);
 
     ImGui::Spacing();
     ImGui::Spacing();
+    switch (kinect_cursor_.EndFrame()) {
+      case 0:
+        SignIn();
+        break;
+      case 1:
+        ImGui::CloseCurrentPopup();
+        Close();
+        break;
+    }
     ImGui::EndPopup();
   } else {
     Close();
