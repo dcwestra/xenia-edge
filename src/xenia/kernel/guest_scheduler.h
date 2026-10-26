@@ -320,9 +320,14 @@ class GuestScheduler {
   // waiting on something none of them will produce. Triggered off the present
   // counter, it dumps what every CPU is running or waiting on.
   static constexpr uint32_t kNoProgressReportTicks = 2000;  // ~2 s
+  // Before the first frame a title is often still loading, GTA V for several
+  // seconds, so it gets longer.
+  static constexpr uint32_t kNoProgressReportTicksBeforeFirstFrame =
+      20000;  // ~20 s
   uint32_t last_frame_number_ = 0;
   uint32_t no_progress_ticks_ = 0;
   bool no_progress_reported_ = false;
+  bool report_at_frame_done_ = false;
   void ReportNoProgress();
 
   // Watchdog-only stall detection state, touched under lock_.

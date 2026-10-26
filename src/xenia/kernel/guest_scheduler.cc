@@ -44,6 +44,12 @@ DEFINE_bool(
     "behind the single I/O worker.",
     "Kernel");
 
+DEFINE_uint32(guest_scheduler_report_at_frame, 0,
+              "Logs what every guest thread is running or waiting on once the "
+              "guest has presented this many frames, as the no-progress "
+              "report does. 0 is off.",
+              "Kernel");
+
 namespace xe {
 namespace kernel {
 
@@ -1559,6 +1565,8 @@ void GuestScheduler::RunLoop(int cpu_index) {
   // Adopt this host thread's stack as this CPU's idle fiber.
   cpu.idle_fiber = xe::threading::Fiber::CreateFromThread();
   XELOGI("GuestScheduler: CPU {} dispatch loop started", cpu_index);
+  // When this CPU first found nothing ever dispatched, for the warning below.
+  uint64_t never_dispatched_since_ms = 0;
 
   while (!shutting_down_.load()) {
     if (cpu_index == 0) {
@@ -1634,16 +1642,25 @@ void GuestScheduler::RunLoop(int cpu_index) {
         cpu.parked.store(false);
         continue;
       }
-      // Nothing has ever run, so poll instead of sleeping forever and say so.
+      // Nothing has ever run, so poll instead of sleeping forever and say so
+      // if it lasts. The title's main thread waits for the shader and
+      // pipeline storage to load, which takes over a second when it's large.
       xe::threading::Wait(cpu.ready_event.get(), false,
                           std::chrono::seconds(1));
       cpu.parked.store(false);
+      constexpr uint64_t kNeverDispatchedWarnMs = 10000;
+      const uint64_t polled_ms = Clock::QueryHostUptimeMillis();
+      if (!never_dispatched_since_ms) {
+        never_dispatched_since_ms = polled_ms;
+      }
       bool warned = false;
       if (!dispatched_any_.load() &&
+          polled_ms - never_dispatched_since_ms >= kNeverDispatchedWarnMs &&
           never_dispatched_warned_.compare_exchange_strong(warned, true)) {
         XELOGW(
-            "GuestScheduler: no guest fiber dispatched after 1s, every guest "
-            "thread is unqueued (created suspended and never resumed?)");
+            "GuestScheduler: no guest fiber dispatched after {}s, every guest "
+            "thread is unqueued (created suspended and never resumed?)",
+            kNeverDispatchedWarnMs / 1000);
       }
       continue;
     }
@@ -1802,8 +1819,9 @@ std::string FormatWaitShape(const XThread::SchedulerLinks& links) {
 void GuestScheduler::ReportNoProgress() {
   XELOGW(
       "GuestScheduler: no guest frame presented in {} watchdog ticks while the "
-      "dispatch threads keep switching. Every fiber below is waiting on "
-      "something none of them is producing:",
+      "dispatch threads keep switching. If the title has hung, every fiber "
+      "below is waiting on something none of them is producing (a line "
+      "saying frames resumed follows if it was only a long wait):",
       no_progress_ticks_);
   uint64_t now_ms = Clock::QueryHostUptimeMillis();
   std::lock_guard<std::mutex> lock(lock_);
@@ -1901,11 +1919,26 @@ void GuestScheduler::WatchdogLoop() {
     // Only meaningful once something has been dispatched, so a title still
     // loading is not reported.
     uint32_t frame = xe::logging::GetFrameNumber();
+    if (cvars::guest_scheduler_report_at_frame &&
+        frame >= cvars::guest_scheduler_report_at_frame &&
+        !report_at_frame_done_) {
+      report_at_frame_done_ = true;
+      ReportNoProgress();
+    }
     if (frame != last_frame_number_ || !dispatched_any_.load()) {
+      if (no_progress_reported_ && frame != last_frame_number_) {
+        // Tells a long load from a hang when reading the log afterwards.
+        XELOGI(
+            "GuestScheduler: guest frames resumed after {} watchdog ticks, so "
+            "the no-progress report above was a long wait, not a hang",
+            no_progress_ticks_);
+      }
       last_frame_number_ = frame;
       no_progress_ticks_ = 0;
       no_progress_reported_ = false;
-    } else if (++no_progress_ticks_ >= kNoProgressReportTicks &&
+    } else if (++no_progress_ticks_ >=
+                   (frame ? kNoProgressReportTicks
+                          : kNoProgressReportTicksBeforeFirstFrame) &&
                !no_progress_reported_) {
       no_progress_reported_ = true;
       ReportNoProgress();

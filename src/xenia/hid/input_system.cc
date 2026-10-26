@@ -429,33 +429,37 @@ void InputSystem::ReconcileBindings() {
     }
   }
 
-  // Pass 2: place devices that aren't currently bound.
-  for (auto& l : live) {
-    bool already_bound = false;
+  auto is_bound = [this](const LiveDevice& l) {
     for (auto& b : slot_bindings_) {
       if (b.driver == l.driver && b.driver_slot == l.info.driver_slot) {
-        already_bound = true;
+        return true;
+      }
+    }
+    return false;
+  };
+
+  // Pass 2: reattach devices to their detached bindings by stable_id. Every
+  // device gets its slot back before any auto-binds, or a device listed
+  // earlier could take a slot held for one listed later. Bindings handed over
+  // on relaunch are all detached, so a gamepad took player 1 from the
+  // keyboard, which never auto-binds and so was left without a slot.
+  for (auto& l : live) {
+    if (l.info.stable_id.empty() || is_bound(l)) {
+      continue;
+    }
+    for (auto& b : slot_bindings_) {
+      if (!b.driver && b.stable_id == l.info.stable_id) {
+        b.driver = l.driver;
+        b.driver_slot = l.info.driver_slot;
+        b.display_name = l.info.display_name;
         break;
       }
     }
-    if (already_bound) {
-      continue;
-    }
+  }
 
-    // Reattach by stable_id (matches detached bindings).
-    bool placed = false;
-    if (!l.info.stable_id.empty()) {
-      for (auto& b : slot_bindings_) {
-        if (!b.driver && b.stable_id == l.info.stable_id) {
-          b.driver = l.driver;
-          b.driver_slot = l.info.driver_slot;
-          b.display_name = l.info.display_name;
-          placed = true;
-          break;
-        }
-      }
-    }
-    if (placed) {
+  // Pass 2b: place devices that are still unbound.
+  for (auto& l : live) {
+    if (is_bound(l)) {
       continue;
     }
 

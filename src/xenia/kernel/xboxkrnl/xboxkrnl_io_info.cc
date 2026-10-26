@@ -7,6 +7,8 @@
  ******************************************************************************
  */
 
+#include <atomic>
+
 #include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
@@ -18,6 +20,7 @@
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
 #include "xenia/kernel/xfile.h"
 #include "xenia/vfs/device.h"
+#include "xenia/vfs/devices/disc_image_entry.h"
 #include "xenia/xbox.h"
 
 namespace xe {
@@ -95,13 +98,25 @@ dword_result_t NtQueryInformationFile_entry(
       break;
     }
     case XFileSectorInformation: {
-      // SW that uses this seems to use the output as a way of uniquely
-      // identifying a file for sorting/lookup so we can just give it an
-      // arbitrary 4 byte integer most of the time
-      XELOGW("Stub XFileSectorInformation!");
-      auto info = info_ptr.as<uint32_t*>();
-      size_t fname_hash = xe::memory::hash_combine(82589933LL, file->path());
-      *info = static_cast<uint32_t>(fname_hash ^ (fname_hash >> 32));
+      // The sector the file starts at. Titles sort reads by it, and Rockstar's
+      // streaming (GTA IV and V) asks for it of every file it opens. On a disc
+      // image it's the file's offset in the image, a full disc's matching the
+      // console's. Elsewhere any unique value keeps sorting working.
+      auto info = info_ptr.as<xe::be<uint32_t>*>();
+      if (auto disc_entry =
+              dynamic_cast<const vfs::DiscImageEntry*>(file->entry())) {
+        *info = uint32_t(disc_entry->data_offset() / 2048);
+      } else {
+        static std::atomic<bool> logged = false;
+        if (!logged.exchange(true)) {
+          XELOGW(
+              "XFileSectorInformation: no sector for {}, giving a unique "
+              "value instead (logged once)",
+              file->path());
+        }
+        size_t fname_hash = xe::memory::hash_combine(82589933LL, file->path());
+        *info = static_cast<uint32_t>(fname_hash ^ (fname_hash >> 32));
+      }
       out_length = sizeof(uint32_t);
       break;
     }
