@@ -1154,7 +1154,8 @@ bool VulkanRenderTargetCache::Resolve(
   if (!draw_util::GetResolveInfo(
           register_file(), memory, trace_writer_, draw_resolution_scale_x(),
           draw_resolution_scale_y(), IsFixedRG16TruncatedToMinus1To1(),
-          IsFixedRGBA16TruncatedToMinus1To1(), resolve_info)) {
+          IsFixedRGBA16TruncatedToMinus1To1(), resolve_info,
+          command_processor_.active_vertex_shader())) {
     XELOGE("Resolve: GetResolveInfo failed");
     return false;
   }
@@ -1186,10 +1187,11 @@ bool VulkanRenderTargetCache::Resolve(
                                             dump_rows, dump_pitch);
     if (copy_native) {
       // Redo the resolve info at 1x1 for the unscaled copy shader.
-      if (!draw_util::GetResolveInfo(register_file(), memory, trace_writer_, 1,
-                                     1, IsFixedRG16TruncatedToMinus1To1(),
-                                     IsFixedRGBA16TruncatedToMinus1To1(),
-                                     resolve_info)) {
+      if (!draw_util::GetResolveInfo(
+              register_file(), memory, trace_writer_, 1, 1,
+              IsFixedRG16TruncatedToMinus1To1(),
+              IsFixedRGBA16TruncatedToMinus1To1(), resolve_info,
+              command_processor_.active_vertex_shader())) {
         return false;
       }
     }

@@ -31,12 +31,24 @@ DEFINE_bool(
     "the render pass and draining the pipeline for each upload in mid-frame. "
     "Turn off if a title shows stale geometry or textures.",
     "Vulkan");
+DEFINE_bool(
+    vulkan_order_draws_by_guest_sync, true,
+    "Order guest draws' shared memory accesses with each other only across "
+    "the title's own waits and events, as the console does: its memory export "
+    "writes bypass the vertex cache, so a title has to synchronize to read "
+    "them. Saves a barrier, which ends the render pass, per memory export "
+    "draw (about 160 a frame in Halo 3). Turn off if a title's geometry or "
+    "particles flicker or tear.",
+    "Vulkan");
+
 DEFINE_bool(vulkan_sparse_shared_memory, true,
             "Enable sparse binding for shared memory emulation. Disabling it "
             "increases video memory usage - a 512 MB buffer is created - but "
             "allows graphics debuggers that don't support sparse binding to "
             "work.",
             "Vulkan");
+
+DECLARE_bool(log_draws);
 
 namespace xe {
 namespace gpu {
@@ -459,6 +471,8 @@ void VulkanSharedMemory::Use(Usage usage,
   written_range.second =
       std::min(written_range.second, kBufferSize - written_range.first);
   assert_true(usage != Usage::kRead || !written_range.second);
+  last_use_was_draw_ = false;
+  ClearDrawAccesses();
   if (last_usage_ != usage || last_written_range_.second) {
     VkPipelineStageFlags src_stage_mask, dst_stage_mask;
     VkAccessFlags src_access_mask, dst_access_mask;
@@ -494,6 +508,121 @@ void VulkanSharedMemory::Use(Usage usage,
     }
   }
   last_written_range_ = written_range;
+}
+
+void VulkanSharedMemory::UseForDraw(const std::pair<uint32_t, uint32_t>* reads,
+                                    size_t read_count,
+                                    const std::pair<uint32_t, uint32_t>* writes,
+                                    size_t write_count) {
+  auto range_end = [](const std::pair<uint32_t, uint32_t>& range) {
+    uint32_t start = std::min(range.first, kBufferSize);
+    return std::make_pair(start,
+                          start + std::min(range.second, kBufferSize - start));
+  };
+  if (!last_use_was_draw_) {
+    // After anything else, the usual ordering, then this draw starts the
+    // tracking.
+    std::pair<uint32_t, uint32_t> written_extent(kBufferSize, 0);
+    for (size_t i = 0; i < write_count; ++i) {
+      const std::pair<uint32_t, uint32_t> write = range_end(writes[i]);
+      if (write.first < write.second) {
+        written_extent.first = std::min(written_extent.first, write.first);
+        written_extent.second = std::max(written_extent.second, write.second);
+      }
+    }
+    if (written_extent.first < written_extent.second) {
+      Use(Usage::kGuestDrawReadWrite,
+          std::make_pair(written_extent.first,
+                         written_extent.second - written_extent.first));
+    } else {
+      Use(Usage::kRead);
+    }
+    last_use_was_draw_ = true;
+  } else {
+    bool conflict =
+        synced_draw_reads_.size() + interval_draw_reads_.size() + read_count >
+            kMaxDrawRanges ||
+        synced_draw_writes_.size() + interval_draw_writes_.size() +
+                write_count >
+            kMaxDrawRanges;
+    for (size_t i = 0; !conflict && i < read_count; ++i) {
+      const std::pair<uint32_t, uint32_t> read = range_end(reads[i]);
+      conflict = read.first < read.second &&
+                 synced_draw_writes_.Overlaps(read.first, read.second);
+      if (conflict && cvars::log_draws) {
+        XELOGI(
+            "log_draws:   shared memory barrier: reads {:08X}-{:08X}, written "
+            "before",
+            read.first, read.second);
+      }
+    }
+    for (size_t i = 0; !conflict && i < write_count; ++i) {
+      const std::pair<uint32_t, uint32_t> write = range_end(writes[i]);
+      conflict = write.first < write.second &&
+                 (synced_draw_reads_.Overlaps(write.first, write.second) ||
+                  synced_draw_writes_.Overlaps(write.first, write.second));
+      if (conflict && cvars::log_draws) {
+        XELOGI(
+            "log_draws:   shared memory barrier: writes {:08X}-{:08X}, used "
+            "before",
+            write.first, write.second);
+      }
+    }
+    if (conflict) {
+      // Orders everything the draws since the last barrier did before this
+      // draw, as Use would have after each draw that wrote.
+      VkPipelineStageFlags stage_mask;
+      VkAccessFlags access_mask;
+      GetUsageMasks(Usage::kGuestDrawReadWrite, stage_mask, access_mask);
+      command_processor_.PushBufferMemoryBarrier(
+          buffer_, 0, VK_WHOLE_SIZE, stage_mask, stage_mask, access_mask,
+          access_mask, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
+      if (host_buffer_ != VK_NULL_HANDLE) {
+        command_processor_.PushBufferMemoryBarrier(
+            host_buffer_, 0, VK_WHOLE_SIZE, stage_mask, stage_mask, access_mask,
+            access_mask, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+            false);
+      }
+      ClearDrawAccesses();
+      ++draw_barriers_placed_;
+    } else {
+      ++draw_barriers_skipped_;
+    }
+  }
+  for (size_t i = 0; i < read_count; ++i) {
+    const std::pair<uint32_t, uint32_t> read = range_end(reads[i]);
+    if (read.first < read.second) {
+      interval_draw_reads_.Add(read.first, read.second);
+    }
+  }
+  for (size_t i = 0; i < write_count; ++i) {
+    const std::pair<uint32_t, uint32_t> write = range_end(writes[i]);
+    if (write.first < write.second) {
+      interval_draw_writes_.Add(write.first, write.second);
+    }
+  }
+  if (!cvars::vulkan_order_draws_by_guest_sync) {
+    // Every draw is ordered with the next one where they conflict.
+    OnGuestSync();
+  }
+  // What Use orders after, if it's what comes next.
+  std::pair<uint32_t, uint32_t> written_extent(kBufferSize, 0);
+  for (const RangeSet* draw_writes :
+       {&interval_draw_writes_, &synced_draw_writes_}) {
+    if (!draw_writes->empty()) {
+      const std::pair<uint32_t, uint32_t> extent = draw_writes->extent();
+      written_extent.first = std::min(written_extent.first, extent.first);
+      written_extent.second = std::max(written_extent.second, extent.second);
+    }
+  }
+  if (written_extent.first < written_extent.second) {
+    last_usage_ = Usage::kGuestDrawReadWrite;
+    last_written_range_ = std::make_pair(
+        written_extent.first, written_extent.second - written_extent.first);
+  } else {
+    last_usage_ = Usage::kRead;
+    last_written_range_ = std::make_pair(uint32_t(0), uint32_t(0));
+  }
 }
 
 bool VulkanSharedMemory::InitializeTraceSubmitDownloads() {

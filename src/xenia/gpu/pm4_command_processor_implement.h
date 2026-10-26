@@ -494,6 +494,57 @@ bool COMMAND_PROCESSOR::ExecutePacketType3(uint32_t packet) XE_RESTRICT {
       }
     }
 
+    switch (opcode) {
+      case PM4_WAIT_REG_MEM:
+      case PM4_EVENT_WRITE:
+      case PM4_EVENT_WRITE_SHD:
+      case PM4_EVENT_WRITE_EXT:
+      case PM4_WAIT_FOR_IDLE:
+        COMMAND_PROCESSOR::OnGuestSyncPacket();
+        break;
+      default:
+        break;
+    }
+    if (cvars::log_draws) {
+      // Where the guest synchronizes between draws, to tell which draws it
+      // expects to be ordered.
+      const char* sync_name = nullptr;
+      switch (opcode) {
+        case PM4_WAIT_REG_MEM:
+          sync_name = "WAIT_REG_MEM";
+          break;
+        case PM4_MEM_WRITE:
+          sync_name = "MEM_WRITE";
+          break;
+        case PM4_COND_WRITE:
+          sync_name = "COND_WRITE";
+          break;
+        case PM4_EVENT_WRITE:
+          sync_name = "EVENT_WRITE";
+          break;
+        case PM4_EVENT_WRITE_SHD:
+          sync_name = "EVENT_WRITE_SHD";
+          break;
+        case PM4_EVENT_WRITE_EXT:
+          sync_name = "EVENT_WRITE_EXT";
+          break;
+        case PM4_INVALIDATE_STATE:
+          sync_name = "INVALIDATE_STATE";
+          break;
+        case PM4_WAIT_FOR_IDLE:
+          sync_name = "WAIT_FOR_IDLE";
+          break;
+        default:
+          break;
+      }
+      if (sync_name) {
+        XELOGI("log_draws: PM4 {} {:08X}", sync_name,
+               count ? xe::byte_swap(xe::load<uint32_t>(reader_.buffer() +
+                                                        reader_.read_offset()))
+                     : 0);
+      }
+    }
+
     bool result = false;
     switch (opcode) {
       case PM4_ME_INIT:

@@ -18,6 +18,7 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -211,7 +212,26 @@ class VulkanCommandProcessor final : public CommandProcessor {
       WriteGpuPhaseMarker(phase);
     }
   }
+  // Marks a draw with these guest shaders. With log_fps_draw_costs every draw
+  // gets its own marker, so its time is charged to its shaders.
+  void MarkGpuDraw(uint64_t vertex_shader_hash, uint64_t pixel_shader_hash) {
+    if (gpu_phase_slot_ == kNoGpuPhaseSlot) {
+      return;
+    }
+    if (gpu_phase_draw_costs_) {
+      WriteGpuPhaseMarker(GpuPhase::kDraw, vertex_shader_hash,
+                          pixel_shader_hash);
+    } else if (gpu_phase_current_ != GpuPhase::kDraw) {
+      WriteGpuPhaseMarker(GpuPhase::kDraw);
+    }
+  }
   std::string TakeGpuTimeReport(uint32_t frames) override;
+  // Hides CommandProcessor's, called by the PM4 packet dispatch.
+  void OnGuestSyncPacket() {
+    if (shared_memory_) {
+      shared_memory_->OnGuestSync();
+    }
+  }
   int64_t TakeGpuAwaitNanoseconds() override {
     return int64_t(completion_timeline_.TakeAwaitNanoseconds());
   }
@@ -397,6 +417,8 @@ class VulkanCommandProcessor final : public CommandProcessor {
 #include "../command_processor_readback_staging.inc"
   void OrderReadbackStagingWrite(VkBuffer staging_buffer);
   void StageMemexportReadback();
+  // Records the copies StageMemexportReadback deferred. Outside a render pass.
+  void RecordMemexportStagingCopies();
   void FlushMemexportStagingReadback();
   void AwaitMemexportSubmission(uint64_t submission) {
     CheckSubmissionCompletionAndDeviceLoss(submission);
@@ -418,6 +440,13 @@ class VulkanCommandProcessor final : public CommandProcessor {
     uint32_t offset;
   };
   std::vector<MemexportStagedRange> memexport_staged_;
+  // Export ranges to copy into staging when the submission ends, as (address,
+  // length) in record order. Copying after each export draw ended the render
+  // pass, and a batch of draws writing parts of one stream copied all of it
+  // every time - about 1700 copies a frame in Halo 3. The guest can only see
+  // the output once the submission has completed, by which time the last
+  // draw's has replaced the others'.
+  std::vector<std::pair<uint32_t, uint32_t>> memexport_staging_pending_;
   // For EnsureMemexportRangeInDeviceBuffer.
   std::vector<VkBufferCopy> memexport_copy_regions_;
 
@@ -768,16 +797,32 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // cost is a few hundred queries per frame rather than one pair per draw.
   static constexpr uint32_t kGpuPhaseSlots = 8;
   static constexpr uint32_t kGpuPhaseQueriesPerSlot = 1024;
+  // With log_fps_draw_costs, one per draw.
+  static constexpr uint32_t kGpuPhaseQueriesPerSlotDrawCosts = 16384;
   static constexpr uint32_t kNoGpuPhaseSlot = UINT32_MAX;
   VkQueryPool gpu_phase_query_pool_ = VK_NULL_HANDLE;
   bool gpu_phase_pool_failed_ = false;
+  // Both fixed when the pool is created.
+  uint32_t gpu_phase_queries_per_slot_ = kGpuPhaseQueriesPerSlot;
+  bool gpu_phase_draw_costs_ = false;
   // Submission timed in each slot, 0 while the slot is free.
   uint64_t gpu_phase_slot_submission_[kGpuPhaseSlots] = {};
   uint32_t gpu_phase_slot_marker_count_[kGpuPhaseSlots] = {};
   // Whether the slot's submission replayed deferred uploads, timed by one more
   // query after its markers.
   bool gpu_phase_slot_has_upload_prologue_[kGpuPhaseSlots] = {};
-  GpuPhase gpu_phase_slot_phases_[kGpuPhaseSlots][kGpuPhaseQueriesPerSlot];
+  // Indexed by slot * gpu_phase_queries_per_slot_ + marker.
+  std::vector<GpuPhase> gpu_phase_slot_phases_;
+  // The guest vertex and pixel shaders of each draw marker, with
+  // log_fps_draw_costs.
+  std::vector<std::pair<uint64_t, uint64_t>> gpu_phase_slot_draw_shaders_;
+  std::vector<uint64_t> gpu_phase_timestamps_;
+  struct GpuDrawCost {
+    uint64_t ns = 0;
+    uint64_t draws = 0;
+  };
+  // By guest vertex and pixel shader, for the log_fps report.
+  std::map<std::pair<uint64_t, uint64_t>, GpuDrawCost> gpu_draw_costs_;
   // Slot of the open submission, kNoGpuPhaseSlot when it isn't timed.
   uint32_t gpu_phase_slot_ = kNoGpuPhaseSlot;
   uint32_t gpu_phase_next_slot_ = 0;
@@ -791,7 +836,8 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // Submissions not timed because every slot was still in flight.
   uint32_t gpu_phase_untimed_submissions_ = 0;
   void BeginGpuPhaseSubmission();
-  void WriteGpuPhaseMarker(GpuPhase phase);
+  void WriteGpuPhaseMarker(GpuPhase phase, uint64_t vertex_shader_hash = 0,
+                           uint64_t pixel_shader_hash = 0);
   void CollectCompletedGpuPhases();
   void DestroyGpuPhaseQueryPool();
   // Guest frame index, since some transient resources can be reused across

@@ -414,6 +414,9 @@ class CommandProcessor {
   void AwaitHeldSignalsWriting(uint32_t physical_address);
   // Waits for export output and performs all held-back signals.
   void AwaitHeldSignalsAndMemexport();
+  // At a guest wait or event packet, where the guest may expect the writes of
+  // the draws before it to be ordered with later ones. Backends hide it.
+  void OnGuestSyncPacket() {}
 
   virtual void OnPrimaryBufferEnd() {}
 

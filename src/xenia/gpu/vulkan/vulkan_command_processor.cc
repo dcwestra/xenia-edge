@@ -9,6 +9,7 @@
 
 #include "xenia/gpu/vulkan/vulkan_command_processor.h"
 
+#include <algorithm>
 #include <cstdarg>
 #include <cstdint>
 #include <cstring>
@@ -48,6 +49,13 @@ DEFINE_string(
     "exact ties in the 24-bit float guest depth, which 32-bit host depth "
     "breaks, such as Fable II's dog fur shells (014F8A02DB7B19CA:16, about two "
     "24-bit depth steps). Host render target path only.",
+    "GPU");
+
+DEFINE_bool(
+    log_fps_draw_costs, false,
+    "With log_fps, also time every draw and log the guest vertex and pixel "
+    "shader pairs that take the most GPU time, to find what makes a scene "
+    "slow. Timing every draw costs some GPU time itself.",
     "GPU");
 
 DEFINE_bool(
@@ -182,6 +190,7 @@ void VulkanCommandProcessor::ClearReadbackBuffers() {
     ClearReadbackStagingBuffers();
     // Their staging buffers are gone, so there is nothing left to copy out.
     memexport_staged_.clear();
+    memexport_staging_pending_.clear();
   }
 }
 
@@ -1542,6 +1551,7 @@ void VulkanCommandProcessor::ShutdownContext() {
   shared_memory_host_and_edram_descriptor_set_ = VK_NULL_HANDLE;
   ResetMemexportPages();
   memexport_staged_.clear();
+  memexport_staging_pending_.clear();
   zpd_counter_descriptor_buffer_ = VK_NULL_HANDLE;
   zpd_counter_descriptor_range_ = 0;
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
@@ -4109,10 +4119,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   // references, allowing us to check the current register values at draw time.
   const Shader::ConstantRegisterMap& constant_map_vertex =
       vertex_shader->constant_register_map();
+  // In dwords, also what the draw reads for the shared memory barrier.
+  uint32_t vfetch_addresses[96];
+  uint32_t vfetch_sizes[96];
+  uint32_t vfetch_current_queued = 0;
   {
-    uint32_t vfetch_addresses[96];
-    uint32_t vfetch_sizes[96];
-    uint32_t vfetch_current_queued = 0;
     for (uint32_t i = 0;
          i < xe::countof(constant_map_vertex.vertex_fetch_bitmap); ++i) {
       uint32_t vfetch_bits_remaining =
@@ -4223,13 +4234,38 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   // TODO(Triang3l): Find some PM4 command that can be used for indication of
   // when memexports should be awaited instead of inserting the barrier in Use
   // every time if memory export was done in the previous draw?
-  if (memexport_extent_start < memexport_extent_end) {
-    shared_memory_->Use(
-        VulkanSharedMemory::Usage::kGuestDrawReadWrite,
-        std::make_pair(memexport_extent_start,
-                       memexport_extent_end - memexport_extent_start));
-  } else {
-    shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+  {
+    std::pair<uint32_t, uint32_t> draw_reads[xe::countof(vfetch_addresses) + 1];
+    size_t draw_read_count = 0;
+    for (uint32_t i = 0; i < vfetch_current_queued; ++i) {
+      draw_reads[draw_read_count++] =
+          std::make_pair(vfetch_addresses[i] << 2, vfetch_sizes[i] << 2);
+    }
+    if (primitive_processing_result.index_buffer_type ==
+        PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA) {
+      draw_reads[draw_read_count++] = std::make_pair(
+          primitive_processing_result.guest_index_base,
+          primitive_processing_result.guest_draw_vertex_count *
+              (vgt_draw_initiator.index_size == xenos::IndexFormat::kInt32
+                   ? uint32_t(sizeof(uint32_t))
+                   : uint32_t(sizeof(uint16_t))));
+    }
+    std::pair<uint32_t, uint32_t> draw_writes[16];
+    size_t draw_write_count = 0;
+    for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+      if (draw_write_count >= xe::countof(draw_writes)) {
+        // More streams than tracked - one range over all of them.
+        draw_writes[0] =
+            std::make_pair(memexport_extent_start,
+                           memexport_extent_end - memexport_extent_start);
+        draw_write_count = 1;
+        break;
+      }
+      draw_writes[draw_write_count++] = std::make_pair(
+          memexport_range.base_address_dwords << 2, memexport_range.size_bytes);
+    }
+    shared_memory_->UseForDraw(draw_reads, draw_read_count, draw_writes,
+                               draw_write_count);
   }
 
   // After all commands that may dispatch, copy or insert barriers, submit the
@@ -4265,7 +4301,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
       render_target_cache_->last_update_render_pass_key().key;
 
   // Draw.
-  SetGpuPhase(GpuPhase::kDraw);
+  MarkGpuDraw(submission_in_progress_.last_vs_hash,
+              submission_in_progress_.last_ps_hash);
   OnVIZSurveyDraw(true);
   if (primitive_processing_result.index_buffer_type ==
           PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
@@ -4355,12 +4392,6 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
 // out waits, so it is deferred to FlushMemexportStagingReadback, where one wait
 // covers every producer since the last one.
 void VulkanCommandProcessor::StageMemexportReadback() {
-  if (memexport_ranges_.empty()) {
-    return;
-  }
-  shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
-  SubmitBarriers(true);
-  VkBuffer device_buffer = shared_memory_->buffer();
   for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
     uint32_t base_bytes = memexport_range.base_address_dwords << 2;
     if (base_bytes >= SharedMemory::kBufferSize) {
@@ -4374,6 +4405,28 @@ void VulkanCommandProcessor::StageMemexportReadback() {
     if (!size_bytes) {
       continue;
     }
+    // Copied once, after the last draw writing it, in that draw's place.
+    const std::pair<uint32_t, uint32_t> range(base_bytes, size_bytes);
+    std::erase(memexport_staging_pending_, range);
+    memexport_staging_pending_.push_back(range);
+    // The fence and coherency waits are driven by the page marks. Staged output
+    // is awaited from either stage, as only a wait copies it before frame end.
+    MarkMemexportPagesWritten(base_bytes, size_bytes,
+                              IsMemexportAwaited(true, true));
+  }
+}
+
+void VulkanCommandProcessor::RecordMemexportStagingCopies() {
+  if (memexport_staging_pending_.empty()) {
+    return;
+  }
+  shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+  SubmitBarriers(true);
+  VkBuffer device_buffer = shared_memory_->buffer();
+  for (const std::pair<uint32_t, uint32_t>& range :
+       memexport_staging_pending_) {
+    const uint32_t base_bytes = range.first;
+    const uint32_t size_bytes = range.second;
     uint64_t key = MakeReadbackResolveKey(base_bytes, size_bytes);
     ReadbackStagingSlot* slot = AcquireReadbackStagingSlot(key, size_bytes);
     if (slot == nullptr) {
@@ -4396,15 +4449,12 @@ void VulkanCommandProcessor::StageMemexportReadback() {
       return staged.key == key;
     });
     memexport_staged_.push_back({key, base_bytes, size_bytes, 0});
-    // The fence and coherency waits are driven by the page marks. Staged output
-    // is awaited from either stage, as only a wait copies it before frame end.
-    MarkMemexportPagesWritten(base_bytes, size_bytes,
-                              IsMemexportAwaited(true, true));
   }
+  memexport_staging_pending_.clear();
 }
 
 void VulkanCommandProcessor::FlushMemexportStagingReadback() {
-  if (memexport_staged_.empty()) {
+  if (memexport_staged_.empty() && memexport_staging_pending_.empty()) {
     return;
   }
   // Staged output is about to reach guest RAM, so no fence need await it.
@@ -4818,6 +4868,11 @@ bool VulkanCommandProcessor::IssueCopy() {
   // Push debug marker for resolve operation.
   if (debug_markers_enabled_) {
     PushDebugMarker("IssueCopy (Resolve)");
+  }
+
+  // For finding the rectangles of resolves not issued the way Direct3D 9 does.
+  if (Shader* vertex_shader = active_vertex_shader()) {
+    pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
   }
 
   uint32_t written_address, written_length;
@@ -5771,10 +5826,20 @@ void VulkanCommandProcessor::BeginGpuPhaseSubmission() {
   ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   if (gpu_phase_query_pool_ == VK_NULL_HANDLE) {
+    gpu_phase_draw_costs_ = cvars::log_fps_draw_costs;
+    gpu_phase_queries_per_slot_ = gpu_phase_draw_costs_
+                                      ? kGpuPhaseQueriesPerSlotDrawCosts
+                                      : kGpuPhaseQueriesPerSlot;
+    gpu_phase_slot_phases_.resize(kGpuPhaseSlots * gpu_phase_queries_per_slot_);
+    if (gpu_phase_draw_costs_) {
+      gpu_phase_slot_draw_shaders_.resize(kGpuPhaseSlots *
+                                          gpu_phase_queries_per_slot_);
+    }
+    gpu_phase_timestamps_.resize(gpu_phase_queries_per_slot_);
     VkQueryPoolCreateInfo pool_info = {
         VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
     pool_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
-    pool_info.queryCount = kGpuPhaseSlots * kGpuPhaseQueriesPerSlot;
+    pool_info.queryCount = kGpuPhaseSlots * gpu_phase_queries_per_slot_;
     if (!vulkan_device->properties().timestampPeriod ||
         dfn.vkCreateQueryPool(vulkan_device->device(), &pool_info, nullptr,
                               &gpu_phase_query_pool_) != VK_SUCCESS) {
@@ -5796,18 +5861,24 @@ void VulkanCommandProcessor::BeginGpuPhaseSubmission() {
   WriteGpuPhaseMarker(GpuPhase::kOther);
 }
 
-void VulkanCommandProcessor::WriteGpuPhaseMarker(GpuPhase phase) {
+void VulkanCommandProcessor::WriteGpuPhaseMarker(GpuPhase phase,
+                                                 uint64_t vertex_shader_hash,
+                                                 uint64_t pixel_shader_hash) {
   uint32_t& count = gpu_phase_slot_marker_count_[gpu_phase_slot_];
   // Two queries stay free, for the closing marker and the upload prologue.
   // Past that, the rest of the submission is charged to the phase already
   // open.
-  if (count + 2 >= kGpuPhaseQueriesPerSlot) {
+  if (count + 2 >= gpu_phase_queries_per_slot_) {
     return;
   }
+  const uint32_t query = gpu_phase_slot_ * gpu_phase_queries_per_slot_ + count;
   deferred_command_buffer_.CmdVkWriteTimestamp(
-      VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, gpu_phase_query_pool_,
-      gpu_phase_slot_ * kGpuPhaseQueriesPerSlot + count);
-  gpu_phase_slot_phases_[gpu_phase_slot_][count] = phase;
+      VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, gpu_phase_query_pool_, query);
+  gpu_phase_slot_phases_[query] = phase;
+  if (gpu_phase_draw_costs_) {
+    gpu_phase_slot_draw_shaders_[query] = {vertex_shader_hash,
+                                           pixel_shader_hash};
+  }
   ++count;
   gpu_phase_current_ = phase;
 }
@@ -5820,7 +5891,7 @@ void VulkanCommandProcessor::CollectCompletedGpuPhases() {
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const double period = vulkan_device->properties().timestampPeriod;
   const uint64_t completed = GetCompletedSubmission();
-  uint64_t timestamps[kGpuPhaseQueriesPerSlot];
+  uint64_t* const timestamps = gpu_phase_timestamps_.data();
   for (uint32_t slot = 0; slot < kGpuPhaseSlots; ++slot) {
     const uint64_t submission = gpu_phase_slot_submission_[slot];
     if (!submission || submission > completed) {
@@ -5831,13 +5902,23 @@ void VulkanCommandProcessor::CollectCompletedGpuPhases() {
     const uint32_t query_count = count + 1 + uint32_t(has_prologue);
     if (count && dfn.vkGetQueryPoolResults(
                      vulkan_device->device(), gpu_phase_query_pool_,
-                     slot * kGpuPhaseQueriesPerSlot, query_count,
+                     slot * gpu_phase_queries_per_slot_, query_count,
                      sizeof(uint64_t) * query_count, timestamps,
                      sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+      const uint32_t first_query = slot * gpu_phase_queries_per_slot_;
       for (uint32_t i = 0; i < count; ++i) {
-        if (timestamps[i + 1] > timestamps[i]) {
-          gpu_phase_ns_[size_t(gpu_phase_slot_phases_[slot][i])] +=
-              uint64_t(double(timestamps[i + 1] - timestamps[i]) * period);
+        if (timestamps[i + 1] <= timestamps[i]) {
+          continue;
+        }
+        const uint64_t ns =
+            uint64_t(double(timestamps[i + 1] - timestamps[i]) * period);
+        const GpuPhase phase = gpu_phase_slot_phases_[first_query + i];
+        gpu_phase_ns_[size_t(phase)] += ns;
+        if (gpu_phase_draw_costs_ && phase == GpuPhase::kDraw) {
+          GpuDrawCost& cost =
+              gpu_draw_costs_[gpu_phase_slot_draw_shaders_[first_query + i]];
+          cost.ns += ns;
+          ++cost.draws;
         }
       }
       if (has_prologue && timestamps[0] > timestamps[count + 1]) {
@@ -5921,6 +6002,12 @@ std::string VulkanCommandProcessor::TakeGpuTimeReport(uint32_t frames) {
       double(transfer_stats.stencil_bit_checks) / frames);
   gpu_report_upload_bytes_start_ = upload_bytes;
   gpu_report_render_passes_start_ = render_passes_total_;
+  const std::pair<uint64_t, uint64_t> draw_barriers =
+      shared_memory_->TakeDrawBarrierCounts();
+  report += fmt::format(
+      ", shared memory barriers between draws {:.1f} ({:.1f} skipped)",
+      double(draw_barriers.first) / frames,
+      double(draw_barriers.second) / frames);
   if (gpu_phase_untimed_submissions_) {
     report +=
         fmt::format(", {} submissions untimed", gpu_phase_untimed_submissions_);
@@ -5929,6 +6016,24 @@ std::string VulkanCommandProcessor::TakeGpuTimeReport(uint32_t frames) {
   report += TakeResolveReadbackReport(frames);
   for (uint64_t& ns : gpu_phase_ns_) {
     ns = 0;
+  }
+  if (gpu_phase_draw_costs_ && !gpu_draw_costs_.empty()) {
+    // The costliest shader pairs. A draw's time runs to the next marker, so
+    // it includes render pass changes recorded right after it.
+    std::vector<std::pair<std::pair<uint64_t, uint64_t>, GpuDrawCost>> costs(
+        gpu_draw_costs_.begin(), gpu_draw_costs_.end());
+    const size_t shown = std::min(costs.size(), size_t(8));
+    std::partial_sort(
+        costs.begin(), costs.begin() + shown, costs.end(),
+        [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
+    report += "; costliest draws per frame:";
+    for (size_t i = 0; i < shown; ++i) {
+      report += fmt::format(
+          "{} VS {:016X} PS {:016X} {:.2f} ms in {:.1f} draws", i ? ";" : "",
+          costs[i].first.first, costs[i].first.second, ms(costs[i].second.ns),
+          double(costs[i].second.draws) / frames);
+    }
+    gpu_draw_costs_.clear();
   }
   return report;
 }
@@ -6019,6 +6124,8 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     assert_false(scratch_buffer_used_);
 
     EndRenderPass();
+
+    RecordMemexportStagingCopies();
 
     render_target_cache_->EndSubmission();
 
@@ -6128,7 +6235,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     const bool has_upload_prologue = !deferred_upload_command_buffer_.empty();
     if (gpu_phase_slot != kNoGpuPhaseSlot) {
       dfn.vkCmdResetQueryPool(command_buffer.buffer, gpu_phase_query_pool_,
-                              gpu_phase_slot * kGpuPhaseQueriesPerSlot,
+                              gpu_phase_slot * gpu_phase_queries_per_slot_,
                               gpu_phase_slot_marker_count_[gpu_phase_slot] + 1 +
                                   uint32_t(has_upload_prologue));
       gpu_phase_slot_has_upload_prologue_[gpu_phase_slot] = has_upload_prologue;
@@ -6139,7 +6246,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
         dfn.vkCmdWriteTimestamp(
             command_buffer.buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
             gpu_phase_query_pool_,
-            gpu_phase_slot * kGpuPhaseQueriesPerSlot +
+            gpu_phase_slot * gpu_phase_queries_per_slot_ +
                 gpu_phase_slot_marker_count_[gpu_phase_slot] + 1);
       }
       // Earlier submissions' accesses to the pages before the copies replace
@@ -6168,7 +6275,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       dfn.vkCmdWriteTimestamp(command_buffer.buffer,
                               VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                               gpu_phase_query_pool_,
-                              gpu_phase_slot * kGpuPhaseQueriesPerSlot +
+                              gpu_phase_slot * gpu_phase_queries_per_slot_ +
                                   gpu_phase_slot_marker_count_[gpu_phase_slot]);
       gpu_phase_slot_submission_[gpu_phase_slot] = GetCurrentSubmission();
       gpu_phase_next_slot_ = (gpu_phase_slot + 1) % kGpuPhaseSlots;

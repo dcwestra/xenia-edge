@@ -52,6 +52,38 @@ class VulkanSharedMemory : public SharedMemory {
   // Inserts a pipeline barrier for the target usage, also ensuring consecutive
   // read-write accesses are ordered with each other.
   void Use(Usage usage, std::pair<uint32_t, uint32_t> written_range = {});
+  // For a guest draw, given as (start, length) ranges it reads (vertex and
+  // index data) and writes (memory export). Orders it after earlier draws only
+  // where they conflict: reading what one wrote, or writing what one read or
+  // wrote. With vulkan_order_draws_by_guest_sync, only accesses from before
+  // the last guest wait or event (OnGuestSync) count, as on the console:
+  // export writes bypass its vertex cache, so a title has to synchronize to
+  // use them. Export streams and vertex buffers name whole buffers, so draws
+  // using parts of one look like they conflict. A barrier ends the render
+  // pass, and Use orders a draw after any draw that wrote, so the 160 or so
+  // export draws Halo 3 skins its characters with every frame, each updating
+  // its own slice of one vertex buffer, would otherwise take one each.
+  void UseForDraw(const std::pair<uint32_t, uint32_t>* reads, size_t read_count,
+                  const std::pair<uint32_t, uint32_t>* writes,
+                  size_t write_count);
+  // At a guest wait or event packet.
+  void OnGuestSync() {
+    if (!last_use_was_draw_) {
+      return;
+    }
+    synced_draw_reads_.Add(interval_draw_reads_);
+    synced_draw_writes_.Add(interval_draw_writes_);
+    interval_draw_reads_.clear();
+    interval_draw_writes_.clear();
+  }
+  // Barriers UseForDraw placed and skipped since the last call.
+  std::pair<uint64_t, uint64_t> TakeDrawBarrierCounts() {
+    std::pair<uint64_t, uint64_t> counts(draw_barriers_placed_,
+                                         draw_barriers_skipped_);
+    draw_barriers_placed_ = 0;
+    draw_barriers_skipped_ = 0;
+    return counts;
+  }
 
   VkBuffer buffer() const { return buffer_; }
 
@@ -122,6 +154,62 @@ class VulkanSharedMemory : public SharedMemory {
 
   Usage last_usage_;
   std::pair<uint32_t, uint32_t> last_written_range_;
+
+  // Disjoint, sorted [start, end) ranges, merged as they're added.
+  class RangeSet {
+   public:
+    bool Overlaps(uint32_t start, uint32_t end) const {
+      auto it = std::upper_bound(
+          ranges_.cbegin(), ranges_.cend(), start,
+          [](uint32_t value, const std::pair<uint32_t, uint32_t>& range) {
+            return value < range.second;
+          });
+      return it != ranges_.cend() && it->first < end;
+    }
+    void Add(uint32_t start, uint32_t end) {
+      auto first =
+          std::lower_bound(ranges_.begin(), ranges_.end(), start,
+                           [](const std::pair<uint32_t, uint32_t>& range,
+                              uint32_t value) { return range.second < value; });
+      auto last = first;
+      for (; last != ranges_.end() && last->first <= end; ++last) {
+        start = std::min(start, last->first);
+        end = std::max(end, last->second);
+      }
+      ranges_.insert(ranges_.erase(first, last), std::make_pair(start, end));
+    }
+    bool empty() const { return ranges_.empty(); }
+    size_t size() const { return ranges_.size(); }
+    std::pair<uint32_t, uint32_t> extent() const {
+      return std::make_pair(ranges_.front().first, ranges_.back().second);
+    }
+    void clear() { ranges_.clear(); }
+    void Add(const RangeSet& other) {
+      for (const std::pair<uint32_t, uint32_t>& range : other.ranges_) {
+        Add(range.first, range.second);
+      }
+    }
+
+   private:
+    std::vector<std::pair<uint32_t, uint32_t>> ranges_;
+  };
+  // Past this many ranges, a conflict is assumed rather than searched for.
+  static constexpr size_t kMaxDrawRanges = 1024;
+  // What the draws since the last barrier read and wrote, while the last use
+  // was a draw: since the last guest sync, and before it.
+  bool last_use_was_draw_ = false;
+  RangeSet interval_draw_reads_;
+  RangeSet interval_draw_writes_;
+  RangeSet synced_draw_reads_;
+  RangeSet synced_draw_writes_;
+  void ClearDrawAccesses() {
+    interval_draw_reads_.clear();
+    interval_draw_writes_.clear();
+    synced_draw_reads_.clear();
+    synced_draw_writes_.clear();
+  }
+  uint64_t draw_barriers_placed_ = 0;
+  uint64_t draw_barriers_skipped_ = 0;
 
   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> upload_buffer_pool_;
   std::vector<VkBufferCopy> upload_regions_;
