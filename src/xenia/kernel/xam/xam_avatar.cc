@@ -125,10 +125,17 @@ dword_result_t XamAvatarGetManifestsByXuid_entry(
 }
 DECLARE_XAM_EXPORT1(XamAvatarGetManifestsByXuid, kAvatars, kStub)
 
+// XamAvatarGetAssets' result without the assets: room for its header, an
+// empty skeleton and an empty mesh list.
+constexpr uint32_t kEmptyAvatarAssetsSize = 0x100;
+
 dword_result_t XamAvatarGetAssetsResultSize_entry(
     dword_t avatar_component_mask, lpdword_t result_buffer_size_ptr,
     lpdword_t gpu_resource_buffer_size_ptr) {
-  *result_buffer_size_ptr = 0;
+  // Without the avatar assets, room for an empty result (see
+  // XamAvatarGetAssets).
+  *result_buffer_size_ptr =
+      cvars::allow_avatar_initialization ? kEmptyAvatarAssetsSize : 0;
   *gpu_resource_buffer_size_ptr = 0;
 
   return X_STATUS_SUCCESS;
@@ -140,6 +147,33 @@ dword_result_t XamAvatarGetAssets_entry(
     dword_t avatar_component_mask, dword_t flags, lpdword_t result_buffer_ptr,
     lpdword_t gpu_resource_buffer_ptr,
     pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
+  // The avatar assets aren't implemented. A title that initialized the
+  // avatar system takes their result as given, though: Kinect Sports
+  // (4D5308C9) reads its meshes and skeleton from the buffer whether or not
+  // the request succeeded, and corrupts its heap. With avatar initialization
+  // allowed, the result is a valid one of nothing instead - an empty skeleton
+  // and no meshes - so its avatars are invisible. As the title reads it:
+  // +0 the skeleton (+0 bone count, +4 bones of 96 bytes), +8 the mesh count,
+  // +12 the component IDs (32 bytes each), +16 the meshes (52 bytes each:
+  // vertex and index buffer sizes and addresses in the GPU resource buffer,
+  // and their textures).
+  if (cvars::allow_avatar_initialization && result_buffer_ptr) {
+    const uint32_t result = result_buffer_ptr.guest_address();
+    auto* words =
+        kernel_state()->memory()->TranslateVirtual<xe::be<uint32_t>*>(result);
+    std::memset(words, 0, kEmptyAvatarAssetsSize);
+    constexpr uint32_t kSkeletonOffset = 0x40;
+    constexpr uint32_t kMeshesOffset = 0x80;
+    words[0] = result + kSkeletonOffset;
+    words[kSkeletonOffset / 4 + 1] = result + kSkeletonOffset + 8;
+    words[4] = result + kMeshesOffset;
+    if (overlapped_ptr) {
+      kernel_state()->CompleteOverlappedImmediateEx(overlapped_ptr,
+                                                    X_ERROR_SUCCESS, 0, 0);
+      return X_ERROR_IO_PENDING;
+    }
+    return X_STATUS_SUCCESS;
+  }
   // 58410907 doesn't crash if we return failure.
   if (overlapped_ptr) {
     kernel_state()->CompleteOverlappedImmediateEx(
