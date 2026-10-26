@@ -111,6 +111,9 @@ class PsCamDevice {
   std::vector<uint8_t> color_frame_;
   bool color_frame_ready_ = false;
   ColorSettings color_settings_;
+  // The generation of the color settings, which completing a 0x23 request
+  // advances. Only the worker touches it.
+  uint8_t color_settings_generation_ = 0;
   uint32_t color_frames_received_ = 0;
   uint32_t depth_frame_number_ = 0;
   uint32_t color_frame_number_ = 0;

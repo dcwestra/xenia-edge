@@ -60,7 +60,10 @@ struct X_PSCAM_FRAME_REQUEST {
   xe::be<uint32_t> buffer_size;         // 0x20
   xe::be<uint32_t> unknown_24;
   xe::be<uint32_t> result_ptr;  // 0x28, the request's +0x40
-  xe::be<uint32_t> unknown_2c[5];
+  // For color, the generation of the color settings the frame was taken
+  // with (see kColorSettingsGenerationOffset).
+  uint8_t color_settings_generation;  // 0x2C
+  uint8_t unknown_2d[19];
   // The frame's sequence number and timestamp, which become the skeleton
   // frame's dwFrameNumber and liTimeStamp: a timestamp that never changes
   // leaves everything timed from frame to frame, such as a hand's speed, at
@@ -72,6 +75,13 @@ struct X_PSCAM_FRAME_REQUEST {
 static_assert_size(X_PSCAM_FRAME_REQUEST, 0x50);
 // The completion routine a request names, at +0x14 in every request.
 constexpr uint32_t kRequestCompletionOffset = 0x14;
+// Color settings (0x23) completed get a generation, a byte counter, at +0x18,
+// and color frames carry the generation in effect when they were taken. A
+// title's NUI runtime applies new settings, such as the window its identity
+// runtime pans onto a face, from the first frame of their generation, and
+// Kinect Sports (4D5308C9) uses no color until that frame comes.
+constexpr uint32_t kRequestSetColorSettings = 0x23;
+constexpr uint32_t kColorSettingsGenerationOffset = 0x18;
 // The streams frame buffers are queued for.
 constexpr uint32_t kStreamColor = 2;
 constexpr uint32_t kStreamDepth = 4;
@@ -434,6 +444,12 @@ void PsCamDevice::WorkerMain() {
       }
     }
     for (uint32_t async_request : async_requests) {
+      auto* words = kernel_state_->memory()->TranslateVirtual<xe::be<uint32_t>*>(
+          async_request);
+      if (words[0] == kRequestSetColorSettings) {
+        words[kColorSettingsGenerationOffset / 4] =
+            ++color_settings_generation_;
+      }
       uint64_t args[] = {async_request, uint64_t(X_STATUS_SUCCESS), 0};
       kernel_state_->processor()->Execute(
           worker_->thread_state(),
@@ -461,6 +477,9 @@ void PsCamDevice::WorkerMain() {
           }
         }
       }
+      kernel_state_->memory()
+          ->TranslateVirtual<X_PSCAM_FRAME_REQUEST*>(color_request)
+          ->color_settings_generation = color_settings_generation_;
       CompleteFrameBuffer(color_request, color.data(), uint32_t(color.size()),
                           color_number, color_time_ms);
     }
