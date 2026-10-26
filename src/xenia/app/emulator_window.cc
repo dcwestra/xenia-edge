@@ -19,7 +19,9 @@
 #include "xenia/ui/quick_settings_dialog_wx.h"
 #include "xenia/ui/windowed_app_wx.h"
 
+#include <algorithm>
 #include <cerrno>
+#include <charconv>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -43,6 +45,7 @@
 #include "xenia/base/profiling.h"
 #include "xenia/base/system.h"
 #include "xenia/base/threading.h"
+#include "xenia/base/utf8.h"
 #include "xenia/config.h"
 #include "xenia/ui/imgui_audio_dialog.h"
 #include "xenia/ui/imgui_confirm_dialog.h"
@@ -296,6 +299,11 @@ DEFINE_bool(
     "Only meaningful on Apple Silicon hosts running a universal app bundle.",
     "MacOS");
 #endif
+DEFINE_string(screenshot_frames, "",
+              "Comma-separated guest frame numbers to save a screenshot of, "
+              "to screenshots/<title ID>/ next to the executable, for testing "
+              "without input.",
+              "General");
 DEFINE_bool(disable_game_window_mouse, false,
             "Disables mouse interactions in the game window, including "
             "double-click to fullscreen and right-click context menu.",
@@ -572,6 +580,14 @@ std::unique_ptr<EmulatorWindow> EmulatorWindow::Create(
 EmulatorWindow::~EmulatorWindow() {
   // The burst thread captures through the UI thread, which is this one, so
   // keep running its calls until it notices the stop.
+  screenshot_burst_stop_ = true;
+  if (auto_screenshot_thread_.joinable()) {
+    while (auto_screenshot_running_) {
+      app_context_.ExecutePendingFunctionsFromUIThread();
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    auto_screenshot_thread_.join();
+  }
   if (screenshot_burst_thread_.joinable()) {
     screenshot_burst_stop_ = true;
     while (screenshot_burst_running_) {
@@ -745,6 +761,7 @@ std::optional<LibraryKey> EmulatorWindow::RecordLaunchedDisc(
 }
 
 void EmulatorWindow::OnEmulatorInitialized() {
+  StartAutoScreenshots();
   // Ahead of the no-profile prompt, which is modal and offers to import games
   // right there. The import needs the library.
   InitializeGameLibrary();
@@ -1784,6 +1801,54 @@ void EmulatorWindow::TakeScreenshotBurst() {
       });
     }
     screenshot_burst_running_ = false;
+  });
+}
+
+void EmulatorWindow::StartAutoScreenshots() {
+  std::vector<uint32_t> frames;
+  for (std::string_view part : xe::utf8::split(cvars::screenshot_frames, ",")) {
+    uint32_t frame = 0;
+    if (std::from_chars(part.data(), part.data() + part.size(), frame).ec ==
+            std::errc() &&
+        frame) {
+      frames.push_back(frame);
+    }
+  }
+  if (frames.empty()) {
+    return;
+  }
+  std::sort(frames.begin(), frames.end());
+  auto_screenshot_running_ = true;
+  auto_screenshot_thread_ = std::thread([this, frames]() {
+    for (uint32_t target : frames) {
+      while (xe::logging::GetFrameNumber() < target &&
+             !screenshot_burst_stop_) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      if (screenshot_burst_stop_) {
+        break;
+      }
+      xe::ui::RawImage image;
+      bool captured = false;
+      app_context_.CallInUIThreadSynchronous([this, &image, &captured]() {
+        xe::ui::Presenter* presenter = GetGraphicsSystemPresenter();
+        captured = presenter && presenter->CaptureGuestOutput(image);
+      });
+      if (!captured) {
+        continue;
+      }
+      std::filesystem::path folder =
+          xe::filesystem::GetExecutableFolder() / "screenshots" /
+          fmt::format("{:08X}", emulator()->title_id());
+      std::filesystem::create_directories(folder);
+      const std::filesystem::path path =
+          folder /
+          fmt::format("frame {:06}.png", xe::logging::GetFrameNumber());
+      SaveImage(path, image);
+      XELOGI("screenshot_frames: saved {}",
+             xe::strip_pii(xe::path_to_utf8(path)));
+    }
+    auto_screenshot_running_ = false;
   });
 }
 

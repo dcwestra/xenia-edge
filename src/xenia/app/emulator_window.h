@@ -71,6 +71,10 @@ class EmulatorWindow {
   std::thread screenshot_burst_thread_;
   std::atomic<bool> screenshot_burst_running_ = {false};
   std::atomic<bool> screenshot_burst_stop_ = {false};
+  // Saves the guest frames screenshot_frames lists.
+  void StartAutoScreenshots();
+  std::thread auto_screenshot_thread_;
+  std::atomic<bool> auto_screenshot_running_ = {false};
 
   static constexpr int64_t diff_in_ms(
       const steady_clock::time_point t1,
