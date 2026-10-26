@@ -72,6 +72,20 @@ class XGuestObject : public XObject {
   static inline std::unordered_map<uint32_t, XGuestObject*> by_body_;
 };
 
+// Bodies ObCreateObject made of a type xenia keeps no host object kind for,
+// by type, until ObOpenObjectByPointer names one. Guarded by the global lock.
+static std::unordered_map<uint32_t, uint32_t> unnamed_guest_objects;
+
+static bool IsHostObjectType(uint32_t type_ptr) {
+  for (const auto& [type, guest_type_ptr] :
+       kernel_state()->host_object_type_enum_to_guest_object_type_ptr_) {
+    if (guest_type_ptr == type_ptr) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // Runs the type's delete and free procedures for the guest objects this thread
 // released.
 static void RunPendingGuestObjectDeletes() {
@@ -308,6 +322,41 @@ DECLARE_XBOXKRNL_EXPORT1(ObOpenObjectByName, kNone, kImplemented);
 dword_result_t ObOpenObjectByPointer_entry(lpvoid_t object_ptr,
                                            lpdword_t out_handle_ptr) {
   *out_handle_ptr = 0;
+  // An object of a type the title defines has no dispatch header to make a
+  // host object of. It's named as ObInsertObject names one, keeping its type
+  // for ObReferenceObjectByHandle to check: Kinect Sports' (4D5308C9) NUI
+  // runtime opens its image streams so and references them by type each
+  // frame.
+  const uint32_t body = object_ptr.guest_address();
+  if (auto guest_object = XGuestObject::FromBody(body)) {
+    guest_object->RetainHandle();
+    *out_handle_ptr = guest_object->handle();
+    return X_STATUS_SUCCESS;
+  }
+  uint32_t guest_type_ptr = 0;
+  {
+    auto global_lock = global_critical_region::AcquireDirect();
+    auto it = unnamed_guest_objects.find(body);
+    if (it != unnamed_guest_objects.end()) {
+      // Unless the memory is something else's by now.
+      auto header = kernel_memory()->TranslateVirtual<X_OBJECT_HEADER*>(
+          body - uint32_t(sizeof(X_OBJECT_HEADER)));
+      if (header->object_type_ptr == it->second) {
+        guest_type_ptr = it->second;
+      }
+      unnamed_guest_objects.erase(it);
+    }
+  }
+  if (guest_type_ptr) {
+    // The caller keeps the creation reference, which it drops with
+    // ObDereferenceObject, beside the handle.
+    auto guest_object = object_ref<XGuestObject>(
+        new XGuestObject(kernel_state(), body, guest_type_ptr));
+    guest_object->RetainHandle();
+    *out_handle_ptr = guest_object->handle();
+    return X_STATUS_SUCCESS;
+  }
+
   auto object = XObject::GetNativeObject<XObject>(kernel_state(), object_ptr);
   if (!object) {
     return X_STATUS_UNSUCCESSFUL;
@@ -574,6 +623,11 @@ dword_result_t ObCreateObject_entry(
       xeObCreateObject(object_factory, optional_attributes,
                        object_size_sans_headers, &out_object_tmp, context);
   *out_object = out_object_tmp;
+  if (XSUCCEEDED(result) &&
+      !IsHostObjectType(object_factory.guest_address())) {
+    auto global_lock = global_critical_region::AcquireDirect();
+    unnamed_guest_objects[out_object_tmp] = object_factory.guest_address();
+  }
   return result;
 }
 DECLARE_XBOXKRNL_EXPORT1(ObCreateObject, kNone, kImplemented);
@@ -589,6 +643,10 @@ dword_result_t ObInsertObject_entry(dword_t object,
       object - uint32_t(sizeof(X_OBJECT_HEADER)));
   // The creation reference passes to the handle and the caller gets
   // |pointer_bias| more, which it later drops with ObDereferenceObject.
+  {
+    auto global_lock = global_critical_region::AcquireDirect();
+    unnamed_guest_objects.erase(object);
+  }
   auto guest_object = object_ref<XGuestObject>(
       new XGuestObject(kernel_state(), object, header->object_type_ptr));
   for (uint32_t i = 0; i < pointer_bias; ++i) {
