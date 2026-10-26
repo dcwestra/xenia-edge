@@ -168,6 +168,10 @@ inline void XeCryptSha256Final(XECRYPT_SHA256_STATE* state, uint8_t* out,
   if (out_size) {
     std::memcpy(out, digest, std::min<uint32_t>(out_size, sizeof(digest)));
   }
+  // The state ends as the final hash, which, its words being big-endian, is
+  // the digest: titles that pass no output read it there, such as Fable: The
+  // Journey (4D530A1A) checking its Kinect gesture databases.
+  std::memcpy(state->state, digest, sizeof(digest));
   std::memcpy(state->buffer, digest, sizeof(digest));
 }
 
@@ -211,6 +215,8 @@ inline void XeCryptSha512Final(XECRYPT_SHA512_STATE* state, uint8_t* out,
   if (out_size) {
     std::memcpy(out, digest, std::min<uint32_t>(out_size, sizeof(digest)));
   }
+  // As for SHA-256, the state ends as the final hash.
+  std::memcpy(state->state, digest, sizeof(digest));
   std::memcpy(state->buffer, digest, sizeof(digest));
 }
 
