@@ -323,11 +323,18 @@ dword_result_t XamAvatarGetAssets_entry(
                     avatar_metadata_ptr.guest_address()),
                 manifest.size());
   }
+  // Titles' custom assets in it, read now as the title has them.
+  std::vector<std::vector<uint8_t>> custom_assets;
+  for (const auto& [address, size] : GetAvatarManifestCustomAssets(manifest)) {
+    const auto* data =
+        kernel_state()->memory()->TranslateVirtual<const uint8_t*>(address);
+    custom_assets.emplace_back(data, data + size);
+  }
   const uint32_t component_mask = avatar_component_mask;
   const uint32_t result = result_buffer_ptr.guest_address();
   const uint32_t gpu = gpu_resource_buffer_ptr.guest_address();
-  auto run = [manifest, component_mask, result, gpu](uint32_t& extended_error,
-                                                     uint32_t& length) {
+  auto run = [manifest, custom_assets, component_mask, result, gpu](
+                 uint32_t& extended_error, uint32_t& length) {
     extended_error = X_ERROR_SUCCESS;
     length = 0;
     if (!result) {
@@ -336,7 +343,7 @@ dword_result_t XamAvatarGetAssets_entry(
     uint32_t result_size, gpu_size;
     GetAvatarAssetsSizes(component_mask, &result_size, &gpu_size);
     AvatarAssets assets;
-    BuildAvatarAssets(manifest, component_mask, &assets);
+    BuildAvatarAssets(manifest, component_mask, &assets, custom_assets);
     XELOGI("Avatars: {} models for components {:08X}", assets.models.size(),
            component_mask);
     WriteAvatarAssetsResult(result, result_size, gpu, gpu_size, assets);
@@ -353,13 +360,34 @@ DECLARE_XAM_EXPORT1(XamAvatarGetAssets, kAvatars, kSketchy);
 
 dword_result_t XamAvatarSetCustomAsset_entry(
     dword_t buffer_size, lpdword_t asset_data_ptr, dword_t custom_color_count,
-    lpdword_t custom_colors_ptr,
+    lpdword_t custom_colors_ptr, dword_t unknown,  // 0 from XAvatar
     pointer_t<X_AVATAR_METADATA> avatar_metadata_ptr) {
-  // Titles put their own assets in an avatar this way (Kinect Sports: empty
-  // clothes with body shape overrides, for its sports outfits). Not done yet:
-  // the avatar keeps its clothes.
-  XELOGW("Avatars: a title's custom avatar asset ({} bytes) is ignored",
-         uint32_t(buffer_size));
+  // A title's own avatar item (an STRB container) in place of the manifest's
+  // in its slots; Kinect Sports dresses players for its sports this way
+  // (empty clothes whose hiding templates hide the body under its outfits).
+  if (!avatar_metadata_ptr || !asset_data_ptr || !buffer_size) {
+    return X_E_INVALIDARG;
+  }
+  Memory* memory = kernel_state()->memory();
+  std::vector<uint32_t> colors;
+  for (uint32_t i = 0;
+       custom_colors_ptr && i < std::min<uint32_t>(custom_color_count, 3);
+       ++i) {
+    colors.push_back(xe::load_and_swap<uint32_t>(
+        memory->TranslateVirtual(custom_colors_ptr.guest_address() + 4 * i)));
+  }
+  const bool set = SetAvatarManifestCustomAsset(
+      std::span<uint8_t>(memory->TranslateVirtual<uint8_t*>(
+                             avatar_metadata_ptr.guest_address()),
+                         kAvatarManifestSize),
+      std::span<const uint8_t>(memory->TranslateVirtual<const uint8_t*>(
+                                   asset_data_ptr.guest_address()),
+                               buffer_size),
+      asset_data_ptr.guest_address(), colors);
+  if (!set) {
+    XELOGW("Avatars: a title's custom avatar asset ({} bytes) wasn't usable",
+           uint32_t(buffer_size));
+  }
   return X_STATUS_SUCCESS;
 }
 DECLARE_XAM_EXPORT1(XamAvatarSetCustomAsset, kAvatars, kStub)

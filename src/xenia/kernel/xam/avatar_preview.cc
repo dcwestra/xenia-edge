@@ -194,9 +194,6 @@ bool RenderAvatarPreview(const AvatarAssets& assets, uint32_t width,
   struct Mesh {
     const AvatarAssetModel* model;
     uint32_t pass;
-    // The body a little behind the clothes over it, which it pokes through
-    // in places.
-    float depth_bias;
     std::vector<Vertex> vertices;
     std::vector<uint32_t> indices;
     // Texture binding n samples UV set n.
@@ -228,7 +225,6 @@ bool RenderAvatarPreview(const AvatarAssets& assets, uint32_t width,
       Mesh mesh;
       mesh.model = &model;
       mesh.pass = word(0);
-      mesh.depth_bias = (model.slots & 0x2) ? -0.006f : 0.0f;
       for (size_t r = 1; r + 6 <= 120; r += 6) {
         const uint32_t type = word(r);
         if (type == 1) {
@@ -400,7 +396,7 @@ bool RenderAvatarPreview(const AvatarAssets& assets, uint32_t width,
             continue;
           }
           const float z = w[0] * v[0]->position.z + w[1] * v[1]->position.z +
-                          w[2] * v[2]->position.z + mesh.depth_bias;
+                          w[2] * v[2]->position.z;
           float& stored = depth[size_t(y) * width + x];
           if (z <= stored) {
             continue;

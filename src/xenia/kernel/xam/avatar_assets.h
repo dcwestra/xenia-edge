@@ -15,6 +15,7 @@
 #include <mutex>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace xe {
@@ -36,6 +37,10 @@ class AvatarAssetPack {
     // Bit 0: offered in the avatar editor (not a hat variant of a hairstyle).
     uint8_t flags = 0;
     uint32_t subcategory = 0;
+    // An asset it goes with: a clothing item's hiding template (slots
+    // 0x1000000), a hairstyle's hat variant (slots 4).
+    uint32_t linked_slots = 0;
+    uint32_t linked_index = 0;
     // The asset's STRB container in the table, 0 if this pack lacks it.
     uint32_t strb_offset = 0;
     uint32_t strb_size = 0;
@@ -105,9 +110,23 @@ struct AvatarAssets {
 // The avatar manifest (X_AVATAR_METADATA) is 1000 bytes.
 constexpr size_t kAvatarManifestSize = 1000;
 
-// Builds an avatar's models with the components in component_mask.
-bool BuildAvatarAssets(std::span<const uint8_t> manifest,
-                       uint32_t component_mask, AvatarAssets* out);
+// Builds an avatar's models with the components in component_mask. The
+// manifest's custom assets (see SetAvatarManifestCustomAsset) are given in
+// the order GetAvatarManifestCustomAssets lists them.
+bool BuildAvatarAssets(
+    std::span<const uint8_t> manifest, uint32_t component_mask,
+    AvatarAssets* out,
+    std::span<const std::vector<uint8_t>> custom_assets = {});
+// Puts a title's own item (an STRB container, at a guest address that stays
+// valid) in the manifest in place of the components sharing its slots, with
+// up to 3 tint colors (ARGB).
+bool SetAvatarManifestCustomAsset(std::span<uint8_t> manifest,
+                                  std::span<const uint8_t> strb,
+                                  uint32_t address,
+                                  std::span<const uint32_t> colors);
+// The guest addresses and sizes of a manifest's custom assets.
+std::vector<std::pair<uint32_t, uint32_t>> GetAvatarManifestCustomAssets(
+    std::span<const uint8_t> manifest);
 // The result and GPU data sizes that hold any avatar's components in the mask.
 void GetAvatarAssetsSizes(uint32_t component_mask, uint32_t* result_size,
                           uint32_t* gpu_size);

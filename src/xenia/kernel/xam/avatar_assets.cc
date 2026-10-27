@@ -56,6 +56,12 @@ constexpr uint32_t kStrbBlockMetadata = 8;
 constexpr uint32_t kSlotHead = 0x1;
 constexpr uint32_t kSlotBody = 0x2;
 constexpr uint32_t kSlotHair = 0x4;
+// Linked to by clothing records: their hiding templates.
+constexpr uint32_t kSlotHidingTemplate = 0x1000000;
+
+// A manifest component that's a title's custom asset (XamAvatarSetCustomAsset):
+// {slots, 'XCUS', its guest address, its size, slots << 16, 3 colors}.
+constexpr uint32_t kCustomAssetMarker = 0x58435553;
 
 // Asset y positions are quantized with a step sqrt(2/3) of x's and z's
 // (checked against titles' own avatar meshes on their skeleton).
@@ -247,12 +253,37 @@ bool ParseStrb(std::span<const uint8_t> data, std::vector<StrbBlock>* blocks) {
   return true;
 }
 
+bool DecompressAssetData(std::span<const uint8_t> data,
+                         std::vector<uint8_t>* out, size_t max_chunks);
+
+// The data of an STRB container's first block of the type, decompressed for
+// models and textures.
+bool ReadStrbBlock(std::span<const uint8_t> strb, uint32_t block_id,
+                   std::vector<uint8_t>* out) {
+  std::vector<StrbBlock> blocks;
+  if (!ParseStrb(strb, &blocks)) {
+    return false;
+  }
+  for (const StrbBlock& block : blocks) {
+    if (block.id != block_id) {
+      continue;
+    }
+    const std::span<const uint8_t> data =
+        strb.subspan(block.offset, block.length);
+    if (block_id == kStrbBlockModel || block_id == kStrbBlockTexture) {
+      return DecompressAssetData(data, out, SIZE_MAX);
+    }
+    out->assign(data.begin(), data.end());
+    return true;
+  }
+  return false;
+}
+
 // Model and texture block data: chunks of {u32 compressed size, u32 output
 // offset, u32 output size} (little-endian), each an LZX stream of its own
 // with a 32 KB window.
 bool DecompressAssetData(std::span<const uint8_t> data,
-                         std::vector<uint8_t>* out,
-                         size_t max_chunks = SIZE_MAX) {
+                         std::vector<uint8_t>* out, size_t max_chunks) {
   out->clear();
   size_t cursor = 0;
   for (size_t chunk = 0; chunk < max_chunks && cursor + 12 <= data.size();
@@ -581,19 +612,22 @@ bool DecodeModel(std::span<const uint8_t> raw, DecodedModel* model) {
   return true;
 }
 
-// Applies a shape override (an STRB block 4: a nose, chin or ears) to its
-// model's GPU data. Sections of a 32-byte header {count, the size of the
-// buffer they change, ?, the model's asset ID, 0, index bits}: for the vertex
-// buffer, the model mesh descriptor (position step and minimum, the 274-bit
-// widths and bases) and records {VB byte offset, position, normal, weights,
-// bone indices, color}, replacing those vertices; for the index buffer,
-// triangles (not applied).
+// Applies a shape override (an STRB block 4) to the model it targets, in its
+// GPU data: a nose, chin or ears reshape the head, a clothing item's hiding
+// template hides the body under it. Sections of a 32-byte header {count, the
+// size of the buffer they change, ?, the target's asset ID, 0, index bits}:
+// for the index buffer, the triangles to hide; for the vertex buffer, the
+// model mesh descriptor (position step and minimum, the 274-bit widths and
+// bases) and records {VB byte offset, position, normal, weights, bone
+// indices, color}, replacing those vertices.
 void ApplyShapeOverride(std::span<const uint8_t> block,
-                        const DecodedModel& model, uint8_t* gpu) {
+                        const DecodedModel& model, uint32_t model_index,
+                        uint8_t* gpu) {
   if (model.meshes.empty()) {
     return;
   }
   const uint32_t vb_size = model.header[3];
+  const uint32_t ib_size = model.header[4];
   const uint32_t stride = model.meshes[0].stride;
   // Stored minimum z are scaled by 2/sqrt(3) about the model's (fitted to
   // the head's vertices the overrides border on, within about 2 mm).
@@ -604,16 +638,37 @@ void ApplyShapeOverride(std::span<const uint8_t> block,
   while (offset + 32 <= block.size()) {
     const uint32_t count = LoadLE32(&block[offset]);
     const uint32_t buffer_size = LoadLE32(&block[offset + 4]);
+    const uint32_t target = LoadLE32(&block[offset + 12]) & 0xFFFF;
     const uint32_t index_bits = LoadLE32(&block[offset + 28]);
     offset += 32;
     if (!count) {
       continue;
     }
-    if (buffer_size != vb_size || offset + 20 > block.size() || !index_bits ||
-        index_bits > 32) {
-      // Triangles: count indices of index_bits each.
-      offset = (offset * 8 + size_t(count) * index_bits + 7) / 8;
+    if (!index_bits || index_bits > 32) {
+      return;
+    }
+    if (buffer_size != vb_size) {
+      // Triangles to hide (made degenerate).
+      const size_t data = offset * 8;
+      if (data + size_t(count) * index_bits > bits.size_bits()) {
+        return;
+      }
+      if (target == model_index && buffer_size == ib_size) {
+        for (uint32_t i = 0; i < count; ++i) {
+          const size_t triangle =
+              bits.Read(data + size_t(i) * index_bits, index_bits);
+          if (6 * triangle + 6 <= ib_size) {
+            uint8_t* indices = gpu + model.header[8] + 6 * triangle;
+            std::memcpy(indices + 2, indices, 2);
+            std::memcpy(indices + 4, indices, 2);
+          }
+        }
+      }
+      offset = (data + size_t(count) * index_bits + 7) / 8;
       continue;
+    }
+    if (offset + 20 > block.size()) {
+      return;
     }
     const float step = 2.0f * LoadLE32Float(&block[offset]);
     const float minimum[3] = {
@@ -640,7 +695,7 @@ void ApplyShapeOverride(std::span<const uint8_t> block,
     if (stream + size_t(count) * record_bits > bits.size_bits()) {
       return;
     }
-    for (uint32_t v = 0; v < count; ++v) {
+    for (uint32_t v = 0; target == model_index && v < count; ++v) {
       size_t bit = stream + size_t(v) * record_bits;
       const uint32_t vertex_offset = bits.Read(bit, index_bits);
       bit += index_bits;
@@ -700,6 +755,8 @@ std::shared_ptr<const DecodedModel> GetModel(const AvatarAssetPack& pack,
 struct ManifestItem {
   uint32_t slots = 0;
   uint32_t index = 0;
+  // A title's custom asset (an index into BuildAvatarAssets' custom assets).
+  int32_t custom = -1;
   std::array<uint8_t, 16> asset_id = {};
   std::array<uint32_t, 3> custom_colors = {};
 };
@@ -751,6 +808,7 @@ ParsedManifest ParseManifest(const AvatarAssetPack& pack,
       offset += 4;
     }
   }
+  int32_t custom_count = 0;
   for (size_t offset = 0x120; offset + 32 <= 0x300; offset += 32) {
     const uint32_t slots = xe::load_and_swap<uint32_t>(&manifest[offset]);
     if (!slots) {
@@ -762,8 +820,13 @@ ParsedManifest ParseManifest(const AvatarAssetPack& pack,
       item.custom_colors[i] =
           xe::load_and_swap<uint32_t>(&manifest[offset + 20 + 4 * i]);
     }
-    if (IsPackAssetId(pack, &manifest[offset + 4]) &&
-        accept(slots, &manifest[offset + 4], &item)) {
+    if (xe::load_and_swap<uint32_t>(&manifest[offset + 4]) ==
+        kCustomAssetMarker) {
+      item.slots = slots;
+      item.custom = custom_count++;
+      parsed.components.push_back(item);
+    } else if (IsPackAssetId(pack, &manifest[offset + 4]) &&
+               accept(slots, &manifest[offset + 4], &item)) {
       parsed.components.push_back(item);
     }
   }
@@ -954,6 +1017,8 @@ bool AvatarAssetPack::Load(std::vector<uint8_t> toc) {
     record.gender = r[4];
     record.flags = r[6];
     record.subcategory = xe::load_and_swap<uint32_t>(r + 0x98);
+    record.linked_slots = xe::load_and_swap<uint32_t>(r + 0x9C);
+    record.linked_index = xe::load_and_swap<uint32_t>(r + 0xA0) >> 16;
     const uint32_t strb = xe::load_and_swap<uint32_t>(r + 0xF0);
     const uint32_t size = xe::load_and_swap<uint32_t>(r + 0xF4);
     std::vector<StrbBlock> blocks;
@@ -1018,16 +1083,11 @@ bool AvatarAssetPack::FindBlock(uint32_t index, uint32_t block_id,
 
 bool AvatarAssetPack::ReadBlock(uint32_t index, uint32_t block_id,
                                 std::vector<uint8_t>* out) const {
-  size_t offset, length;
-  if (!FindBlock(index, block_id, &offset, &length)) {
-    return false;
-  }
-  const std::span<const uint8_t> data(&toc_[offset], length);
-  if (block_id == kStrbBlockModel || block_id == kStrbBlockTexture) {
-    return DecompressAssetData(data, out);
-  }
-  out->assign(data.begin(), data.end());
-  return true;
+  const Record* record = GetRecord(index);
+  return record &&
+         ReadStrbBlock(std::span<const uint8_t>(&toc_[record->strb_offset],
+                                                record->strb_size),
+                       block_id, out);
 }
 
 uint32_t AvatarAssetPack::GetModelGpuSize(uint32_t index) const {
@@ -1051,7 +1111,8 @@ uint32_t AvatarAssetPack::GetModelGpuSize(uint32_t index) const {
 }
 
 bool BuildAvatarAssets(std::span<const uint8_t> manifest,
-                       uint32_t component_mask, AvatarAssets* out) {
+                       uint32_t component_mask, AvatarAssets* out,
+                       std::span<const std::vector<uint8_t>> custom_assets) {
   out->models.clear();
   out->gpu_data.clear();
   const AvatarAssetPack* pack = AvatarAssetPack::Get();
@@ -1066,13 +1127,26 @@ bool BuildAvatarAssets(std::span<const uint8_t> manifest,
       const bool is_first = item.slots == kSlotBody || item.slots == kSlotHead;
       if ((first ? item.slots == first : !is_first) &&
           (item.slots & component_mask) &&
-          pack->GetRecord(item.index)->type == 1) {
+          (item.custom >= 0 ? size_t(item.custom) < custom_assets.size()
+                            : pack->GetRecord(item.index)->type == 1)) {
         components.push_back(&item);
       }
     }
   }
   for (const ManifestItem* item : components) {
-    std::shared_ptr<const DecodedModel> model = GetModel(*pack, item->index);
+    std::shared_ptr<const DecodedModel> model;
+    if (item->custom >= 0) {
+      // A title's own; empty ones (Kinect Sports' clothes for its sports
+      // outfits) only hide the body.
+      std::vector<uint8_t> raw;
+      auto decoded = std::make_shared<DecodedModel>();
+      if (ReadStrbBlock(custom_assets[item->custom], kStrbBlockModel, &raw) &&
+          DecodeModel(raw, decoded.get())) {
+        model = decoded;
+      }
+    } else {
+      model = GetModel(*pack, item->index);
+    }
     if (!model) {
       continue;
     }
@@ -1096,7 +1170,28 @@ bool BuildAvatarAssets(std::span<const uint8_t> manifest,
         std::vector<uint8_t> block;
         if (pack->GetRecord(feature.index)->type == 3 &&
             pack->ReadBlock(feature.index, kStrbBlockShapeOverrides, &block)) {
-          ApplyShapeOverride(block, *model, &out->gpu_data[base]);
+          ApplyShapeOverride(block, *model, item->index, &out->gpu_data[base]);
+        }
+      }
+    }
+    if (item->slots & kSlotBody) {
+      // The clothes' hiding templates: the body under them hidden, or pulled
+      // in where it would show through.
+      for (const ManifestItem* other : components) {
+        std::vector<uint8_t> block;
+        bool found;
+        if (other->custom >= 0) {
+          // Custom assets carry theirs.
+          found = ReadStrbBlock(custom_assets[other->custom],
+                                kStrbBlockShapeOverrides, &block);
+        } else {
+          const AvatarAssetPack::Record* record = pack->GetRecord(other->index);
+          found = record->linked_slots == kSlotHidingTemplate &&
+                  pack->ReadBlock(record->linked_index,
+                                  kStrbBlockShapeOverrides, &block);
+        }
+        if (found) {
+          ApplyShapeOverride(block, *model, item->index, &out->gpu_data[base]);
         }
       }
     }
@@ -1163,7 +1258,10 @@ bool BuildAvatarAssets(std::span<const uint8_t> manifest,
     } else {
       // {u32 count, then entries of 3 {color, ?}}, little-endian.
       std::vector<uint8_t> table;
-      if (pack->ReadBlock(item->index, kStrbBlockColorTable, &table) &&
+      if ((item->custom >= 0
+               ? ReadStrbBlock(custom_assets[item->custom],
+                               kStrbBlockColorTable, &table)
+               : pack->ReadBlock(item->index, kStrbBlockColorTable, &table)) &&
           table.size() >= 28 && LoadLE32(&table[0])) {
         for (size_t i = 0; i < 3; ++i) {
           tints[i] = LoadLE32(&table[4 + 8 * i]);
@@ -1200,6 +1298,76 @@ bool BuildAvatarAssets(std::span<const uint8_t> manifest,
     out->models.push_back(std::move(result));
   }
   return !out->models.empty();
+}
+
+bool SetAvatarManifestCustomAsset(std::span<uint8_t> manifest,
+                                  std::span<const uint8_t> strb,
+                                  uint32_t address,
+                                  std::span<const uint32_t> colors) {
+  // Its slots from the metadata (a component's details).
+  std::vector<StrbBlock> blocks;
+  uint32_t slots = 0;
+  if (manifest.size() < kAvatarManifestSize || !ParseStrb(strb, &blocks)) {
+    return false;
+  }
+  for (const StrbBlock& block : blocks) {
+    if (block.id == kStrbBlockMetadata && block.length >= 10 &&
+        strb[block.offset] == 2 && LoadLE32(&strb[block.offset + 2]) == 1) {
+      slots = LoadLE32(&strb[block.offset + 6]);
+    }
+  }
+  if (!slots || (slots & (kSlotHead | kSlotBody))) {
+    return false;
+  }
+  // It replaces the components sharing its slots.
+  std::vector<std::array<uint8_t, 32>> entries;
+  for (size_t offset = 0x120; offset + 32 <= 0x300; offset += 32) {
+    const uint32_t entry_slots = xe::load_and_swap<uint32_t>(&manifest[offset]);
+    if (!entry_slots) {
+      break;
+    }
+    if (!(entry_slots & slots & 0x7FFFFF)) {
+      std::array<uint8_t, 32> entry;
+      std::memcpy(entry.data(), &manifest[offset], 32);
+      entries.push_back(entry);
+    }
+  }
+  std::array<uint8_t, 32> custom = {};
+  xe::store_and_swap<uint32_t>(&custom[0], slots);
+  xe::store_and_swap<uint32_t>(&custom[4], kCustomAssetMarker);
+  xe::store_and_swap<uint32_t>(&custom[8], address);
+  xe::store_and_swap<uint32_t>(&custom[12], uint32_t(strb.size()));
+  xe::store_and_swap<uint32_t>(&custom[16], slots << 16);
+  for (size_t i = 0; i < std::min<size_t>(colors.size(), 3); ++i) {
+    xe::store_and_swap<uint32_t>(&custom[20 + 4 * i], colors[i]);
+  }
+  entries.push_back(custom);
+  if (entries.size() > (0x300 - 0x120) / 32) {
+    return false;
+  }
+  std::fill(&manifest[0x120], &manifest[0x300], uint8_t(0));
+  for (size_t i = 0; i < entries.size(); ++i) {
+    std::memcpy(&manifest[0x120 + 32 * i], entries[i].data(), 32);
+  }
+  return true;
+}
+
+std::vector<std::pair<uint32_t, uint32_t>> GetAvatarManifestCustomAssets(
+    std::span<const uint8_t> manifest) {
+  std::vector<std::pair<uint32_t, uint32_t>> assets;
+  for (size_t offset = 0x120;
+       manifest.size() >= kAvatarManifestSize && offset + 32 <= 0x300;
+       offset += 32) {
+    if (!xe::load_and_swap<uint32_t>(&manifest[offset])) {
+      break;
+    }
+    if (xe::load_and_swap<uint32_t>(&manifest[offset + 4]) ==
+        kCustomAssetMarker) {
+      assets.emplace_back(xe::load_and_swap<uint32_t>(&manifest[offset + 8]),
+                          xe::load_and_swap<uint32_t>(&manifest[offset + 12]));
+    }
+  }
+  return assets;
 }
 
 void GetAvatarAssetsSizes(uint32_t component_mask, uint32_t* result_size,
@@ -1266,9 +1434,14 @@ uint32_t OccupiedSlots(const AvatarAssetPack::Record& record) {
   return record.slots & 0x7FFFFF;
 }
 
-bool IsHatHairVariant(const AvatarAssetPack& pack, uint32_t index) {
+// A hairstyle's hat variant is the hair asset its record links to.
+uint32_t HatHairVariant(const AvatarAssetPack& pack, uint32_t index) {
   const AvatarAssetPack::Record* record = pack.GetRecord(index);
-  return record && record->slots == kSlotHair && !(record->flags & 1);
+  return record && record->slots == kSlotHair &&
+                 record->linked_slots == kSlotHair &&
+                 pack.GetRecord(record->linked_index)
+             ? record->linked_index
+             : index;
 }
 }  // namespace
 
@@ -1293,11 +1466,14 @@ bool ReadAvatarManifest(std::span<const uint8_t> manifest,
     if (item.slots == kSlotHead || item.slots == kSlotBody) {
       continue;
     }
-    // Hair under a hat is a variant after the hairstyle.
+    // Hair under a hat is the hat variant a hairstyle links to.
     uint32_t index = item.index;
-    if (IsHatHairVariant(*pack, index) && index && pack->GetRecord(index - 1) &&
-        pack->GetRecord(index - 1)->slots == kSlotHair) {
-      --index;
+    const auto& records = pack->records();
+    for (uint32_t i = 0; i < records.size(); ++i) {
+      if (i != index && HatHairVariant(*pack, i) == index) {
+        index = i;
+        break;
+      }
     }
     avatar->items.push_back(index);
   }
@@ -1370,9 +1546,8 @@ bool WriteAvatarManifest(const AvatarDescription& avatar,
     if (!record || record->type != 1 || IsFeatureSlots(record->slots)) {
       continue;
     }
-    if (hat && record->slots == kSlotHair &&
-        IsHatHairVariant(*pack, index + 1)) {
-      ++index;
+    if (hat) {
+      index = HatHairVariant(*pack, index);
     }
     clothes.push_back({record->slots, index});
   }
