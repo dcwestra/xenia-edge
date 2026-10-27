@@ -452,7 +452,7 @@ class KinectCameraLinux : public KinectCamera {
                   uint16_t payload_size, uint8_t* reply, int reply_capacity) {
     uint8_t out[8 + 0x200];
     if (payload_size > sizeof(out) - 8) {
-      return -1;
+      return LIBUSB_ERROR_INVALID_PARAM;
     }
     out[0] = 'G';
     out[1] = 'M';
@@ -484,23 +484,43 @@ class KinectCameraLinux : public KinectCamera {
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     if (length < 8) {
-      return -1;
+      return LIBUSB_ERROR_TIMEOUT;
     }
     const int reply_size = length - 8;
     std::memcpy(reply, in + 8, std::min(reply_size, reply_capacity));
     return reply_size;
   }
 
+  // Now and then the camera doesn't answer a command (at the first depth or
+  // color setting, which left that stream off for the whole session), so a
+  // write is tried again. Writing a register twice is harmless, and a late
+  // reply to the first try has an older tag, which SendCommand skips.
   bool WriteRegister(uint16_t reg, uint16_t value) {
     uint8_t payload[4];
     StoreLe16(payload, reg);
     StoreLe16(payload + 2, value);
     uint8_t reply[4];
-    if (SendCommand(0x03, payload, sizeof(payload), reply, sizeof(reply)) < 0) {
-      XELOGW("Kinect: writing camera register {:04X} failed", reg);
-      return false;
+    int result = 0;
+    for (int attempt = 0; attempt < 4; ++attempt) {
+      if (attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      }
+      result =
+          SendCommand(0x03, payload, sizeof(payload), reply, sizeof(reply));
+      if (result >= 0) {
+        if (attempt) {
+          XELOGI("Kinect: writing camera register {:04X} took {} tries", reg,
+                 attempt + 1);
+        }
+        return true;
+      }
+      if (result == LIBUSB_ERROR_NO_DEVICE) {
+        break;
+      }
     }
-    return true;
+    XELOGW("Kinect: writing camera register {:04X} failed: {}", reg,
+           usb_.libusb_error_name(result));
+    return false;
   }
 
   struct Stream {
