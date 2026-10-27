@@ -37,8 +37,7 @@ void NuiIdentity::SetHandler(uint32_t handler) {
   handler_ = handler;
 }
 
-void NuiIdentity::RequestEnrollment(uint32_t tracking_id,
-                                    uint32_t user_index) {
+void NuiIdentity::RequestEnrollment(uint32_t tracking_id, uint32_t user_index) {
   uint32_t handler;
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -56,16 +55,16 @@ void NuiIdentity::RequestEnrollment(uint32_t tracking_id,
     // answers, so it's bound now, to the slot their identification was
     // given.
     for (const MatchAnswer& answer : match_answers_) {
-      if (answer.tracking_id == tracking_id &&
-          answer.slot < kSlotCount) {
+      if (answer.tracking_id == tracking_id && answer.slot < kSlotCount) {
         BindSlot(answer.slot, user_index);
         break;
       }
     }
   }
-  XELOGI("NUI identity: asking the title to enroll tracking ID {:X} for "
-         "user {}",
-         tracking_id, user_index);
+  XELOGI(
+      "NUI identity: asking the title to enroll tracking ID {:X} for "
+      "user {}",
+      tracking_id, user_index);
   // {tracking ID, user index, flags}.
   CallHandler(handler, kMessageEnroll, {tracking_id, user_index, 1});
 }
@@ -89,8 +88,8 @@ void NuiIdentity::CallHandler(uint32_t handler, uint32_t message,
         const uint32_t result = uint32_t(kernel_state->processor()->Execute(
             XThread::GetCurrentThread()->thread_state(), handler, args,
             xe::countof(args)));
-        XELOGI("NUI identity: the title's handler took {:08X}: {:08X}",
-               message, result);
+        XELOGI("NUI identity: the title's handler took {:08X}: {:08X}", message,
+               result);
         // Refused (the player out of view, say), so no answer is coming.
         if (message == kMessageEnroll && int32_t(result) < 0) {
           kernel_state->nui_identity()->OnEnrollmentResult(
@@ -110,9 +109,8 @@ void NuiIdentity::CallHandler(uint32_t handler, uint32_t message,
 
 void NuiIdentity::WaitForEnrollment(std::chrono::milliseconds timeout) {
   std::unique_lock<std::mutex> lock(mutex_);
-  if (!enrollment_answered_.wait_for(lock, timeout, [this]() {
-        return pending_user_index_ == kNoUser;
-      })) {
+  if (!enrollment_answered_.wait_for(
+          lock, timeout, [this]() { return pending_user_index_ == kNoUser; })) {
     XELOGW("NUI identity: the title didn't answer the enrollment in time");
   }
 }
@@ -121,9 +119,10 @@ void NuiIdentity::OnEnrollmentResult(uint32_t result, uint32_t tracking_id,
                                      uint32_t slot) {
   std::lock_guard<std::mutex> lock(mutex_);
   enrollment_answered_.notify_all();
-  XELOGI("NUI identity: enrollment of tracking ID {:X} finished: {:08X}, "
-         "slot {}",
-         tracking_id, result, slot);
+  XELOGI(
+      "NUI identity: enrollment of tracking ID {:X} finished: {:08X}, "
+      "slot {}",
+      tracking_id, result, slot);
   if (int32_t(result) < 0 || slot >= kSlotCount ||
       pending_user_index_ == kNoUser) {
     pending_user_index_ = kNoUser;
@@ -176,7 +175,8 @@ bool NuiIdentity::GetUserIndex(uint32_t slot, uint32_t& user_index_out) {
     return false;
   }
   const uint8_t user_index =
-      kernel_state_->xam_state()->profile_manager()
+      kernel_state_->xam_state()
+          ->profile_manager()
           ->GetUserIndexAssignedToProfile(slot_xuids_[slot]);
   if (user_index >= XUserMaxUserCount) {
     return false;
@@ -208,9 +208,8 @@ void NuiIdentity::LoadBindings() {
   bindings_loaded_ = true;
   uint64_t version;
   std::vector<uint8_t> data;
-  if (!kernel_state_->nui_data_store()->Read(NuiDataStore::Kind::kSystem,
-                                             "enrollment_profiles", version,
-                                             data) ||
+  if (!kernel_state_->nui_data_store()->Read(
+          NuiDataStore::Kind::kSystem, "enrollment_profiles", version, data) ||
       data.size() < sizeof(slot_xuids_)) {
     return;
   }

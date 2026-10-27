@@ -632,8 +632,7 @@ dword_result_t ObCreateObject_entry(
       xeObCreateObject(object_factory, optional_attributes,
                        object_size_sans_headers, &out_object_tmp, context);
   *out_object = out_object_tmp;
-  if (XSUCCEEDED(result) &&
-      !IsHostObjectType(object_factory.guest_address())) {
+  if (XSUCCEEDED(result) && !IsHostObjectType(object_factory.guest_address())) {
     auto global_lock = global_critical_region::AcquireDirect();
     unnamed_guest_objects[out_object_tmp] = object_factory.guest_address();
   }

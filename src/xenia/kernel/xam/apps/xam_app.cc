@@ -368,17 +368,14 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
           continue;
         }
         const float score = total / float(measured);
-        summary += fmt::format(" slot {}: {} {} {} {} / {:.3f} {:.3f} {:.3f} {:.3f}"
-                               " flags {:X};",
-                               slot, match->status[slot][0].get(),
-                               match->status[slot][1].get(),
-                               match->status[slot][2].get(),
-                               match->status[slot][3].get(),
-                               match->score[slot][0].get(),
-                               match->score[slot][1].get(),
-                               match->score[slot][2].get(),
-                               match->score[slot][3].get(),
-                               match->slot_flags[slot].get());
+        summary += fmt::format(
+            " slot {}: {} {} {} {} / {:.3f} {:.3f} {:.3f} {:.3f}"
+            " flags {:X};",
+            slot, match->status[slot][0].get(), match->status[slot][1].get(),
+            match->status[slot][2].get(), match->status[slot][3].get(),
+            match->score[slot][0].get(), match->score[slot][1].get(),
+            match->score[slot][2].get(), match->score[slot][3].get(),
+            match->slot_flags[slot].get());
         if (score > best_score) {
           best_score = score;
           best_slot = slot;
@@ -390,10 +387,11 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       static uint32_t logged = 0;
       if (logged < 64 || best_slot >= 0) {
         ++logged;
-        XELOGI("XamApp: NUI identity match for {:08X} (flags {:X}, {:X}):{} "
-               "answered {:X}",
-               match->tracking_id.get(), match->flags.get(),
-               request->parameter.get(), summary, answer);
+        XELOGI(
+            "XamApp: NUI identity match for {:08X} (flags {:X}, {:X}):{} "
+            "answered {:X}",
+            match->tracking_id.get(), match->flags.get(),
+            request->parameter.get(), summary, answer);
       }
       xe::store_and_swap<uint32_t>(
           memory_->TranslateVirtual(request->result_ptr), answer);
@@ -412,11 +410,12 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       const uint32_t result = xe::load_and_swap<uint32_t>(buffer);
       const uint32_t tracking_id = xe::load_and_swap<uint32_t>(buffer + 4);
       const uint32_t slot = xe::load_and_swap<uint32_t>(buffer + 8);
-      XELOGI("XamApp: NUI identity {} result {:08X}, tracking ID {:X}, slot "
-             "{}, {:08X} {:016X}",
-             message == 0x0002C003 ? "enrollment" : "identification", result,
-             tracking_id, slot, xe::load_and_swap<uint32_t>(buffer + 12),
-             xe::load_and_swap<uint64_t>(buffer + 16));
+      XELOGI(
+          "XamApp: NUI identity {} result {:08X}, tracking ID {:X}, slot "
+          "{}, {:08X} {:016X}",
+          message == 0x0002C003 ? "enrollment" : "identification", result,
+          tracking_id, slot, xe::load_and_swap<uint32_t>(buffer + 12),
+          xe::load_and_swap<uint64_t>(buffer + 16));
       if (message == 0x0002C003) {
         kernel_state_->nui_identity()->OnEnrollmentResult(result, tracking_id,
                                                           slot);

@@ -22,7 +22,6 @@
 #include "xenia/base/string.h"
 #include "xenia/base/system.h"
 #include "xenia/base/utf8.h"
-#include "xenia/base/utf8.h"
 #include "xenia/hid/input_system.h"
 #include "xenia/kernel/guest_scheduler.h"
 #include "xenia/kernel/kernel_state.h"
@@ -256,10 +255,10 @@ void MessageBoxDialog::OnDraw(ImGuiIO& io) {
     if (kinect_cursor_.enabled()) {
       ImGui::TextDisabled("Hold your hand over a button to choose it.");
     }
-    const ImVec2 button_size = kinect_cursor_.enabled()
-                                   ? ImVec2(ImGui::GetFontSize() * 9.0f,
-                                            ImGui::GetFontSize() * 3.0f)
-                                   : ImVec2(0.0f, 0.0f);
+    const ImVec2 button_size =
+        kinect_cursor_.enabled()
+            ? ImVec2(ImGui::GetFontSize() * 9.0f, ImGui::GetFontSize() * 3.0f)
+            : ImVec2(0.0f, 0.0f);
 
     // Buttons - ImGui handles navigation, A button activates via ImGui
     for (size_t i = 0; i < buttons_.size(); ++i) {
@@ -309,8 +308,7 @@ void KinectCursor::TrackItem(int32_t id) {
   }
   const ImVec2 min = ImGui::GetItemRectMin();
   const ImVec2 max = ImGui::GetItemRectMax();
-  if (pos_x_ >= min.x && pos_x_ < max.x && pos_y_ >= min.y &&
-      pos_y_ < max.y) {
+  if (pos_x_ >= min.x && pos_x_ < max.x && pos_y_ >= min.y && pos_y_ < max.y) {
     hovered_ = id;
   }
 }
@@ -331,7 +329,8 @@ int32_t KinectCursor::EndFrame() {
         auto_button_ = std::atoi(std::string(buttons[dialogs_opened]).c_str());
       }
       ++dialogs_opened;
-    } else if (auto_button_ >= 0 && now - auto_start_ > std::chrono::seconds(2)) {
+    } else if (auto_button_ >= 0 &&
+               now - auto_start_ > std::chrono::seconds(2)) {
       return auto_button_;
     }
   }
@@ -346,8 +345,8 @@ int32_t KinectCursor::EndFrame() {
   }
   float progress = 0.0f;
   if (held_ >= 0) {
-    progress = std::chrono::duration<float>(now - hold_start_).count() /
-               kHoldSeconds;
+    progress =
+        std::chrono::duration<float>(now - hold_start_).count() / kHoldSeconds;
   }
   const ImVec2 pos(pos_x_, pos_y_);
   ImDrawList* draw_list = ImGui::GetForegroundDrawList();

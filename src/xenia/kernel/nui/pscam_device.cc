@@ -444,8 +444,9 @@ void PsCamDevice::WorkerMain() {
       }
     }
     for (uint32_t async_request : async_requests) {
-      auto* words = kernel_state_->memory()->TranslateVirtual<xe::be<uint32_t>*>(
-          async_request);
+      auto* words =
+          kernel_state_->memory()->TranslateVirtual<xe::be<uint32_t>*>(
+              async_request);
       if (words[0] == kRequestSetColorSettings) {
         words[kColorSettingsGenerationOffset / 4] =
             ++color_settings_generation_;

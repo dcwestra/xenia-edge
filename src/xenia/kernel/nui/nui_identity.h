@@ -49,8 +49,7 @@ class NuiIdentity {
   // Waits for the enrollment asked for to be answered, if there is one.
   void WaitForEnrollment(std::chrono::milliseconds timeout);
   // What the title answered an enrollment with (0x2C003).
-  void OnEnrollmentResult(uint32_t result, uint32_t tracking_id,
-                          uint32_t slot);
+  void OnEnrollmentResult(uint32_t result, uint32_t tracking_id, uint32_t slot);
 
   bool GetUserIndex(uint32_t slot, uint32_t& user_index_out);
   bool GetSlot(uint32_t user_index, uint32_t& slot_out);
