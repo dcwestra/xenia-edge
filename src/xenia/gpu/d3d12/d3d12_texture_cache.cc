@@ -757,8 +757,7 @@ void D3D12TextureCache::WriteActiveTextureBindfulSRV(
 
     const D3D12TextureBinding& d3d12_binding =
         d3d12_texture_bindings_[fetch_constant_index];
-    if (texture_util::IsSignedViewBound(binding->swizzled_signs,
-                                        host_shader_binding.is_signed)) {
+    if (host_shader_binding.is_signed) {
       // Not supporting signed compressed textures - hopefully DXN and DXT5A are
       // not used as signed.
       if (texture_util::IsAnySignSigned(binding->swizzled_signs)) {
@@ -844,10 +843,8 @@ uint32_t D3D12TextureCache::GetActiveTextureBindlessSRVIndex(
     const D3D12TextureBinding& d3d12_binding =
         d3d12_texture_bindings_[fetch_constant_index];
 
-    bool signed_view = texture_util::IsSignedViewBound(
-        binding->swizzled_signs, host_shader_binding.is_signed);
     // Helper lambda to get standard index
-    uint32_t standard_index = signed_view
+    uint32_t standard_index = host_shader_binding.is_signed
                                   ? d3d12_binding.descriptor_index_signed
                                   : d3d12_binding.descriptor_index;
 
@@ -855,8 +852,8 @@ uint32_t D3D12TextureCache::GetActiveTextureBindlessSRVIndex(
       // Determine which texture object to use
       // Respect swizzled_signs from fetch constant, not just shader request
       Texture* texture = nullptr;
-      bool use_signed =
-          signed_view && texture_util::IsAnySignSigned(binding->swizzled_signs);
+      bool use_signed = host_shader_binding.is_signed &&
+                        texture_util::IsAnySignSigned(binding->swizzled_signs);
       if (use_signed) {
         texture = IsSignedVersionSeparateForFormat(binding->key)
                       ? binding->texture_signed
@@ -922,12 +919,8 @@ D3D12TextureCache::SamplerParameters D3D12TextureCache::GetSamplerParameters(
   if (xenos::ClampModeUsesBorder(parameters.clamp_x) ||
       xenos::ClampModeUsesBorder(parameters.clamp_y) ||
       xenos::ClampModeUsesBorder(parameters.clamp_z)) {
-    if (binding.border_color_forced) {
-      parameters.border_color = binding.forced_border_color;
-    } else {
-      parameters.border_color = fetch.border_color;
-      parameters.force_bc_w_to_max = fetch.force_bc_w_to_max;
-    }
+    parameters.border_color = fetch.border_color;
+    parameters.force_bc_w_to_max = fetch.force_bc_w_to_max;
   } else {
     parameters.border_color = xenos::BorderColor::k_ABGR_Black;
   }
@@ -1663,8 +1656,8 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
 
   // The loop counter can mean two things depending on whether the packed mip
   // tail is stored as mip 0, because in this case, it would be ambiguous since
-  // both the base and the mips would be on "level 0", but stored in separate
-  // places.
+  // both the base and the mips would be on "level 0", but loaded using separate
+  // layouts.
   uint32_t loop_level_first, loop_level_last;
   if (level_packed == 0) {
     // Packed mip tail is the level 0 - may need to load mip tails for the base,

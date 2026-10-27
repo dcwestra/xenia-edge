@@ -44,7 +44,6 @@ class HostPathEntry : public Entry {
   void RetainFile() override { open_files_.fetch_add(1); }
   void ReleaseFile() override;
 
-  bool SetAttributes(uint64_t attributes) override;
   bool SetCreateTimestamp(uint64_t timestamp) override;
   bool SetAccessTimestamp(uint64_t timestamp) override;
   bool SetWriteTimestamp(uint64_t timestamp) override;

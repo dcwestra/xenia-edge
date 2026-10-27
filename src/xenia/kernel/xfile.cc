@@ -543,12 +543,13 @@ bool XFile::Save(ByteStream* stream) {
     return false;
   }
 
-  stream->Write(file_->entry()->absolute_path());
+  stream->Write(std::string_view(file_->entry()->absolute_path()));
   stream->Write<uint64_t>(position_);
   stream->Write(file_access());
   stream->Write<bool>(
       (file_->entry()->attributes() & vfs::kFileAttributeDirectory) != 0);
   stream->Write<bool>(is_synchronous_);
+  stream->Write<bool>(is_buffered_);
 
   return true;
 }
@@ -567,6 +568,7 @@ object_ref<XFile> XFile::Restore(KernelState* kernel_state,
   auto access = stream->Read<uint32_t>();
   auto is_directory = stream->Read<bool>();
   auto is_synchronous = stream->Read<bool>();
+  auto is_buffered = stream->Read<bool>();
 
   // XELOGD("XFile {:08X} ({})", file->handle(), abs_path);
 
@@ -583,6 +585,7 @@ object_ref<XFile> XFile::Restore(KernelState* kernel_state,
   file->file_ = vfs_file;
   file->position_ = position;
   file->is_synchronous_ = is_synchronous;
+  file->is_buffered_ = is_buffered;
 
   return object_ref<XFile>(file);
 }

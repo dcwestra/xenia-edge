@@ -58,8 +58,12 @@ Suites:
   export formats and addressing.
 - `tfetch`, `tfetch_formats`, `tfilter`, `tfilter_probes`: texture fetch
   conversions, block formats, endianness, filtering and addressing.
+- `getbcf`: getBCF in each clamp mode, filter, format and dimension, next to
+  a tfetch of the border at the same coordinates.
 - `pixel`, `pixel_probes`, `snap`, `msaa`: pixel shader inputs (interpolation,
   PsParamGen), vertex snapping and multisample coverage.
 - `rb`, `blend`, `depth`, `zdepth`, `alpha`, `msaarb`: render target formats,
   blending, depth formats and polygon offset, alpha test and alpha to mask,
   MSAA samples and resolves.
+- `blend_products`: blending on the fixed point formats one product at a time,
+  each operand swept or held.

@@ -14,18 +14,27 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstring>
+#include <deque>
+#include <iterator>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
+#include <vector>
 
 #include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
+#include "xenia/cpu/processor.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/user_module.h"
 #include "xenia/kernel/xam/xam_module.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_crypt.h"
 #include "xenia/kernel/xboxkrnl/xecrypt_sha.h"
+#include "xenia/kernel/xevent.h"
+#include "xenia/kernel/xthread.h"
+#include "xenia/memory.h"
 #include "xenia/net/host_interfaces.h"
 #include "xenia/net/packet_transport.h"
 
@@ -69,9 +78,10 @@ namespace kernel {
 namespace xam {
 namespace {
 
-// A Microsoft block from while the 360 was made. XLink Kai only forwards
-// frames from console vendors.
-constexpr uint8_t kMacPrefix[] = {0x00, 0x1D, 0xD8};
+// An Ethernet header and a 1500 byte payload.
+constexpr uint32_t kEthernetFrameLimit = 1514;
+// Frames that arrived and wait for the title's callback.
+constexpr size_t kReceiveQueueLimit = 256;
 
 // Titles with cross-platform System Link derive their broadcast keys from
 // their LAN key AES-CBC encrypted with key 0x43 and a zero IV, which only a
@@ -281,11 +291,7 @@ std::unique_ptr<net::SystemLink> CreateSystemLink(KernelState* kernel_state,
     association.cross_platform.emplace();
     transport = OpenCrossPlatformTransport(*association.cross_platform, port);
   } else {
-    // New for every title so instances on one machine never share it.
-    net::secure::Mac mac;
-    std::copy(std::begin(kMacPrefix), std::end(kMacPrefix), mac.begin());
-    net::Random(std::span(mac).subspan(std::size(kMacPrefix)));
-    transport = OpenTransport(mac);
+    transport = OpenTransport(kernel_state->xconfig()->mac_address());
   }
   if (!transport) {
     return nullptr;
@@ -323,6 +329,126 @@ std::shared_ptr<net::SystemLink> GetSystemLink(KernelState* kernel_state) {
     return nullptr;
   }
   return kernel_state->GetKernelModule<XamModule>("xam.xex")->system_link();
+}
+
+struct EthernetIntercept::Queue {
+  std::mutex mutex;
+  // The XNCALLER that set the callback, 0 without one.
+  uint32_t caller = 0;
+  uint32_t receive = 0;
+  uint32_t context = 0;
+  std::deque<std::vector<uint8_t>> frames;
+  object_ref<XEvent> arrived;
+};
+
+EthernetIntercept::EthernetIntercept(KernelState* kernel_state)
+    : kernel_state_(kernel_state), queue_(std::make_shared<Queue>()) {}
+
+EthernetIntercept::~EthernetIntercept() {
+  {
+    // The System Link can outlive this and still hand frames over.
+    std::lock_guard lock(queue_->mutex);
+    queue_->receive = 0;
+    queue_->frames.clear();
+  }
+  if (buffer_) {
+    kernel_state_->memory()->SystemHeapFree(buffer_);
+  }
+}
+
+uint32_t EthernetIntercept::SetCallbacks(net::SystemLink& link, uint32_t caller,
+                                         uint32_t receive, uint32_t context) {
+  std::lock_guard lock(queue_->mutex);
+  if (!receive) {
+    if (queue_->caller != caller) {
+      return net::kWsaSystemNotReady;
+    }
+    queue_->caller = queue_->receive = queue_->context = 0;
+    queue_->frames.clear();
+    link.SetFrameReceiver(nullptr);
+    return 0;
+  }
+  if (queue_->caller) {
+    return net::kWsaAlready;
+  }
+  if (!thread_ && !Start()) {
+    return net::kWsaNoBuffers;
+  }
+  queue_->caller = caller;
+  queue_->receive = receive;
+  queue_->context = context;
+  link.SetFrameReceiver([queue = queue_](std::span<const uint8_t> frame) {
+    {
+      std::lock_guard lock(queue->mutex);
+      // A full receive ring drops what arrives.
+      if (!queue->receive || frame.size() > kEthernetFrameLimit ||
+          queue->frames.size() >= kReceiveQueueLimit) {
+        return;
+      }
+      queue->frames.emplace_back(frame.begin(), frame.end());
+    }
+    queue->arrived->Set(0, false);
+  });
+  return 0;
+}
+
+bool EthernetIntercept::Start() {
+  buffer_ = kernel_state_->memory()->SystemHeapAlloc(kEthernetFrameLimit);
+  if (!buffer_) {
+    return false;
+  }
+  queue_->arrived = object_ref<XEvent>(new XEvent(kernel_state_, true));
+  queue_->arrived->Initialize(false, false);
+  thread_ = object_ref<XHostThread>(new XHostThread(
+      kernel_state_, 128 * 1024, 0,
+      [kernel_state = kernel_state_, queue = queue_, buffer = buffer_]() {
+        Deliver(kernel_state, *queue, buffer);
+        return 0;
+      },
+      kernel_state_->GetSystemProcess(), true));
+  thread_->set_can_debugger_suspend(true);
+  thread_->set_name("XNet Ethernet Intercept");
+  if (XFAILED(thread_->Create())) {
+    thread_.reset();
+    kernel_state_->memory()->SystemHeapFree(buffer_);
+    buffer_ = 0;
+    return false;
+  }
+  // At the top priority, as xam's receive DPC interrupts what runs below
+  // DISPATCH_LEVEL.
+  thread_->SetPriority(31);
+  return true;
+}
+
+void EthernetIntercept::Deliver(KernelState* kernel_state, Queue& queue,
+                                uint32_t buffer) {
+  auto thread_state = XThread::GetCurrentThread()->thread_state();
+  auto context = thread_state->context();
+  while (true) {
+    queue.arrived->Wait(0, 0, 0, nullptr);
+    DPCImpersonationScope dpc_scope{};
+    kernel_state->BeginDPCImpersonation(context, dpc_scope);
+    while (true) {
+      std::vector<uint8_t> frame;
+      uint32_t receive, receive_context;
+      {
+        std::lock_guard lock(queue.mutex);
+        if (queue.frames.empty()) {
+          break;
+        }
+        frame = std::move(queue.frames.front());
+        queue.frames.pop_front();
+        receive = queue.receive;
+        receive_context = queue.context;
+      }
+      std::memcpy(kernel_state->memory()->TranslateVirtual(buffer),
+                  frame.data(), frame.size());
+      uint64_t args[] = {receive_context, buffer, frame.size()};
+      kernel_state->processor()->Execute(thread_state, receive, args,
+                                         std::size(args));
+    }
+    kernel_state->EndDPCImpersonation(context, dpc_scope);
+  }
 }
 
 }  // namespace xam

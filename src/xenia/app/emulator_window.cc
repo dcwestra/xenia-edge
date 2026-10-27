@@ -21,6 +21,7 @@
 #include "xenia/ui/windowed_app_wx.h"
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <charconv>
 #include <cstdlib>
@@ -465,6 +466,22 @@ uint8_t EffectiveSubtype(uint8_t detected, uint8_t native_subtype,
     return binding.subtype_override;
   }
   return native_subtype ? native_subtype : detected;
+}
+
+// The connected devices in a slot, as "A + B".
+wxString SlotDeviceNames(
+    const std::vector<hid::InputSystem::SlotBinding>& bindings) {
+  wxString names;
+  for (const auto& binding : bindings) {
+    if (!binding.driver) {
+      continue;
+    }
+    if (!names.empty()) {
+      names += wxT(" + ");
+    }
+    names += wxString::FromUTF8(binding.display_name);
+  }
+  return names;
 }
 
 // About dialog with clickable links, which the stock wxAboutBox
@@ -2680,37 +2697,54 @@ void EmulatorWindow::RefreshControllerToolbar() {
 
   // Fetch current bindings.
   std::vector<InputSystem::EnumeratedDevice> devices;
+  std::array<std::vector<InputSystem::SlotBinding>, XUserMaxUserCount> bindings;
   if (auto* is = emulator_ ? emulator_->input_system() : nullptr) {
     auto lock = is->lock();
     devices = is->EnumerateDevices();
+    for (uint32_t slot = 0; slot < XUserMaxUserCount; ++slot) {
+      bindings[slot] = is->GetSlotBindings(slot);
+    }
   }
 
   // Update each fixed controller slot's bitmap — bound slot gets the
   // appropriate type icon, empty slot keeps a transparent placeholder so the
   // toolbar geometry never changes.
   for (uint32_t slot = 0; slot < XUserMaxUserCount; ++slot) {
-    const InputSystem::EnumeratedDevice* bound = nullptr;
-    for (const auto& d : devices) {
-      if (d.bound_slot == static_cast<int>(slot)) {
-        bound = &d;
-        break;
-      }
-    }
     const int id = kToolIdControllerBase + static_cast<int>(slot);
-    if (!bound) {
+    const wxString names = SlotDeviceNames(bindings[slot]);
+    if (names.empty()) {
       tb->SetToolBitmap(id, s.controller_empty_bundle);
       tb->SetToolShortHelp(id, wxEmptyString);
       tb->EnableTool(id, false);
       continue;
     }
+    // The icon shows the type the guest sees, which the first device that
+    // isn't a plain gamepad sets, and the keyboard only when it's alone.
+    bool keyboard_only = true;
+    uint8_t effective = 0x01;
+    for (const auto& binding : bindings[slot]) {
+      if (!binding.driver) {
+        continue;
+      }
+      auto d =
+          std::find_if(devices.begin(), devices.end(), [&](const auto& dev) {
+            return dev.driver == binding.driver &&
+                   dev.info.driver_slot == binding.driver_slot;
+          });
+      if (d == devices.end() || d->info.stable_id == "keyboard") {
+        continue;
+      }
+      keyboard_only = false;
+      if (effective == 0x01) {
+        // User override takes precedence over the device's detected subtype.
+        effective =
+            EffectiveSubtype(d->info.subtype, d->info.native_subtype, binding);
+      }
+    }
     const wxBitmapBundle* bundle = &s.controller_gamepad_bundle;
-    if (bound->info.stable_id == "keyboard") {
+    if (keyboard_only) {
       bundle = &s.controller_keyboard_bundle;
     } else {
-      // User override takes precedence over the device's detected subtype.
-      const auto& binding = emulator_->input_system()->GetSlotBinding(slot);
-      const uint8_t effective = EffectiveSubtype(
-          bound->info.subtype, bound->info.native_subtype, binding);
       switch (effective) {
         case 0x02:  // WHEEL
           bundle = &s.controller_wheel_bundle;
@@ -2737,8 +2771,8 @@ void EmulatorWindow::RefreshControllerToolbar() {
       }
     }
     tb->SetToolBitmap(id, *bundle);
-    tb->SetToolShortHelp(id, wxString::Format(_("Slot %d"), slot + 1) + ": " +
-                                 wxString::FromUTF8(bound->info.display_name));
+    tb->SetToolShortHelp(
+        id, wxString::Format(_("Slot %d"), slot + 1) + ": " + names);
     tb->EnableTool(id, true);
   }
   tb->Refresh();
@@ -2778,83 +2812,109 @@ void EmulatorWindow::PopulateControllersMenu(ui::MenuItem* parent) {
   auto lock = input_sys->lock();
   auto devices = input_sys->EnumerateDevices();
 
+  // A bound device's "Disconnect" action and type override.
+  auto add_device_items = [this, &devices](
+                              ui::MenuItem* menu,
+                              const InputSystem::SlotBinding& binding) {
+    InputDriver* driver = binding.driver;
+    uint8_t driver_slot = binding.driver_slot;
+    menu->AddChild(ui::WxMenuItem::Create(
+        ui::MenuItem::Type::kString, _("Disconnect"), "",
+        [this, driver, driver_slot]() {
+          auto* is = emulator_ ? emulator_->input_system() : nullptr;
+          if (!is) {
+            return;
+          }
+          auto l = is->lock();
+          is->UnbindDevice(driver, driver_slot);
+        }));
+
+    // "Type: <effective>" submenu lets the user override the subtype the
+    // guest sees (e.g. expose a regular pad as a wheel or drum kit).
+    uint8_t detected = 0x01;
+    uint8_t native_subtype = 0;
+    for (const auto& dev : devices) {
+      if (dev.driver == driver && dev.info.driver_slot == driver_slot) {
+        detected = dev.info.subtype;
+        native_subtype = dev.info.native_subtype;
+        break;
+      }
+    }
+    wxString type_label = wxString::Format(
+        _("Type: %s"),
+        SubtypeName(EffectiveSubtype(detected, native_subtype, binding)));
+    auto type_entry =
+        ui::WxMenuItem::Create(ui::MenuItem::Type::kPopup, type_label);
+
+    // Auto reads a device with a native mode through XInput, an override
+    // through SDL's mapping.
+    wxString auto_label = wxString::Format(
+        _("Auto (%s)"),
+        native_subtype ? wxString(wxT("XInput")) : SubtypeName(detected));
+    if (binding.subtype_override == 0) {
+      auto_label = wxT("✓ ") + auto_label;
+    }
+    type_entry->AddChild(ui::WxMenuItem::Create(
+        ui::MenuItem::Type::kString, auto_label, "",
+        [this, driver, driver_slot]() {
+          auto* is = emulator_ ? emulator_->input_system() : nullptr;
+          if (!is) {
+            return;
+          }
+          auto l = is->lock();
+          is->SetSubtypeOverride(driver, driver_slot, 0);
+        }));
+    for (uint8_t st : kSelectableSubtypes) {
+      const bool active = binding.subtype_override == st;
+      wxString item_label =
+          active ? wxT("✓ ") + SubtypeName(st) : SubtypeName(st);
+      uint8_t captured = st;
+      type_entry->AddChild(ui::WxMenuItem::Create(
+          ui::MenuItem::Type::kString, item_label, "",
+          [this, driver, driver_slot, captured]() {
+            auto* is = emulator_ ? emulator_->input_system() : nullptr;
+            if (!is) {
+              return;
+            }
+            auto l = is->lock();
+            is->SetSubtypeOverride(driver, driver_slot, captured);
+          }));
+    }
+    menu->AddChild(std::move(type_entry));
+  };
+
   for (uint32_t slot = 0; slot < XUserMaxUserCount; ++slot) {
-    const auto& binding = input_sys->GetSlotBinding(slot);
-    const bool bound = binding.driver != nullptr;
+    const auto& bindings = input_sys->GetSlotBindings(slot);
     wxString slot_label = wxString::Format(_("Slot %d"), slot + 1);
-    if (bound) {
-      slot_label += ": " + wxString::FromUTF8(binding.display_name);
+    const wxString names = SlotDeviceNames(bindings);
+    if (!names.empty()) {
+      slot_label += ": " + names;
     }
     auto slot_entry =
         ui::WxMenuItem::Create(ui::MenuItem::Type::kPopup, slot_label);
 
-    // Bound slot exposes a "Disconnect" action; an empty slot goes straight
-    // to the device list.
-    if (bound) {
-      slot_entry->AddChild(ui::WxMenuItem::Create(
-          ui::MenuItem::Type::kString, _("Disconnect"), "", [this, slot]() {
-            auto* is = emulator_ ? emulator_->input_system() : nullptr;
-            if (!is) {
-              return;
-            }
-            auto l = is->lock();
-            is->UnbindSlot(slot);
-          }));
-
-      // "Type: <effective>" submenu lets the user override the subtype the
-      // guest sees (e.g. expose a regular pad as a wheel or drum kit).
-      uint8_t detected = 0x01;
-      uint8_t native_subtype = 0;
-      for (const auto& dev : devices) {
-        if (dev.bound_slot == static_cast<int>(slot)) {
-          detected = dev.info.subtype;
-          native_subtype = dev.info.native_subtype;
-          break;
-        }
+    // A slot with one device lists its actions directly, one with several
+    // gets a submenu per device, and an empty slot goes straight to the
+    // device list.
+    std::vector<const InputSystem::SlotBinding*> bound;
+    for (const auto& binding : bindings) {
+      if (binding.driver) {
+        bound.push_back(&binding);
       }
-      wxString type_label = wxString::Format(
-          _("Type: %s"),
-          SubtypeName(EffectiveSubtype(detected, native_subtype, binding)));
-      auto type_entry =
-          ui::WxMenuItem::Create(ui::MenuItem::Type::kPopup, type_label);
-
-      // Auto reads a device with a native mode through XInput, an override
-      // through SDL's mapping.
-      wxString auto_label = wxString::Format(
-          _("Auto (%s)"),
-          native_subtype ? wxString(wxT("XInput")) : SubtypeName(detected));
-      if (binding.subtype_override == 0) {
-        auto_label = wxT("✓ ") + auto_label;
+    }
+    if (bound.size() == 1) {
+      add_device_items(slot_entry.get(), *bound[0]);
+    } else {
+      for (const auto* binding : bound) {
+        auto device_entry =
+            ui::WxMenuItem::Create(ui::MenuItem::Type::kPopup,
+                                   wxString::FromUTF8(binding->display_name));
+        add_device_items(device_entry.get(), *binding);
+        slot_entry->AddChild(std::move(device_entry));
       }
-      type_entry->AddChild(ui::WxMenuItem::Create(
-          ui::MenuItem::Type::kString, auto_label, "", [this, slot]() {
-            auto* is = emulator_ ? emulator_->input_system() : nullptr;
-            if (!is) {
-              return;
-            }
-            auto l = is->lock();
-            is->SetSlotSubtypeOverride(slot, 0);
-          }));
-      for (uint8_t st : kSelectableSubtypes) {
-        const bool active = binding.subtype_override == st;
-        wxString item_label =
-            active ? wxT("✓ ") + SubtypeName(st) : SubtypeName(st);
-        uint8_t captured = st;
-        type_entry->AddChild(ui::WxMenuItem::Create(
-            ui::MenuItem::Type::kString, item_label, "",
-            [this, slot, captured]() {
-              auto* is = emulator_ ? emulator_->input_system() : nullptr;
-              if (!is) {
-                return;
-              }
-              auto l = is->lock();
-              is->SetSlotSubtypeOverride(slot, captured);
-            }));
-      }
-      slot_entry->AddChild(std::move(type_entry));
     }
 
-    // One entry per enumerated device.
+    // One entry per enumerated device, which picking adds to the slot.
     for (const auto& dev : devices) {
       const bool here = dev.bound_slot == static_cast<int>(slot);
       wxString device_label =

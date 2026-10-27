@@ -18,6 +18,7 @@
 #include "xenia/cpu/export_resolver.h"
 #include "xenia/kernel/kernel_module.h"
 #include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/xam/xam_system_link.h"
 #include "xenia/net/system_link.h"
 
 namespace xe {
@@ -52,6 +53,7 @@ class XamModule : public KernelModule {
   // on when it hasn't started yet.
   uint32_t SetSystemLinkPort(uint16_t port);
   uint16_t system_link_port();
+  EthernetIntercept& ethernet_intercept() { return ethernet_intercept_; }
 
   // XNetStartup, or WSAStartup with |wsa| and no |params|. Only the first
   // start since everything was cleaned up takes its parameters.
@@ -68,6 +70,7 @@ class XamModule : public KernelModule {
   bool system_link_started_ = false;
   std::shared_ptr<net::SystemLink> system_link_;
   uint16_t system_link_port_ = net::secure::kSystemLinkPort;
+  EthernetIntercept ethernet_intercept_;
 
   std::mutex xnet_mutex_;
   uint32_t xnet_starts_ = 0, wsa_starts_ = 0;

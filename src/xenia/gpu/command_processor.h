@@ -217,6 +217,10 @@ class CommandProcessor {
       std::function<void()> completion_callback = nullptr);
 
   virtual void RequestFrameTrace(const std::filesystem::path& root_path);
+  // Sets the frame numbers to capture as frame traces, counted by the swaps
+  // before them. Must be called before Initialize.
+  void SetTraceFrameNumbers(const std::filesystem::path& root_path,
+                            std::vector<uint32_t> frame_numbers);
   virtual void BeginTracing(const std::filesystem::path& root_path);
   virtual void EndTracing();
   // Safe from any thread, the writer is closed on the next swap.
@@ -771,6 +775,11 @@ class CommandProcessor {
   // Full path of the frame trace currently being written, so the reference
   // screenshot can be saved beside it when the frame closes.
   std::filesystem::path trace_frame_file_path_;
+  // Frame numbers passed to SetTraceFrameNumbers, and the number of swaps
+  // executed so far that they are compared against (counter_ also counts
+  // vblanks, so it skips numbers between swaps).
+  std::vector<uint32_t> trace_frame_numbers_;
+  uint32_t trace_swap_count_ = 0;
 
   std::atomic<bool> worker_running_;
   kernel::object_ref<kernel::XHostThread> worker_thread_;

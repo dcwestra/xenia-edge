@@ -213,6 +213,14 @@ std::optional<XexMetadata> ExtractXexMetadata(const uint8_t* data,
     }
   }
 
+  xex2_opt_bound_path* bound_path = nullptr;
+  if (GetXexOptHeader(header, XEX_HEADER_BOUNDING_PATH, &bound_path) &&
+      bound_path && bound_path->size > sizeof(uint32_t)) {
+    metadata.bounding_path = std::string(
+        bound_path->path,
+        strnlen(bound_path->path, bound_path->size - sizeof(uint32_t)));
+  }
+
   xex2_game_ratings_t* ratings = nullptr;
   if (GetXexOptHeader(header, XEX_HEADER_GAME_RATINGS, &ratings) && ratings) {
     metadata.ratings.present = true;

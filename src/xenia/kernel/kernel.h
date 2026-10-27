@@ -18,6 +18,7 @@ namespace xe {
 namespace kernel {
 
 // IOCTL_, used by NtDeviceIoControlFile
+constexpr uint32_t X_IOCTL_CDROM_AUTHENTICATE_DISC = 0x24080;
 constexpr uint32_t X_IOCTL_DISK_GET_DRIVE_GEOMETRY = 0x70000;
 constexpr uint32_t X_IOCTL_DISK_UNK =
     0x70042;  // used when accessing storage in dash

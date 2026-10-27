@@ -24,7 +24,9 @@ namespace kernel {
 namespace xam {
 
 XamModule::XamModule(Emulator* emulator, KernelState* kernel_state)
-    : KernelModule(kernel_state, "xe:\\xam.xex"), loader_data_() {
+    : KernelModule(kernel_state, "xe:\\xam.xex"),
+      loader_data_(),
+      ethernet_intercept_(kernel_state) {
   RegisterExportTable(export_resolver_);
 
   // Register all exported functions.

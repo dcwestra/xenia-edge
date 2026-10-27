@@ -190,7 +190,8 @@ std::unique_ptr<FileHandle> FileHandle::OpenExisting(
   if (desired_access & FileAccess::kFileAppendData) {
     open_access |= FILE_APPEND_DATA;
   }
-  DWORD share_mode = FILE_SHARE_READ | FILE_SHARE_WRITE;
+  // A guest renames a file through a handle it has open on it.
+  DWORD share_mode = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
   // We assume we've already created the file in the caller.
   DWORD creation_disposition = OPEN_EXISTING;
   HANDLE handle = CreateFileW(
@@ -266,10 +267,6 @@ std::vector<FileInfo> ListFilesUnsorted(const std::filesystem::path& path) {
 }
 
 }  // namespace internal
-
-bool SetAttributes(const std::filesystem::path& path, uint64_t attributes) {
-  return SetFileAttributes(path.c_str(), static_cast<DWORD>(attributes));
-}
 
 }  // namespace filesystem
 }  // namespace xe

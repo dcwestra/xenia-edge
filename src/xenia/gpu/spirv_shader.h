@@ -58,9 +58,6 @@ class SpirvShader : public Shader {
     xenos::TextureFilter min_filter : 2;
     xenos::TextureFilter mip_filter : 2;
     xenos::AnisoFilter aniso_filter : 3;
-    // getBCF samples with the border color forced to forced_border_color.
-    uint32_t border_color_forced : 1;
-    xenos::BorderColor forced_border_color : 2;
   };
   const std::vector<SamplerBinding>& GetSamplerBindingsAfterTranslation()
       const {

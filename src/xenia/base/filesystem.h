@@ -159,8 +159,6 @@ std::vector<FileInfo> FindFileWithName(const std::filesystem::path& path,
                                        std::string_view name,
                                        bool recursive = false);
 
-bool SetAttributes(const std::filesystem::path& path, uint64_t attributes);
-
 #if XE_PLATFORM_ANDROID
 void AndroidInitialize();
 void AndroidShutdown();

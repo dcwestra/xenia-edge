@@ -19,7 +19,8 @@ OUTDIR/<where>_results.json.
 
 Comparisons normalize first: the XUID and gamertag the corpus's identity
 scenario reads become <X0> and <NAME0>, and a wait only records whether the
-XOVERLAPPED completed. expect writes a run's normalized steps as the expected
+XOVERLAPPED completed. r3 is compared by its low 32 bits when the high half
+only extends them. expect writes a run's normalized steps as the expected
 results, check compares a run against them and exits nonzero on a mismatch.
 """
 
@@ -346,7 +347,8 @@ def normalize(results):
             out['faults'] = True
             steps.append(out)
             continue
-        out['r3'] = step['r3']
+        if 'r3' in step:
+            out['r3'] = step['r3']
         if 'wait_left' in step:
             out['completed'] = step['wait_left'] > 0
         capture = {}
@@ -380,6 +382,24 @@ def by_scenario(steps):
     return scenarios
 
 
+def comparable(step):
+    """The step with r3 cut to its low 32 bits when the high half is only their
+    zero or sign extension.
+
+    Xenia sign-extends every 32-bit result and a console extends it either way,
+    depending on the instruction that made it. Titles read the low half only.
+    Caveat: this also hides a real difference in an export that returns 64 bits
+    with a high half of 0, or of all ones over a low half with bit 31 set.
+    """
+    if 'r3' not in step:
+        return step
+    value = int(step['r3'], 16)
+    high, low = value >> 32, value & 0xFFFFFFFF
+    if high == 0 or (high == 0xFFFFFFFF and low & 0x80000000):
+        return dict(step, r3=f'{low:08X}')
+    return step
+
+
 def compare(expected, actual):
     """Prints the steps that differ, returns how many do and how many were
     compared. Scenarios a run left out (a build with --only) count as not
@@ -399,13 +419,14 @@ def compare(expected, actual):
         for want, got in zip(wants, gots):
             if want.get('faults') and got.get('faults'):
                 continue
-            if want == got:
+            want_cmp, got_cmp = comparable(want), comparable(got)
+            if want_cmp == got_cmp:
                 same += 1
                 continue
             differ += 1
             print(f'{scenario} / {want["name"]}')
             for key in ('r3', 'completed', 'capture'):
-                if want.get(key) != got.get(key):
+                if want_cmp.get(key) != got_cmp.get(key):
                     print(f'  {key}: {want.get(key)}\n  {" " * len(key)}  '
                           f'{got.get(key)}')
     print(f'{same} same, {differ} different' +

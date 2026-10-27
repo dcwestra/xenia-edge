@@ -205,6 +205,7 @@ class XObject {
 
   const std::string& name() const { return name_; }
   uint32_t guest_object() const { return guest_object_ptr_; }
+  uint32_t guest_object_type() const { return guest_object_type_ptr_.load(); }
 
   // Has this object been created for use by the host?
   // Host objects are persisted through reloads/etc.
@@ -233,6 +234,8 @@ class XObject {
   // Dereference()
 
   void SetAttributes(uint32_t obj_attributes_ptr);
+
+  void SetNativeType();
 
   // |interruptible| false keeps a terminate from ending a fiber inside the
   // wait, for a signaler that writes into the waiter's stack.
@@ -378,6 +381,8 @@ class XObject {
   // if we allocated it!
   uint32_t guest_object_ptr_ = 0;
   bool allocated_guest_object_ = false;
+
+  std::atomic<uint32_t> guest_object_type_ptr_{0};
 };
 
 template <typename T>

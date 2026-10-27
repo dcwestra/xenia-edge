@@ -9,12 +9,15 @@
 
 #include "xenia/gpu/graphics_system.h"
 
+#include <charconv>
+
 #include "xenia/base/byte_stream.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/profiling.h"
 #include "xenia/base/threading.h"
+#include "xenia/base/utf8.h"
 #include "xenia/config.h"
 #include "xenia/gpu/command_processor.h"
 #include "xenia/gpu/gpu_flags.h"
@@ -83,6 +86,17 @@ GraphicsSystem::GraphicsSystem() : frame_limiter_worker_running_(false) {
 
 GraphicsSystem::~GraphicsSystem() = default;
 
+// The trace writer is compiled out of Release unless XENIA_ENABLE_GPU_TRACE is
+// enabled.
+constexpr bool kTraceCaptureAvailable =
+    XE_ENABLE_TRACE_WRITER_INSTRUMENTATION != 0;
+
+static void WarnTraceCaptureUnavailable() {
+  XELOGW(
+      "GPU trace capture isn't built into this configuration; use a Debug "
+      "build or enable the XENIA_ENABLE_GPU_TRACE CMake option");
+}
+
 X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
                                kernel::KernelState* kernel_state,
                                ui::WindowedAppContext* app_context,
@@ -132,6 +146,33 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
   // Create command processor. This will spin up a thread to process all
   // incoming ringbuffer packets.
   command_processor_ = CreateCommandProcessor();
+
+  // Trace requests from the command line, made before Initialize starts the
+  // command processor thread, which reads the frame numbers on every swap.
+  if (cvars::trace_gpu_stream) {
+    BeginTracing();
+  }
+  std::vector<uint32_t> trace_frame_numbers;
+  for (std::string_view frame :
+       utf8::split(cvars::trace_gpu_frames, ", ", true)) {
+    uint32_t frame_number;
+    auto [end, error] = std::from_chars(
+        frame.data(), frame.data() + frame.size(), frame_number);
+    if (error != std::errc() || end != frame.data() + frame.size()) {
+      XELOGW("Ignoring invalid frame number \"{}\" in trace_gpu_frames", frame);
+      continue;
+    }
+    trace_frame_numbers.push_back(frame_number);
+  }
+  if (!trace_frame_numbers.empty()) {
+    if constexpr (kTraceCaptureAvailable) {
+      command_processor_->SetTraceFrameNumbers(cvars::trace_gpu_prefix,
+                                               std::move(trace_frame_numbers));
+    } else {
+      WarnTraceCaptureUnavailable();
+    }
+  }
+
   if (!command_processor_->Initialize()) {
     XELOGE("Unable to initialize command processor");
     return X_STATUS_UNSUCCESSFUL;
@@ -225,9 +266,6 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
   frame_limiter_worker_thread_->thread()->set_priority(
       threading::ThreadPriority::kLowest);
 #endif
-  if (cvars::trace_gpu_stream) {
-    BeginTracing();
-  }
 
   return X_STATUS_SUCCESS;
 }
@@ -474,11 +512,19 @@ void GraphicsSystem::InitializeShaderStorage(
 }
 
 void GraphicsSystem::RequestFrameTrace() {
-  command_processor_->RequestFrameTrace(cvars::trace_gpu_prefix);
+  if constexpr (kTraceCaptureAvailable) {
+    command_processor_->RequestFrameTrace(cvars::trace_gpu_prefix);
+  } else {
+    WarnTraceCaptureUnavailable();
+  }
 }
 
 void GraphicsSystem::BeginTracing() {
-  command_processor_->BeginTracing(cvars::trace_gpu_prefix);
+  if constexpr (kTraceCaptureAvailable) {
+    command_processor_->BeginTracing(cvars::trace_gpu_prefix);
+  } else {
+    WarnTraceCaptureUnavailable();
+  }
 }
 
 void GraphicsSystem::EndTracing() { command_processor_->EndTracing(); }

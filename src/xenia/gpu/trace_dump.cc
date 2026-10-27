@@ -18,6 +18,7 @@
 #include "xenia/base/string.h"
 #include "xenia/base/threading.h"
 #include "xenia/gpu/command_processor.h"
+#include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/graphics_system.h"
 #include "xenia/memory.h"
 #include "xenia/ui/file_picker.h"
@@ -153,6 +154,11 @@ int TraceDump::Main(const std::vector<std::string>& args) {
 }
 
 bool TraceDump::Setup() {
+  // Captures don't wait for pipelines being created asynchronously, so draws
+  // using them would be missing from the output, which would also vary
+  // between runs.
+  cvars::async_shader_compilation = false;
+
   // Create the emulator but don't initialize so we can setup the window.
   emulator_ = std::make_unique<Emulator>("", "", "", "");
   X_STATUS result = emulator_->Setup(

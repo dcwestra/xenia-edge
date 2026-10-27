@@ -67,6 +67,7 @@ class Assembler:
     def addi(self, rt, ra, imm): self._dform(14, rt, ra, imm)
     def addis(self, rt, ra, imm): self._dform(15, rt, ra, imm, HIGH_HALF)
     def addic_(self, rt, ra, imm): self._dform(13, rt, ra, imm)
+    def mulli(self, rt, ra, imm): self._dform(7, rt, ra, imm)
     def li(self, rt, imm): self.addi(rt, 0, imm)
     def lis(self, rt, imm): self.addis(rt, 0, imm)
     def ori(self, ra, rs, imm): self._dform(24, rs, ra, imm, UNSIGNED)

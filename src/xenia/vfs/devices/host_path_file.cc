@@ -22,7 +22,8 @@ HostPathFile::HostPathFile(
 }
 
 HostPathFile::~HostPathFile() {
-  // Windows can't delete the file while this handle is still open.
+  // Closed first, or a delete on Windows can leave the name in place until
+  // this handle closes.
   file_handle_.reset();
   entry_->ReleaseFile();
 }

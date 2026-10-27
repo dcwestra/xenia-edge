@@ -12,11 +12,14 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <iterator>
+#include <span>
 
 #include "xenia/base/memory.h"
 #include "xenia/config.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
+#include "xenia/net/xnet_secure.h"
 
 // XConfig settings are kept as cvars so they flow through Xenia's existing
 // (per-game) config system. This class is only a guest-facing facade: reads
@@ -82,13 +85,20 @@ namespace {
 
 constexpr uint16_t kMaxSettingSize = 0x40;
 
+// A Microsoft block from while the 360 was made. XLink Kai only forwards
+// frames from console vendors.
+constexpr uint8_t kMacPrefix[] = {0x00, 0x1D, 0xD8};
+
 // Fills |out| (>= kMaxSettingSize bytes) with the guest-formatted bytes of the
 // requested setting and returns its size, or 0 if the setting is unhandled.
 uint16_t BuildSetting(X_CONFIG_CATEGORY category, uint16_t setting,
-                      uint8_t* out) {
+                      const std::array<uint8_t, 6>& mac_address, uint8_t* out) {
   switch (category) {
     case XCONFIG_SECURED_CATEGORY:
       switch (setting) {
+        case XCONFIG_SECURED_MAC_ADDRESS:
+          std::copy(mac_address.begin(), mac_address.end(), out);
+          return uint16_t(mac_address.size());
         case XCONFIG_SECURED_AV_REGION: {
           uint32_t region = 0;
           switch (cvars::video_standard) {
@@ -256,10 +266,17 @@ void StoreConsoleSetting(T& live, const char* name, T value) {
 
 }  // namespace
 
+XConfig::XConfig() {
+  // New for every title so instances on one machine never share it.
+  std::copy(std::begin(kMacPrefix), std::end(kMacPrefix), mac_address_.begin());
+  net::Random(std::span(mac_address_).subspan(std::size(kMacPrefix)));
+}
+
 void XConfig::ReadSetting(const X_CONFIG_CATEGORY category,
                           const uint16_t setting_id, void* buffer) {
   uint8_t scratch[kMaxSettingSize] = {};
-  const uint16_t size = BuildSetting(category, setting_id, scratch);
+  const uint16_t size =
+      BuildSetting(category, setting_id, mac_address_, scratch);
   if (size) {
     std::memcpy(buffer, scratch, size);
   }
@@ -268,7 +285,7 @@ void XConfig::ReadSetting(const X_CONFIG_CATEGORY category,
 uint16_t XConfig::GetSettingSize(const X_CONFIG_CATEGORY category,
                                  const uint16_t setting_id) {
   uint8_t scratch[kMaxSettingSize];
-  return BuildSetting(category, setting_id, scratch);
+  return BuildSetting(category, setting_id, mac_address_, scratch);
 }
 
 void XConfig::WriteSetting(const X_CONFIG_CATEGORY category,

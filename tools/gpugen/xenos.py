@@ -28,6 +28,7 @@ ALLOC_MEMORY = 3
 # Fetch opcodes.
 FETCH_VERTEX = 0
 FETCH_TEXTURE = 1
+FETCH_BORDER_COLOR_FRAC = 16
 
 # Vertex formats used here (xenos::VertexFormat).
 VF_32_32_FLOAT = 37
@@ -179,15 +180,16 @@ def tfetch(dst, src, src_swizzle, const_index, dimension=1, dst_swizzle='xyzw',
            vol_mag_filter=3, vol_min_filter=3,
            denormalized=False, fetch_valid_only=True, use_reg_lod=False,
            use_comp_lod=True, lod_bias=0, offsets=(0, 0, 0),
-           sample_location=0, unk=0):
+           sample_location=0, unk=0, opcode=FETCH_TEXTURE):
     """tfetch (1D/2D/3D/cube by `dimension`) into r`dst` from r`src`'s
     `src_swizzle` (absolute, up to three components) with texture fetch
     constant `const_index`. Filters default to the fetch constant's (3, aniso
-    7), as Direct3D's shaders do."""
+    7), as Direct3D's shaders do. `opcode` gives the other texture fetches
+    the same fields, such as getBCF."""
     swz = 0
     for i, comp in enumerate(src_swizzle.ljust(3, 'x')):
         swz |= 'xyzw'.index(comp) << (2 * i)
-    w0 = (FETCH_TEXTURE | (src << 5) | (dst << 12) |
+    w0 = (opcode | (src << 5) | (dst << 12) |
           (int(fetch_valid_only) << 19) | (const_index << 20) |
           (int(denormalized) << 25) | (swz << 26))
     w1 = (fetch_swizzle(dst_swizzle) | (mag_filter << 12) |

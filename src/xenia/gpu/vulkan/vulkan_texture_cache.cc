@@ -144,9 +144,10 @@ constexpr VulkanTextureCache::HostFormatPair
          xenos::XE_GPU_TEXTURE_SWIZZLE_RRRR,
          true},
         // k_8_B
-        {{kLoadShaderIndexUnknown},
-         {kLoadShaderIndexUnknown},
-         xenos::XE_GPU_TEXTURE_SWIZZLE_RRRR},
+        {{kLoadShaderIndex8bpb, VK_FORMAT_R8_UNORM},
+         {kLoadShaderIndex8bpb, VK_FORMAT_R8_SNORM},
+         xenos::XE_GPU_TEXTURE_SWIZZLE_RRRR,
+         true},
         // k_8_8
         {{kLoadShaderIndex16bpb, VK_FORMAT_R8G8_UNORM},
          {kLoadShaderIndex16bpb, VK_FORMAT_R8G8_SNORM},
@@ -172,9 +173,10 @@ constexpr VulkanTextureCache::HostFormatPair
          {kLoadShaderIndexUnknown},
          xenos::XE_GPU_TEXTURE_SWIZZLE_RGGG},
         // k_8_8_8_8_A
-        {{kLoadShaderIndexUnknown},
-         {kLoadShaderIndexUnknown},
-         xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA},
+        {{kLoadShaderIndex32bpb, VK_FORMAT_R8G8B8A8_UNORM},
+         {kLoadShaderIndex32bpb, VK_FORMAT_R8G8B8A8_SNORM},
+         xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA,
+         true},
         // k_4_4_4_4
         // Components swapped in the load shader for simplicity.
         {{kLoadShaderIndexRGBA4ToARGB4, VK_FORMAT_B4G4R4A4_UNORM_PACK16},
@@ -641,15 +643,13 @@ VkImageView VulkanTextureCache::GetActiveBindingOrNullImageView(
     bool force_special_view =
         (dimension == xenos::FetchOpDimension::k2D &&
          binding->key.dimension == xenos::DataDimension::k3D);
-    bool signed_view =
-        texture_util::IsSignedViewBound(binding->swizzled_signs, is_signed);
 
     if (force_special_view) {
       // Get the appropriate texture for signed/unsigned.
       // Respect swizzled_signs from fetch constant, not just shader request.
       Texture* texture = nullptr;
       bool use_signed =
-          signed_view && texture_util::IsAnySignSigned(binding->swizzled_signs);
+          is_signed && texture_util::IsAnySignSigned(binding->swizzled_signs);
       if (use_signed && IsSignedVersionSeparateForFormat(binding->key)) {
         texture = binding->texture_signed;
       } else {
@@ -663,8 +663,8 @@ VkImageView VulkanTextureCache::GetActiveBindingOrNullImageView(
     } else {
       const VulkanTextureBinding& vulkan_binding =
           vulkan_texture_bindings_[fetch_constant_index];
-      image_view = signed_view ? vulkan_binding.image_view_signed
-                               : vulkan_binding.image_view_unsigned;
+      image_view = is_signed ? vulkan_binding.image_view_signed
+                             : vulkan_binding.image_view_unsigned;
     }
   }
   if (image_view != VK_NULL_HANDLE) {
@@ -698,12 +698,8 @@ VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
   if (xenos::ClampModeUsesBorder(parameters.clamp_x) ||
       xenos::ClampModeUsesBorder(parameters.clamp_y) ||
       xenos::ClampModeUsesBorder(parameters.clamp_z)) {
-    if (binding.border_color_forced) {
-      parameters.border_color = binding.forced_border_color;
-    } else {
-      parameters.border_color = fetch.border_color;
-      parameters.force_bc_w_to_max = fetch.force_bc_w_to_max;
-    }
+    parameters.border_color = fetch.border_color;
+    parameters.force_bc_w_to_max = fetch.force_bc_w_to_max;
   } else {
     parameters.border_color = xenos::BorderColor::k_ABGR_Black;
   }
@@ -1310,8 +1306,8 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
 
   // The loop counter can mean two things depending on whether the packed mip
   // tail is stored as mip 0, because in this case, it would be ambiguous since
-  // both the base and the mips would be on "level 0", but stored in separate
-  // places.
+  // both the base and the mips would be on "level 0", but loaded using separate
+  // layouts.
   uint32_t loop_level_first, loop_level_last;
   if (level_packed == 0) {
     // Packed mip tail is the level 0 - may need to load mip tails for the base,

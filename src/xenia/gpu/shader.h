@@ -552,11 +552,9 @@ struct ParsedTextureFetchInstruction {
   // coordinates snap. The fetch constant side is bit 26 in GetIntegerScaleBits.
   // The epsilon is there so host rounding picks the texel guest trunc would,
   // but near an edge it can push the sample into the next texel. That shows up
-  // as texture seams in 425307EC's virtual texture tables. getBCF snaps like
-  // the fetch it goes with.
+  // as texture seams in 425307EC's virtual texture tables.
   bool CanSnapToTexelCenter(bool use_computed_lod) const {
-    return (opcode == ucode::FetchOpcode::kTextureFetch ||
-            opcode == ucode::FetchOpcode::kGetTextureBorderColorFrac) &&
+    return opcode == ucode::FetchOpcode::kTextureFetch &&
            dimension == xenos::FetchOpDimension::k2D &&
            !attributes.unnormalized_coordinates &&
            AllowsPointSampling(use_computed_lod);

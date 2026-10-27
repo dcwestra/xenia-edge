@@ -189,9 +189,7 @@ uint32_t XContentContainerDevice::LicenseMaskFromHeader(
     const XContentContainerHeader& header) {
   uint32_t final_license = 0;
   for (uint8_t i = 0; i < license_count; i++) {
-    if (header.content_header.licenses[i].license_flags) {
-      final_license |= header.content_header.licenses[i].license_bits;
-    }
+    final_license |= header.content_header.licenses[i].license_bits;
   }
   return final_license;
 }

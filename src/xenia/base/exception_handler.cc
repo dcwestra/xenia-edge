@@ -127,7 +127,9 @@ bool IsArm64LoadPrefetchStore(uint32_t instruction, bool& is_store_out) {
     return true;
   }
   if ((instruction & kArm64SystemSysFMask) == kArm64SystemSysFixed) {
-    is_store_out = true;
+    is_store_out =
+        (instruction & kArm64CacheOpByVaFMask) != kArm64CacheOpByVaFixed ||
+        (instruction & kArm64DcZvaFMask) == kArm64DcZvaFixed;
     return true;
   }
   if ((instruction & kArm64LoadStoreAnyFMask) != kArm64LoadStoreAnyFixed) {

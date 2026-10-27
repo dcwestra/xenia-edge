@@ -82,6 +82,7 @@ KernelState::KernelState(Emulator* emulator)
   xam_state_ = std::make_unique<xam::XamState>(emulator, this);
   guest_scheduler_ = std::make_unique<GuestScheduler>(this);
   smc_ = std::make_unique<SystemManagementController>();
+  nui_ = std::make_unique<NUIController>();
 
   InitializeKernelGuestGlobals();
   kernel_version_ = KernelVersion(cvars::kernel_build_version);
@@ -947,7 +948,10 @@ bool KernelState::IsPatchSignatureProper(
   patch_module->GetOptHeader(XEX_HEADER_DELTA_PATCH_DESCRIPTOR,
                              reinterpret_cast<void**>(&patch_header));
 
-  assert_not_null(patch_header);
+  if (!patch_header) {
+    XELOGE("XEX patch has no delta patch descriptor");
+    return false;
+  }
 
   // Compare hash inside delta descriptor to base XEX signature
   uint8_t digest[0x14];
@@ -1199,8 +1203,9 @@ void KernelState::CompleteOverlappedEx(uint32_t overlapped_ptr, X_RESULT result,
   XOverlappedSetLength(ptr, length);
   std::atomic_thread_fence(std::memory_order_release);
   XOverlappedSetResult(ptr, result);
+  // The event is left unsignaled when there is a completion routine.
   X_HANDLE event_handle = XOverlappedGetEvent(ptr);
-  if (event_handle) {
+  if (event_handle && !XOverlappedGetCompletionRoutine(ptr)) {
     auto ev = object_table()->LookupObject<XEvent>(event_handle);
     assert_not_null(ev);
     if (ev) {

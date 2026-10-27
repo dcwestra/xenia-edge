@@ -807,6 +807,35 @@ dword_result_t NetDll_XNetGetBroadcastVersionStatus_entry(dword_t caller,
 DECLARE_XAM_EXPORT1(NetDll_XNetGetBroadcastVersionStatus, kNetworking,
                     kImplemented);
 
+// The original Xbox emulator puts its emulated network adapter on the LAN
+// through these. |send_filter| would vet xam's own frames, but a title with
+// its own stack sends none.
+dword_result_t NetDll_XnpEthernetInterceptSetCallbacks_entry(
+    dword_t caller, dword_t send_filter, dword_t receive, dword_t context,
+    dword_t flags) {
+  auto link = GetSystemLink(kernel_state());
+  if (!link) {
+    return uint32_t(X_WSAError::X_WSANOTINITIALISED);
+  }
+  return kernel_state()
+      ->GetKernelModule<XamModule>("xam.xex")
+      ->ethernet_intercept()
+      .SetCallbacks(*link, caller, receive, context);
+}
+DECLARE_XAM_EXPORT1(NetDll_XnpEthernetInterceptSetCallbacks, kNetworking,
+                    kImplemented);
+
+dword_result_t NetDll_XnpEthernetInterceptXmit_entry(dword_t caller,
+                                                     lpvoid_t frame,
+                                                     dword_t length) {
+  auto link = GetSystemLink(kernel_state());
+  if (!link) {
+    return uint32_t(X_WSAError::X_WSANOTINITIALISED);
+  }
+  return link->SendFrame({frame.as<const uint8_t*>(), length.value()});
+}
+DECLARE_XAM_EXPORT1(NetDll_XnpEthernetInterceptXmit, kNetworking, kImplemented);
+
 // Fills |dns| with the IPv4 addresses |host| resolves to.
 static void ResolveDnsHost(const std::string& host, XNDNS* dns) {
   asio::error_code ec;

@@ -51,6 +51,20 @@ constexpr uint32_t kContextUserModeControl = 0x228;
 constexpr uint32_t kContextControl = 0x1;
 constexpr uint32_t kContextInteger = 0x4;
 
+// Points the JIT's guest addressing at the user mode or kernel address space.
+void SetUserAddressing(PPCContext* context, bool user) {
+  auto memory = kernel_memory();
+  if (user) {
+    context->virtual_membase = memory->user_virtual_membase();
+    context->tlb_read = memory->user_tlb(false);
+    context->tlb_write = memory->user_tlb(true);
+  } else {
+    context->virtual_membase = memory->virtual_membase();
+    context->tlb_read = memory->kernel_tlb();
+    context->tlb_write = memory->kernel_tlb();
+  }
+}
+
 // Trap frame layout. RuntimeHost uses the GPRs, lr and iar. XeFu also uses
 // ctr, cr and xer and sets ctr before resuming. Where msr goes is unknown.
 constexpr uint32_t kKframesSize = XThread::UserMode::kInterruptFrameSize;
@@ -71,18 +85,6 @@ constexpr uint32_t kRecordAddress = 0xC;
 constexpr uint32_t kRecordParameterCount = 0x10;
 constexpr uint32_t kRecordInformation = 0x14;
 constexpr uint32_t kRecordSize = 0x1C;
-
-// POSIX runs the fault handler on the thread's signal stack, and running guest
-// code from it lets the next fault on that thread overwrite the suspended
-// signal frame, so a fault there diverts to a thunk on the fiber's own stack
-// and resumes the access through the host context it saved.
-// TODO(has207): a64 has no ResumeHostContext, so POSIX there can't resume the
-// access a fault interrupted.
-#if XE_PLATFORM_WIN32 || XE_ARCH_AMD64
-constexpr bool kDeliverUserFaults = true;
-#else
-constexpr bool kDeliverUserFaults = false;
-#endif  // XE_PLATFORM_WIN32 || XE_ARCH_AMD64
 
 constexpr uint32_t kReturnSentinel = 0xBCBCBCBC;
 // Keeps the handler clear of the frame that called KeEnterUserMode.
@@ -176,7 +178,7 @@ void LeaveUserMode(XThread* thread, uint32_t value) {
   auto context = thread->thread_state()->context();
   user_mode->in_user_code = false;
   user_mode->leave_value = value;
-  context->virtual_membase = kernel_memory()->virtual_membase();
+  SetUserAddressing(context, false);
   auto& registers = user_mode->kernel_registers;
   std::memcpy(context->r, registers.r, sizeof(registers.r));
   context->ctr = registers.ctr;
@@ -203,7 +205,7 @@ bool TrapIntoHandler(PPCContext* context, XThread* thread, uint32_t record,
   auto trapped = user_mode->running;
   user_mode->in_user_code = false;
   thread->SaveInterruptedUserCr();
-  context->virtual_membase = kernel_memory()->virtual_membase();
+  SetUserAddressing(context, false);
   auto kframes = context->TranslateVirtual<uint8_t*>(user_mode->kframes);
   SaveKframes(context, kframes, resume_address);
   trapped->resume_address = resume_address;
@@ -241,7 +243,7 @@ bool TrapIntoHandler(PPCContext* context, XThread* thread, uint32_t record,
 
   *out_address = LoadKframes(context, kframes);
   thread->RestoreInterruptedUserCr();
-  context->virtual_membase = kernel_memory()->user_virtual_membase();
+  SetUserAddressing(context, true);
   user_mode->in_user_code = true;
   return true;
 }
@@ -314,7 +316,6 @@ uint32_t UserModeCodeFault(PPCContext* context, uint32_t address) {
   return resume_address != address ? resume_address : 0;
 }
 
-#if XE_PLATFORM_WIN32 || XE_ARCH_AMD64
 // Runs the trap handler for a fault on the guest instruction at |address|.
 // Returns whether the interrupted access runs again, false if the fiber has to
 // restart at the address the handler left instead.
@@ -330,12 +331,10 @@ bool RunFaultHandler(PPCContext* context, XThread* thread, uint32_t address) {
   user_mode->restart_address = handler_returned ? resume_address : address;
   return false;
 }
-#endif  // XE_PLATFORM_WIN32 || XE_ARCH_AMD64
 
-#if !XE_PLATFORM_WIN32 && XE_ARCH_AMD64
-// A fault handed to the thunk below. The thunk copies it out before running
-// any guest code, so another fiber of the thread can use the slot while this
-// one is parked in a trap.
+#if !XE_PLATFORM_WIN32
+// Guest code can't run on the signal stack, where the next fault overwrites the
+// frame, so a fault diverts to the thunk below, which copies it out first.
 struct DivertedFault {
   HostThreadContext context;
   // The guest instruction the fault interrupted.
@@ -349,19 +348,23 @@ void UserModeFaultThunk() {
   XThread* thread = XThread::GetCurrentThread();
   const HostThreadContext context = diverted_fault.context;
   const uint32_t address = diverted_fault.address;
+#if XE_ARCH_AMD64
   // The signal return put back the MXCSR the fault ran with, which the context
   // doesn't carry and the handler's guest code changes.
   const uint32_t mxcsr = _mm_getcsr();
+#endif  // XE_ARCH_AMD64
   if (RunFaultHandler(thread->thread_state()->context(), thread, address)) {
     // The retry runs from the host registers, so changes the handler made to
     // the frame are lost.
     // TODO(has207): load the frame back into the host context instead.
+#if XE_ARCH_AMD64
     _mm_setcsr(mxcsr);
+#endif  // XE_ARCH_AMD64
     ResumeHostContext(&context);
   }
   RestartUserModeThunk();
 }
-#endif  // !XE_PLATFORM_WIN32 && XE_ARCH_AMD64
+#endif  // !XE_PLATFORM_WIN32
 
 // A user mode access with no page table entry, or one its entry's protection
 // forbids. The guest's handler can fix the entry and return, and the access
@@ -395,15 +398,12 @@ Memory::UserFaultResult UserModeFault(uint32_t fault_address, bool is_write,
   }
   DivertToThunk(ex, &RestartUserModeThunk);
   return Memory::UserFaultResult::kDiverted;
-#elif XE_ARCH_AMD64
+#else
   // The thunk gets the registers the access has to resume from.
   diverted_fault.context = *ex->thread_context();
   diverted_fault.address = address;
   DivertToThunk(ex, &UserModeFaultThunk);
   return Memory::UserFaultResult::kDiverted;
-#else
-  // kDeliverUserFaults keeps the hook off without a way to resume the access.
-  return Memory::UserFaultResult::kNotTaken;
 #endif  // XE_PLATFORM_WIN32
 }
 
@@ -471,15 +471,13 @@ dword_result_t KeCreateUserMode_entry(dword_t unknown, lpvoid_t descriptor,
   }
   context->processor->EnableDynamicCode();
   context->processor->set_syscall_hook(&UserModeSyscall);
-  if (kDeliverUserFaults) {
-    // The handler reads the registers of a fault from the context, which the
-    // JIT otherwise leaves stale mid-block.
-    // TODO(has207): this slows all user mode code down. Recovering the
-    // registers from the host context at the fault would avoid it.
-    context->processor->KeepDynamicCodeContextStores();
-    kernel_memory()->set_user_fault_hook(&UserModeFault);
-    context->processor->set_code_fault_hook(&UserModeCodeFault);
-  }
+  // The handler reads the registers of a fault from the context, which the JIT
+  // otherwise leaves stale mid-block.
+  // TODO(has207): this slows all user mode code down. Recovering the registers
+  // from the host context at the fault would avoid it.
+  context->processor->KeepDynamicCodeContextStores();
+  kernel_memory()->set_user_fault_hook(&UserModeFault);
+  context->processor->set_code_fault_hook(&UserModeCodeFault);
   return X_STATUS_SUCCESS;
 }
 DECLARE_XBOXKRNL_EXPORT2(KeCreateUserMode, kThreading, kImplemented, kSketchy);
@@ -553,7 +551,7 @@ dword_result_t KeEnterUserMode_entry(lpvoid_t user_context, dword_t handler,
     user_mode->adopted_fiber = xe::threading::Fiber::CreateFromThread();
   }
   user_mode->kernel_fiber = xe::threading::Fiber::GetCurrentFiber();
-  guest_context->virtual_membase = kernel_memory()->user_virtual_membase();
+  SetUserAddressing(guest_context, true);
 
   // The kernel services a trap by entering again at the instruction after it,
   // with the stack pointer it trapped with, so that fiber continues in place.
@@ -692,12 +690,16 @@ void KeContextToKframes_entry(lpvoid_t kframes, lpvoid_t context,
 DECLARE_XBOXKRNL_EXPORT1(KeContextToKframes, kThreading, kImplemented);
 
 // Dropping more than was asked for only costs a fault, so none reads its args.
-void KeFlushUserModeCurrentTb_entry() { kernel_memory()->FlushUserPageTable(); }
+void KeFlushUserModeCurrentTb_entry() {
+  kernel_memory()->FlushChangedUserPages();
+}
 DECLARE_XBOXKRNL_EXPORT1(KeFlushUserModeCurrentTb, kMemory, kImplemented);
 
-void KeFlushUserModeTb_entry() { kernel_memory()->FlushUserPageTable(); }
+void KeFlushUserModeTb_entry() { kernel_memory()->FlushChangedUserPages(); }
 DECLARE_XBOXKRNL_EXPORT1(KeFlushUserModeTb, kMemory, kImplemented);
 
+// TODO(has207): keeping unchanged pages here, as the user mode flushes do,
+// bugchecks Crimson Skies under XeFu for an unknown reason.
 void KeFlushCurrentEntireTb_entry() { kernel_memory()->FlushUserPageTable(); }
 DECLARE_XBOXKRNL_EXPORT1(KeFlushCurrentEntireTb, kMemory, kImplemented);
 

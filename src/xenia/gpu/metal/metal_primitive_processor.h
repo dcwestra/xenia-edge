@@ -15,6 +15,7 @@
 #include "third_party/metal-cpp/Metal/Metal.hpp"
 
 #include "xenia/gpu/primitive_processor.h"
+#include "xenia/ui/metal/metal_upload_buffer_pool.h"
 
 namespace xe {
 namespace gpu {
@@ -63,7 +64,6 @@ class MetalPrimitiveProcessor : public PrimitiveProcessor {
   };
 
   std::vector<ConvertedIndexBufferBinding> converted_index_buffers_;
-  uint64_t current_frame_ = 0;
 
   // Built-in index buffer for primitive type conversion
   MTL::Buffer* builtin_index_buffer_ = nullptr;
@@ -73,13 +73,8 @@ class MetalPrimitiveProcessor : public PrimitiveProcessor {
   // Uses triangle-list topology to avoid relying on primitive restart.
   MTL::Buffer* expansion_triangle_list_index_buffer_ = nullptr;
 
-  // Per-frame index buffer for primitive conversion
-  struct FrameIndexBuffer {
-    MTL::Buffer* buffer = nullptr;
-    size_t size = 0;
-    uint64_t last_frame_used = 0;
-  };
-  std::vector<FrameIndexBuffer> frame_index_buffers_;
+  // Pages are tagged with frame indices.
+  std::unique_ptr<ui::metal::MetalUploadBufferPool> frame_index_buffer_pool_;
 };
 
 }  // namespace metal

@@ -369,6 +369,8 @@ struct XMP_USER_PLAYLIST_INFO {
 };
 static_assert_size(XMP_USER_PLAYLIST_INFO, 0x334);
 
+constexpr uint32_t MAX_LAUNCH_DATA_SIZE = 0x3FC;
+
 enum LoaderLaunchFlags : uint32_t {
   GetSystemVersion = 0x00000040,  // XamUpdateGetCurrentSystemVersion
   GetVersionFromExecutionId = 0x00010000,

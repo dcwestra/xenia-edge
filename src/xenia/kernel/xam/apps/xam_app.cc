@@ -11,6 +11,7 @@
 
 #include "xenia/base/logging.h"
 #include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/nui.h"
 #include "xenia/kernel/nui/nui_data_store.h"
 #include "xenia/kernel/nui/nui_hud.h"
 #include "xenia/kernel/nui/nui_identity.h"
@@ -422,13 +423,14 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       }
       return X_E_SUCCESS;
     }
-    case 0x0002B001:
-      // A Kinect title keeping the camera awake for the milliseconds given, 0
-      // releasing it. Titles ignore the answer.
-      if (!cvars::allow_nui_initialization) {
-        break;
-      }
+    case 0x0002B001: {
+      // Games used in:
+      // 42560819, 373307D9
+      uint32_t ms_delay = xe::load_and_swap<uint32_t>(buffer);
+
+      XELOGD("XNuiDelayUI unimplemented({:08X})", ms_delay);
       return X_E_SUCCESS;
+    }
     case 0x0002B002:
       // A Kinect title's skeleton frame, sent each frame for the system to
       // spot its own Kinect Guide gesture in - which it would answer with
@@ -444,20 +446,41 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       // Games used in:
       // 4D5309C9
       // It only receives buffer
-      struct {
-        xe::be<uint64_t> unk1;
-        xe::be<uint64_t> unk2;
-        xe::be<uint64_t> unk3;
-      }* args = memory_->TranslateVirtual<decltype(args)>(buffer_ptr);
+      X_NUI_TITLE_INITIALIZE_DATA* args =
+          reinterpret_cast<X_NUI_TITLE_INITIALIZE_DATA*>(buffer);
+      XELOGD("XNuiTitleInitialize({:016X}, {:016X}, flags: 0x{:08X}), Stubbed",
+             args->xam_version.get(), args->xtl_version.get(),
+             args->flags.get());
+      X_HRESULT result = X_E_FAIL;
 
-      XELOGD("XamUnk2B003({:016X}, {:016X}, {:016X}), unimplemented",
-             args->unk1.get(), args->unk2.get(), args->unk3.get());
-      return X_E_SUCCESS;
+      if (args->xam_version == 5) {
+        kernel_state_->nui()->SetNUIVersion(uint64_t(args->xam_version), 0);
+        kernel_state_->nui()->SetNUIVersion(uint64_t(args->xtl_version), 1);
+        kernel_state_->nui()->SetInitFlags(uint32_t(args->flags));
+        if ((args->flags & 0x80000000) == 0) {
+          XELOGD("Todo: write data to two pointers");
+          result = X_E_SUCCESS;
+        }
+      }
+      if ((args->flags & 0x40000000) == 0) {
+        XELOGD(
+            "Todo: call XamNuiGetDeviceStatus and if status does not have flag "
+            "1 set but has flags 4 and 0x40 call XamShowNuiTroubleshooterUI");
+      }
+
+      return result;
     }
     case 0x0002B004: {
-      // Probably related to 0x0002B003, maybe camera/Kinect related.
-      // Seen in Forza Horizon 2.
-      XELOGD("XamUnk2B004, unimplemented");
+      // Games used in:
+      // Emerald Dashboard, Forza Horizon 2
+      // Called with no buffer
+
+      kernel_state_->nui()->SetNUIVersion(0, 0);
+      kernel_state_->nui()->SetNUIVersion(0, 1);
+      kernel_state_->nui()->SetInitFlags(0);
+      kernel_state_->nui()->SetTiltCallback(0);
+
+      XELOGD("XNuiTitleShutdown stubbed");
       return X_E_SUCCESS;
     }
     case 0x0002C009: {

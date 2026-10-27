@@ -13,6 +13,7 @@
 
 DECLARE_path(trace_gpu_prefix);
 DECLARE_bool(trace_gpu_stream);
+DECLARE_string(trace_gpu_frames);
 
 DECLARE_path(dump_shaders);
 
@@ -86,9 +87,13 @@ DECLARE_bool(use_fuzzy_alpha_epsilon);
 
 DECLARE_bool(force_depth_clamp);
 
-DECLARE_bool(mulsc_round_toward_zero);
+DECLARE_bool(alu_round_toward_zero);
 
 DECLARE_bool(xenos_sample_positions);
+
+DECLARE_bool(texture_point_snap);
+
+DECLARE_bool(texture_border_color_frac);
 
 #define XE_GPU_FINE_GRAINED_DRAW_SCOPES 1
 

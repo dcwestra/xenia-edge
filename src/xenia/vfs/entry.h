@@ -98,7 +98,6 @@ class Entry {
   virtual void RetainFile() {}
   virtual void ReleaseFile() {}
 
-  virtual bool SetAttributes(uint64_t attributes) { return false; }
   virtual bool SetCreateTimestamp(uint64_t timestamp) { return false; }
   virtual bool SetAccessTimestamp(uint64_t timestamp) { return false; }
   virtual bool SetWriteTimestamp(uint64_t timestamp) { return false; }

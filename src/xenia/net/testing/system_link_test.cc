@@ -594,6 +594,104 @@ TEST_CASE("System Link sends without waiting for a frame to arrive",
   pair.transports[0]->Disconnect();
 }
 
+// An original Xbox asks who has 10.0.0.3, which isn't XNet at all.
+const std::vector<uint8_t> kArpRequest{
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x50, 0xF2, 1, 2,
+    3,    0x08, 0x06, 0,    1,    0x08, 0,    6,    4,    0, 1,
+    0x00, 0x50, 0xF2, 1,    2,    3,    10,   0,    0,    2, 0,
+    0,    0,    0,    0,    0,    10,   0,    0,    3};
+
+TEST_CASE("System Link hands a frame receiver every frame that arrives",
+          "[net][system_link]") {
+  Pair pair;
+  std::mutex mutex;
+  std::vector<std::vector<uint8_t>> received;
+  pair.a->SetFrameReceiver([&](std::span<const uint8_t> frame) {
+    std::lock_guard lock(mutex);
+    received.emplace_back(frame.begin(), frame.end());
+  });
+  auto count = [&] {
+    std::lock_guard lock(mutex);
+    return received.size();
+  };
+  auto rx = Bind(*pair.a, 1001, false);
+  auto tx = Bind(*pair.b, 1001, false);
+  REQUIRE(rx);
+  REQUIRE(tx);
+  pair.transports[0]->Inject(kArpRequest);
+  pair.transports[0]->Inject(kArpRequest);
+  const std::vector<uint8_t> data{1, 2, 3};
+  uint32_t error = 0;
+  REQUIRE(tx->Send({0xFFFFFFFF, 1001}, data, error) == 3);
+  // The System Link still reads the frames it gets.
+  REQUIRE(Ready(*rx));
+  REQUIRE(WaitFor([&] { return count() == 3; }));
+  {
+    std::lock_guard lock(mutex);
+    CHECK(received[0] == kArpRequest);
+    CHECK(received[1] == kArpRequest);
+    CHECK(received[2] == pair.transports[1]->Sent().back());
+  }
+
+  pair.a->SetFrameReceiver(nullptr);
+  std::array<uint8_t, 16> buffer{};
+  Endpoint source;
+  REQUIRE(rx->Receive(buffer, false, source, 0, error) == 3);
+  pair.transports[0]->Inject(kArpRequest);
+  REQUIRE(tx->Send({0xFFFFFFFF, 1001}, data, error) == 3);
+  REQUIRE(Ready(*rx));
+  CHECK(count() == 3);
+}
+
+TEST_CASE("System Link releases its frame receiver while ports outlive it",
+          "[net][system_link]") {
+  Pair pair;
+  auto port = Bind(*pair.a, 1000, false);
+  auto token = std::make_shared<int>();
+  std::weak_ptr<int> receiver = token;
+  pair.a->SetFrameReceiver([token](std::span<const uint8_t>) {});
+  token.reset();
+  pair.a.reset();
+  CHECK(receiver.expired());
+}
+
+TEST_CASE("System Link sends the frames it is handed as they are",
+          "[net][system_link]") {
+  Pair pair;
+  // The receive now ends only on a frame or a wake.
+  pair.transports[0]->Stall();
+  REQUIRE(WaitFor([&] { return pair.transports[0]->stalled() > 0; }));
+  CHECK(pair.a->SendFrame(kArpRequest) == 0);
+  CHECK(WaitFor([&] {
+    auto sent = pair.transports[0]->Sent();
+    return !sent.empty() && sent.back() == kArpRequest;
+  }));
+  // Shorter than an Ethernet header, longer than the MTU allows.
+  CHECK(pair.a->SendFrame(std::span(kArpRequest).first(13)) == kWsaNoBuffers);
+  CHECK(pair.a->SendFrame(std::vector<uint8_t>(14 + 1501)) == kWsaNoBuffers);
+  CHECK(pair.a->SendFrame(std::vector<uint8_t>(14 + 1500)) == 0);
+  pair.transports[0]->Disconnect();
+}
+
+TEST_CASE("System Link refuses frames once too many wait to go out",
+          "[net][system_link]") {
+  Pair pair;
+  pair.transports[0]->Hold();
+  bool refused = false;
+  for (int i = 0; i < 1000 && !refused; ++i) {
+    refused = pair.a->SendFrame(kArpRequest) == kWsaNoBuffers;
+  }
+  CHECK(refused);
+  pair.transports[0]->Release();
+}
+
+TEST_CASE("System Link refuses frames once the LAN is down",
+          "[net][system_link]") {
+  Pair pair;
+  pair.transports[0]->Disconnect();
+  CHECK(pair.a->SendFrame(kArpRequest) == kWsaNetworkDown);
+}
+
 TEST_CASE("System Link QoS lookups bring back the data a host listens with",
           "[net][system_link][qos]") {
   Pair pair;

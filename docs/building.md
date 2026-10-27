@@ -54,6 +54,9 @@ xb devenv
 
 # Format code to the style guide:
 xb format
+
+# Build and run the unit tests:
+xb test
 ```
 
 > **Note:** The shaders Xenia generates need a Direct3D 12 runtime with shader

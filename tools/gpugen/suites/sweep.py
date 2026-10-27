@@ -14,9 +14,12 @@ import xenos as x  # noqa: E402
 SWEEPS = {'rcp': (x.S_RCP, 1.0), 'rsq': (x.S_RSQ, 1.0),
           'rsq2': (x.S_RSQ, 2.0), 'sqrt': (x.S_SQRT, 1.0),
           'sqrt2': (x.S_SQRT, 2.0), 'log': (x.S_LOG, 1.0),
-          'log2': (x.S_LOG, 2.0), 'exp': (x.S_EXP, 1.0),
-          'expn': (x.S_EXP, -1.0)}
-LINEAR = {'sin': (x.S_SIN, 2.0 ** -21), 'cos': (x.S_COS, 2.0 ** -21)}
+          'log2': (x.S_LOG, 2.0), 'logh': (x.S_LOG, 0.5),
+          'exp': (x.S_EXP, 1.0), 'expn': (x.S_EXP, -1.0),
+          'exp64': (x.S_EXP, 64.0), 'expn64': (x.S_EXP, -64.0),
+          'expntiny': (x.S_EXP, -2.0 ** -24)}
+LINEAR = {'sin': (x.S_SIN, 2.0 ** -21), 'cos': (x.S_COS, 2.0 ** -21),
+          'expint': (x.S_EXP, 1.0), 'expnint': (x.S_EXP, -1.0)}
 VERTICES = 1 << 21
 f2w = gpugen.f2w
 

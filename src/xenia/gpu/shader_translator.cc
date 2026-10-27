@@ -1271,10 +1271,8 @@ uint32_t ParsedTextureFetchInstruction::GetNonZeroResultComponents() const {
   switch (opcode) {
     case FetchOpcode::kTextureFetch:
     case FetchOpcode::kGetTextureGradients:
-      components = 0b1111;
-      break;
     case FetchOpcode::kGetTextureBorderColorFrac:
-      components = 0b0001;
+      components = 0b1111;
       break;
     case FetchOpcode::kGetTextureComputedLod:
       // Not checking if the MipFilter is basemap because XNA doesn't accept

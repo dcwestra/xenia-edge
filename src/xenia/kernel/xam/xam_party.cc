@@ -37,6 +37,18 @@ dword_result_t XamPartyGetUserList_entry(dword_t caller,
 }
 DECLARE_XAM_EXPORT1(XamPartyGetUserList, kNone, kStub);
 
+// The internal list has the same count and 32 users of 0x80 bytes.
+constexpr size_t kPartyUserListInternalSize = 0x1008;
+
+dword_result_t XamPartyGetUserListInternal_entry(lpvoid_t party_list_ptr) {
+  if (party_list_ptr) {
+    party_list_ptr.Zero(kPartyUserListInternalSize);
+  }
+  // FFFE07D1
+  return 0x807D0003;  // X_PARTY_E_NOT_IN_PARTY
+}
+DECLARE_XAM_EXPORT1(XamPartyGetUserListInternal, kNone, kStub);
+
 // Shares same function as XamPartyAddLocalUsers, XamPartyKickUser,
 // XamPartyGetJoinable, XamPartySetJoinable, & XamPartyGetInfoEx
 dword_result_t XamPartySendGameInvites_entry(

@@ -42,6 +42,7 @@ inline constexpr uint32_t kWsaShutdown = 10058;
 inline constexpr uint32_t kWsaTimedOut = 10060;
 inline constexpr uint32_t kWsaConnectionRefused = 10061;
 inline constexpr uint32_t kWsaHostUnreachable = 10065;
+inline constexpr uint32_t kWsaSystemNotReady = 10091;
 
 // What XNetGetConnectStatus reports for an address without a peer.
 inline constexpr uint32_t kConnectStatusLost = 3;
@@ -238,6 +239,15 @@ class SystemLink {
                                        uint32_t& error);
   // An unbound TCP socket. TCP ports are apart from UDP and VDP ones.
   std::unique_ptr<SystemLinkStream> CreateStream(uint32_t& error);
+  // Hands a guest that runs its own network stack, such as an emulated
+  // console, every Ethernet frame that arrives, before this System Link reads
+  // it. |receive| runs on the worker, maybe once more after it is replaced,
+  // and must not call back into the System Link. None stops it.
+  void SetFrameReceiver(std::function<void(std::span<const uint8_t>)> receive);
+  // Queues an Ethernet frame to go out as it is. Fails with kWsaNetworkDown
+  // once the LAN is down and with kWsaNoBuffers when the frame doesn't fit
+  // the MTU or too many wait.
+  uint32_t SendFrame(std::span<const uint8_t> frame);
   // Drops every key, peer, association and QoS listener, ends every QoS lookup
   // and closes every bound port and stream.
   void Reset();

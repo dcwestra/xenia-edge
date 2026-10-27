@@ -13,7 +13,6 @@
 #include <array>
 #include <cstdint>
 #include <memory>
-#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -543,6 +542,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     bool signed_zero_inf_nan_preserve_float32;
     bool denorm_flush_to_zero_float32;
     bool rounding_mode_rte_float32;
+    bool rounding_mode_rtz_float32 = false;
 
     bool fragment_shader_sample_interlock;
 
@@ -709,8 +709,6 @@ class SpirvShaderTranslator : public ShaderTranslator {
     xenos::TextureFilter min_filter;
     xenos::TextureFilter mip_filter;
     xenos::AnisoFilter aniso_filter;
-    bool border_color_forced;
-    xenos::BorderColor forced_border_color;
 
     spv::Id variable;
   };
@@ -898,11 +896,30 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // must be called with absolute values of operands - use GetAbsoluteOperand!
   spv::Id ZeroIfAnyOperandIsZero(spv::Id value, spv::Id operand_0_abs,
                                  spv::Id operand_1_abs);
-  // Reduces floating-point precision by truncating mantissa bits with rounding.
-  // Used to match Xbox 360 Xenos GPU hardware approximation instructions
-  // (RCP, RSQ, EXP, LOG, SQRT) that provide ~2^-21 relative error tolerance
-  // instead of full IEEE-754 precision (equivalent to 21 vs 23 mantissa bits).
-  spv::Id ReduceFloatPrecision(spv::Id value, uint32_t mantissa_bits);
+  enum class ScalarEstimateOp : uint32_t {
+    kRcp,
+    kRsq,
+    kSqrt,
+    kExp,
+    kLog,
+  };
+  // The scalar op of a float, the same as xenos::Rcp, Rsq, Sqrt, Exp or Log in
+  // vertex shaders, and the host's in pixel shaders where the extra
+  // instructions cost too much.
+  spv::Id ScalarEstimate(ScalarEstimateOp op, spv::Id value);
+  // Whether alu_round_toward_zero applies, only to vertex shaders since the
+  // extra instructions per operation are too slow per pixel.
+  bool RoundsTowardZero() const;
+  // Whether the shader's rounding mode does it, with no extra instructions.
+  bool RoundsTowardZeroInHardware() const;
+  // Guest ALU sums and products of floats or float vectors, rounded toward
+  // zero if RoundsTowardZero.
+  spv::Id AluAdd(spv::Id a, spv::Id b);
+  spv::Id AluSubtract(spv::Id a, spv::Id b);
+  spv::Id AluMultiply(spv::Id a, spv::Id b);
+  // Steps a sum or product of a and b rounded to nearest toward zero if its
+  // exact error shows it rounded away, and saturates overflow.
+  spv::Id RoundTowardZero(spv::Id rounded, spv::Id error, spv::Id a, spv::Id b);
   // Pack/unpack two floats as Xbox 360 extended-range float16, where exponent
   // 31 is a large finite value (up to +-131008), not Inf/NaN.
   spv::Id PackFloat16x2ExtendedRange(spv::Id float2_value);
@@ -954,22 +971,21 @@ class SpirvShaderTranslator : public ShaderTranslator {
   size_t FindOrAddTextureBinding(uint32_t fetch_constant,
                                  xenos::FetchOpDimension dimension,
                                  bool is_signed);
-  size_t FindOrAddSamplerBinding(
-      uint32_t fetch_constant, xenos::TextureFilter mag_filter,
-      xenos::TextureFilter min_filter, xenos::TextureFilter mip_filter,
-      xenos::AnisoFilter aniso_filter,
-      std::optional<xenos::BorderColor> forced_border_color = std::nullopt);
+  size_t FindOrAddSamplerBinding(uint32_t fetch_constant,
+                                 xenos::TextureFilter mag_filter,
+                                 xenos::TextureFilter min_filter,
+                                 xenos::TextureFilter mip_filter,
+                                 xenos::AnisoFilter aniso_filter);
   // `texture_parameters` need to be set up except for `sampler`, which will be
   // set internally, optionally doing linear interpolation between the an
   // existing value and the new one (the result location may be the same as for
-  // the first lerp endpoint, but not across signedness). getBCF samples one
-  // image in both slots, with its black and white border samplers.
+  // the first lerp endpoint, but not across signedness).
   void SampleTexture(spv::Builder::TextureParameters& texture_parameters,
                      spv::ImageOperandsMask image_operands_mask,
                      spv::Id image_unsigned, spv::Id image_signed,
-                     spv::Id sampler_unsigned, spv::Id sampler_signed,
-                     spv::Id is_any_unsigned, spv::Id is_any_signed,
-                     spv::Id& result_unsigned_out, spv::Id& result_signed_out,
+                     spv::Id sampler, spv::Id is_any_unsigned,
+                     spv::Id is_any_signed, spv::Id& result_unsigned_out,
+                     spv::Id& result_signed_out,
                      spv::Id lerp_factor = spv::NoResult,
                      spv::Id lerp_first_unsigned = spv::NoResult,
                      spv::Id lerp_first_signed = spv::NoResult);
@@ -978,6 +994,13 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id QueryTextureLod(spv::Builder::TextureParameters& texture_parameters,
                           spv::Id image_unsigned, spv::Id image_signed,
                           spv::Id sampler, spv::Id is_all_signed);
+  // The explicit LOD, or the bias of a computed one: the fetch constant's, the
+  // register's and the instruction's.
+  spv::Id TextureFetchLod(const ParsedTextureFetchInstruction& instr,
+                          spv::Id fetch_constant_word_4_signed);
+  // getBCF's lane 0 and lanes 1 to 3.
+  void TextureBorderColorFrac(const ParsedTextureFetchInstruction& instr,
+                              spv::Id& lane_0_out, spv::Id& lanes_1_3_out);
 
   spv::Id LoadMsaaSamplesFromFlags();
   // The guest sample count baked into the modification, so the MSAA dependent
@@ -1066,6 +1089,48 @@ class SpirvShaderTranslator : public ShaderTranslator {
       spv::Id dest_color, spv::Id dest_alpha, spv::Id constant_color_clamped,
       spv::Id constant_alpha_clamped, spv::Id equation, spv::Id source_factor,
       spv::Id dest_factor);
+
+  // 8_8_8_8, 8_8_8_8_GAMMA, 2_10_10_10 and 2_10_10_10_AS_10_10_10_10 blend in
+  // the render backend's 10-bit fixed point (FSI_BlendFixed10), the other
+  // formats in floats.
+  static bool FSI_BlendsInFixed10(xenos::ColorRenderTargetFormat format);
+  // Of those, the formats with 8-bit fields rather than 10:10:10:2.
+  static bool FSI_Fixed10Is8bpc(xenos::ColorRenderTargetFormat format);
+  // A float scalar or vector to n-bit unorm (uint) the way the render backend
+  // converts it: clamped, truncated to 23 fraction bits, then rounded half up.
+  // NaN converts by its sign like infinity.
+  spv::Id FSI_FloatToUnorm(spv::Id value, uint32_t bits);
+  // A uint or uint3 8-bit unorm widened to 10 bits by bit replication.
+  spv::Id FSI_Widen8To10(spv::Id value);
+  // uint3 10-bit linear to 8-bit gamma, the render target's curve.
+  spv::Id FSI_LinearToGamma8(spv::Id linear);
+  // uint3 8-bit gamma to 10-bit linear, the exact inverse of the curve.
+  spv::Id FSI_Gamma8ToLinear10(spv::Id gamma);
+  // The blending operands (uint4, 10 bits) of the exported color, quantized
+  // to what the format stores first.
+  spv::Id FSI_SourceToFixed10(spv::Id color,
+                              xenos::ColorRenderTargetFormat format);
+  // The blending operands (uint4, 10 bits) of a stored pixel.
+  spv::Id FSI_UnpackToFixed10(spv::Id packed,
+                              xenos::ColorRenderTargetFormat format);
+  // A blend factor of 10-bit operands before widening, for the color (uint3)
+  // or the alpha (uint).
+  spv::Id FSI_BlendFactorFixed10(spv::Id factor, bool is_alpha, spv::Id source,
+                                 spv::Id dest, spv::Id constant);
+  // Packs uint3 color and uint alpha fields, at the widths the format stores,
+  // into one of the FSI_BlendsInFixed10 formats.
+  spv::Id FSI_PackUnitFields(spv::Id rgb, spv::Id alpha,
+                             xenos::ColorRenderTargetFormat format);
+  // Converts and packs a color into one of the FSI_BlendsInFixed10 formats.
+  spv::Id FSI_PackUnitColor(spv::Id color,
+                            xenos::ColorRenderTargetFormat format);
+  // Blends 10-bit operands and packs the result into the format.
+  spv::Id FSI_BlendFixed10(xenos::ColorRenderTargetFormat format,
+                           spv::Id source, spv::Id dest, spv::Id constant,
+                           spv::Id color_equation, spv::Id color_source_factor,
+                           spv::Id color_dest_factor, spv::Id alpha_equation,
+                           spv::Id alpha_source_factor,
+                           spv::Id alpha_dest_factor);
 
   Features features_;
   bool native_2x_msaa_with_attachments_;
@@ -1364,6 +1429,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // float3.
   spv::Id var_main_tfetch_gradients_h_;
   spv::Id var_main_tfetch_gradients_v_;
+  // uint4[32] coefficients for ScalarEstimate, created on first use.
+  std::array<spv::Id, size_t(ScalarEstimateOp::kLog) + 1>
+      var_main_estimate_coefficients_;
   // float4[register_count()].
   spv::Id var_main_registers_;
   // Components of registers 0-15, 4 bits per register, that still hold the

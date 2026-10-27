@@ -2453,6 +2453,8 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
 
   if (primitive_processor_ && frame_open_) {
     primitive_processor_->EndFrame();
+    closed_frames_.push_back({frame_current_, submission_current_});
+    ++frame_current_;
     frame_open_ = false;
   }
   // Frame boundary reached - resolved memory tracking is only needed within a
@@ -3013,6 +3015,10 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   if (!primitive_processor_) {
     XELOGE("IssueDraw: primitive processor is not initialized");
     return false;
+  }
+  // Converted indices are tagged with the current frame, which must be open.
+  if (!EnsureCommandBuffer()) {
+    return true;
   }
   if (!primitive_processor_->Process(primitive_processing_result)) {
     XELOGE("IssueDraw: primitive processing failed");
@@ -5282,6 +5288,11 @@ MTL::CommandBuffer* MetalCommandProcessor::EnsureCommandBuffer() {
 void MetalCommandProcessor::ProcessCompletedSubmissions() {
   const uint64_t completed =
       completed_command_buffers_.load(std::memory_order_relaxed);
+  while (!closed_frames_.empty() &&
+         closed_frames_.front().last_submission <= completed) {
+    frame_completed_ = closed_frames_.front().frame;
+    closed_frames_.pop_front();
+  }
   if (completed <= submission_completed_processed_) {
     return;
   }
@@ -7077,6 +7088,9 @@ void MetalCommandProcessor::UpdateSpirvSystemConstantValues(
   // Color exponent bias (matching Vulkan backend).
   for (uint32_t i = 0; i < 4; ++i) {
     int32_t color_exp_bias = color_infos[i].color_exp_bias;
+    float color_exp_bias_scale;
+    *reinterpret_cast<int32_t*>(&color_exp_bias_scale) =
+        UINT32_C(0x3F800000) + (color_exp_bias << 23);
     if (render_target_cache_->GetPath() ==
             RenderTargetCache::Path::kHostRenderTargets &&
         ((color_infos[i].color_format ==
@@ -7085,11 +7099,10 @@ void MetalCommandProcessor::UpdateSpirvSystemConstantValues(
          (color_infos[i].color_format ==
               xenos::ColorRenderTargetFormat::k_16_16_16_16 &&
           !render_target_cache_->IsFixedRGBA16TruncatedToMinus1To1()))) {
-      color_exp_bias -= 5;
+      // Remap to -1...1 by scaling the output values by 1024/32767, so the
+      // SNORM bits are the EDRAM ones apart from -32.
+      color_exp_bias_scale *= 1024.0f / 32767.0f;
     }
-    float color_exp_bias_scale;
-    *reinterpret_cast<int32_t*>(&color_exp_bias_scale) =
-        UINT32_C(0x3F800000) + (color_exp_bias << 23);
     consts.color_exp_bias[i] = color_exp_bias_scale;
   }
 

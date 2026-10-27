@@ -48,6 +48,8 @@ constexpr uint8_t kXbox360Platform = 1;
 
 constexpr size_t kKeyLimit = 8, kPeerLimit = 32;
 constexpr size_t kInboxLimit = 64, kPortLimit = 128;
+constexpr size_t kOutgoingFrameLimit = 64;
+constexpr size_t kEthernetHeaderSize = 14;
 constexpr uint64_t kRepeatWindowMs = 500;
 constexpr size_t kRepeatLimit = 512;
 constexpr uint16_t kFirstDynamicPort = 49152;
@@ -362,6 +364,9 @@ struct SystemLink::State {
   std::map<uint32_t, QosLookup> qos_lookups;
   std::map<QosPair, std::chrono::steady_clock::time_point> qos_pairs;
   std::vector<secure::Frame> qos_outbound;
+  // Frames of a guest with its own network stack.
+  std::function<void(std::span<const uint8_t>)> frame_receiver;
+  std::vector<std::vector<uint8_t>> frames_out;
   // Hashes of recently received frames with their arrival time, oldest first.
   // Only the worker touches them.
   std::deque<std::pair<uint64_t, size_t>> recent;
@@ -393,9 +398,21 @@ struct SystemLink::State {
     threading::set_name("XNet System Link");
     while (!stop.stop_requested()) {
       std::vector<uint8_t> wire;
-      const bool received =
-          transport->Receive(wire, 25) && !Repeat(wire, Now());
+      const bool arrived = transport->Receive(wire, 25);
+      // Repeats too, since a guest stack can send the same frame twice.
+      if (arrived) {
+        std::function<void(std::span<const uint8_t>)> receiver;
+        {
+          std::lock_guard lock(mutex);
+          receiver = frame_receiver;
+        }
+        if (receiver) {
+          receiver(wire);
+        }
+      }
+      const bool received = arrived && !Repeat(wire, Now());
       std::vector<secure::Frame> outbound;
+      std::vector<std::vector<uint8_t>> frames;
       std::optional<secure::CrossPlatform> addressing;
       {
         std::lock_guard lock(mutex);
@@ -424,12 +441,18 @@ struct SystemLink::State {
         std::move(qos_outbound.begin(), qos_outbound.end(),
                   std::back_inserter(outbound));
         qos_outbound.clear();
+        frames = std::exchange(frames_out, {});
       }
       for (const auto& frame : outbound) {
         if (auto encoded = secure::EncodeFrame(frame, addressing)) {
           if (transport->Send(*encoded) != static_cast<int>(encoded->size())) {
             XELOGE("System Link packet transmission failed");
           }
+        }
+      }
+      for (const auto& frame : frames) {
+        if (transport->Send(frame) != static_cast<int>(frame.size())) {
+          XELOGE("System Link packet transmission failed");
         }
       }
     }
@@ -1583,13 +1606,16 @@ SystemLink::~SystemLink() {
   state_->transport->Wake();
   state_->worker.join();
   std::shared_ptr<secure::PacketTransport> transport;
+  std::function<void(std::span<const uint8_t>)> receiver;
   {
     // Lookups end without writing results once the System Link is gone.
     std::lock_guard lock(state_->mutex);
     state_->qos_lookups.clear();
-    // The transport closes even while ports and streams keep the state alive.
+    // The transport closes and the frame receiver goes even while ports and
+    // streams keep the state alive.
     transport =
         std::exchange(state_->transport, std::make_shared<ClosedTransport>());
+    receiver = std::exchange(state_->frame_receiver, nullptr);
   }
   Reset();
 }
@@ -1877,6 +1903,28 @@ std::unique_ptr<SystemLinkStream> SystemLink::CreateStream(uint32_t& error) {
     return nullptr;
   }
   return std::make_unique<Stream>(state_, std::make_shared<StreamState>());
+}
+
+void SystemLink::SetFrameReceiver(
+    std::function<void(std::span<const uint8_t>)> receive) {
+  // The old receiver goes once the lock is released.
+  std::lock_guard lock(state_->mutex);
+  std::swap(state_->frame_receiver, receive);
+}
+
+uint32_t SystemLink::SendFrame(std::span<const uint8_t> frame) {
+  std::lock_guard lock(state_->mutex);
+  if (!state_->transport->healthy()) {
+    return kWsaNetworkDown;
+  }
+  if (frame.size() < kEthernetHeaderSize ||
+      frame.size() > kEthernetHeaderSize + state_->transport->mtu() ||
+      state_->frames_out.size() >= kOutgoingFrameLimit) {
+    return kWsaNoBuffers;
+  }
+  state_->frames_out.emplace_back(frame.begin(), frame.end());
+  state_->transport->Wake();
+  return 0;
 }
 
 void SystemLink::Reset() {

@@ -589,8 +589,6 @@ std::vector<InputDeviceInfo> KeyboardInputDriver::EnumerateDevices() {
   info.driver_slot = 0;
   info.stable_id = "keyboard";
   info.display_name = "Keyboard";
-  // User must explicitly bind the keyboard via the menu.
-  info.auto_bind = false;
   return {info};
 }
 

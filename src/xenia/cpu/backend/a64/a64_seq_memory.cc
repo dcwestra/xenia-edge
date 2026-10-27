@@ -119,8 +119,7 @@ struct CACHE_CONTROL
       default:
         return;
     }
-    auto addr = ComputeMemoryAddress(e, i.src1);
-    e.add(e.x0, e.GetMembaseReg(), addr);
+    ComputeGuestHostAddress(e, e.x0, i.src1, 1, false);
     size_t cache_line_size = i.src2.value;
     if (is_clflush) {
       // dc civac, x0
@@ -206,12 +205,13 @@ struct GuestAddress {
 };
 
 template <typename Fn>
-static void EmitAccess(A64Emitter& e, const GuestAddress& addr,
-                       Fn&& emit_access) {
+static void EmitAccess(A64Emitter& e, const GuestAddress& addr, uint32_t size,
+                       bool is_write, Fn&& emit_access) {
   if (addr.displacement) {
-    EmitGuestMemAccessOffset(e, addr.base, *addr.displacement, emit_access);
+    EmitGuestMemAccessOffset(e, addr.base, *addr.displacement, size, is_write,
+                             emit_access);
   } else {
-    EmitGuestMemAccess(e, addr.base, emit_access);
+    EmitGuestMemAccess(e, addr.base, size, is_write, emit_access);
   }
 }
 
@@ -297,7 +297,7 @@ static void EmitStoreScalar(A64Emitter& e, const hir::Instr* instr,
 // ============================================================================
 static void EmitLoadI8(A64Emitter& e, const WReg& dest,
                        const GuestAddress& addr) {
-  EmitAccess(e, addr, [&](const auto& adr) { e.ldrb(dest, adr); });
+  EmitAccess(e, addr, 1, false, [&](const auto& adr) { e.ldrb(dest, adr); });
   if (IsTracingData()) {
     auto trace_addr = ComputeTraceAddress(e, addr);
     e.mov(e.w2, dest);
@@ -308,7 +308,7 @@ static void EmitLoadI8(A64Emitter& e, const WReg& dest,
 
 static void EmitLoadI16(A64Emitter& e, const hir::Instr* instr,
                         const WReg& dest, const GuestAddress& addr) {
-  EmitAccess(e, addr, [&](const auto& adr) { e.ldrh(dest, adr); });
+  EmitAccess(e, addr, 2, false, [&](const auto& adr) { e.ldrh(dest, adr); });
   if (instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
     e.rev16(dest, dest);
   }
@@ -330,7 +330,7 @@ static void EmitLoadI32(A64Emitter& e, const hir::Instr* instr,
     return;
   }
   auto load = [&] {
-    EmitAccess(e, addr, [&](const auto& adr) { e.ldr(dest, adr); });
+    EmitAccess(e, addr, 4, false, [&](const auto& adr) { e.ldr(dest, adr); });
     if (instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
       e.rev(dest, dest);
     }
@@ -358,7 +358,7 @@ static void EmitLoadI32(A64Emitter& e, const hir::Instr* instr,
 
 static void EmitLoadI64(A64Emitter& e, const hir::Instr* instr,
                         const XReg& dest, const GuestAddress& addr) {
-  EmitAccess(e, addr, [&](const auto& adr) { e.ldr(dest, adr); });
+  EmitAccess(e, addr, 8, false, [&](const auto& adr) { e.ldr(dest, adr); });
   if (instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
     e.rev(dest, dest);
   }
@@ -372,7 +372,7 @@ static void EmitLoadI64(A64Emitter& e, const hir::Instr* instr,
 
 static void EmitStoreI8(A64Emitter& e, const GuestAddress& addr,
                         const I8Op& value) {
-  EmitAccess(e, addr, [&](const auto& adr) {
+  EmitAccess(e, addr, 1, true, [&](const auto& adr) {
     if (value.is_constant) {
       e.mov(e.w17, static_cast<uint64_t>(value.constant() & 0xFF));
       e.strb(e.w17, adr);
@@ -390,7 +390,7 @@ static void EmitStoreI8(A64Emitter& e, const GuestAddress& addr,
 
 static void EmitStoreI16(A64Emitter& e, const hir::Instr* instr,
                          const GuestAddress& addr, const I16Op& value) {
-  EmitAccess(e, addr, [&](const auto& adr) {
+  EmitAccess(e, addr, 2, true, [&](const auto& adr) {
     EmitStoreScalar<uint16_t>(
         e, instr, value, e.w17,
         [&] { return static_cast<uint16_t>(value.constant()); },
@@ -415,7 +415,7 @@ static void EmitStoreI32(A64Emitter& e, const hir::Instr* instr,
     return;
   }
   auto store = [&] {
-    EmitAccess(e, addr, [&](const auto& adr) {
+    EmitAccess(e, addr, 4, true, [&](const auto& adr) {
       EmitStoreScalar<uint32_t>(
           e, instr, value, e.w17,
           [&] { return static_cast<uint32_t>(value.constant()); },
@@ -447,7 +447,7 @@ static void EmitStoreI32(A64Emitter& e, const hir::Instr* instr,
 
 static void EmitStoreI64(A64Emitter& e, const hir::Instr* instr,
                          const GuestAddress& addr, const I64Op& value) {
-  EmitAccess(e, addr, [&](const auto& adr) {
+  EmitAccess(e, addr, 8, true, [&](const auto& adr) {
     EmitStoreScalar<uint64_t>(
         e, instr, value, e.x17,
         [&] { return static_cast<uint64_t>(value.constant()); },
@@ -464,7 +464,7 @@ static void EmitStoreI64(A64Emitter& e, const hir::Instr* instr,
 
 static void EmitStoreF32(A64Emitter& e, const hir::Instr* instr,
                          const GuestAddress& addr, const F32Op& value) {
-  EmitAccess(e, addr, [&](const auto& adr) {
+  EmitAccess(e, addr, 4, true, [&](const auto& adr) {
     EmitStoreScalar<uint32_t>(
         e, instr, value, e.w17,
         [&] { return static_cast<uint32_t>(value.value->constant.i32); },
@@ -484,7 +484,7 @@ static void EmitStoreF32(A64Emitter& e, const hir::Instr* instr,
 
 static void EmitStoreF64(A64Emitter& e, const hir::Instr* instr,
                          const GuestAddress& addr, const F64Op& value) {
-  EmitAccess(e, addr, [&](const auto& adr) {
+  EmitAccess(e, addr, 8, true, [&](const auto& adr) {
     EmitStoreScalar<uint64_t>(
         e, instr, value, e.x17,
         [&] { return static_cast<uint64_t>(value.value->constant.i64); },
@@ -527,7 +527,7 @@ struct LOAD_I64 : Sequence<LOAD_I64, I<OPCODE_LOAD, I64Op, I64Op>> {
 };
 struct LOAD_F32 : Sequence<LOAD_F32, I<OPCODE_LOAD, F32Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    EmitGuestMemAccess(e, i.src1, [&](const auto& adr) {
+    EmitGuestMemAccess(e, i.src1, 4, false, [&](const auto& adr) {
       if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
         e.ldr(e.w0, adr);
         e.rev(e.w0, e.w0);
@@ -546,7 +546,7 @@ struct LOAD_F32 : Sequence<LOAD_F32, I<OPCODE_LOAD, F32Op, I64Op>> {
 };
 struct LOAD_F64 : Sequence<LOAD_F64, I<OPCODE_LOAD, F64Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    EmitGuestMemAccess(e, i.src1, [&](const auto& adr) {
+    EmitGuestMemAccess(e, i.src1, 8, false, [&](const auto& adr) {
       if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
         e.ldr(e.x0, adr);
         e.rev(e.x0, e.x0);
@@ -565,7 +565,8 @@ struct LOAD_F64 : Sequence<LOAD_F64, I<OPCODE_LOAD, F64Op, I64Op>> {
 };
 struct LOAD_V128 : Sequence<LOAD_V128, I<OPCODE_LOAD, V128Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    EmitGuestMemAccess(e, i.src1, [&](const auto& adr) { e.ldr(i.dest, adr); });
+    EmitGuestMemAccess(e, i.src1, 16, false,
+                       [&](const auto& adr) { e.ldr(i.dest, adr); });
     if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
       // Reverse bytes within each 32-bit word (PPC BE -> ARM64 LE).
       auto idx = i.dest.reg().getIdx();
@@ -624,7 +625,7 @@ struct STORE_V128
       e.rev32(VReg16B(0), VReg16B(src_idx));
       src_idx = 0;
     }
-    EmitGuestMemAccess(e, i.src1,
+    EmitGuestMemAccess(e, i.src1, 16, true,
                        [&](const auto& adr) { e.str(QReg(src_idx), adr); });
     if (IsTracingData()) {
       auto trace_addr = ComputeMemoryAddress(e, i.src1);
@@ -765,9 +766,8 @@ struct MEMSET_I64
     assert_true(i.src2.constant() == 0);
     // memset(membase + guest_addr, 0, length)
     // Only used by dcbz/dcbz128: constant zero value, constant aligned size.
-    auto addr = ComputeMemoryAddress(e, i.src1);
-    e.add(e.x0, e.GetMembaseReg(), addr);
     const uint64_t len = i.src3.constant();
+    ComputeGuestHostAddress(e, e.x0, i.src1, uint32_t(len), true);
     uint64_t off = 0;
 
     // Use `dc zva` if it writes more bytes at a time than STP
@@ -819,8 +819,7 @@ struct ATOMIC_COMPARE_EXCHANGE_I32
                I<OPCODE_ATOMIC_COMPARE_EXCHANGE, I8Op, I64Op, I32Op, I32Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
     // Compute full host address (ldxr/stxr need base-only [Xn] addressing).
-    auto addr = ComputeMemoryAddress(e, i.src1);
-    e.add(e.x4, e.GetMembaseReg(), addr);
+    ComputeGuestHostAddress(e, e.x4, i.src1, 4, true);
     // src2 = expected (use w5), src3 = desired (use w6).
     if (i.src2.is_constant) {
       e.mov(e.w5,
@@ -864,8 +863,7 @@ struct ATOMIC_COMPARE_EXCHANGE_I64
     : Sequence<ATOMIC_COMPARE_EXCHANGE_I64,
                I<OPCODE_ATOMIC_COMPARE_EXCHANGE, I8Op, I64Op, I64Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    auto addr = ComputeMemoryAddress(e, i.src1);
-    e.add(e.x4, e.GetMembaseReg(), addr);
+    ComputeGuestHostAddress(e, e.x4, i.src1, 8, true);
     if (i.src2.is_constant) {
       e.mov(e.x5, static_cast<uint64_t>(i.src2.constant()));
     } else {
@@ -1008,9 +1006,15 @@ struct RESERVED_LOAD_I32
     : Sequence<RESERVED_LOAD_I32, I<OPCODE_RESERVED_LOAD, I32Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
     const WReg guest_address = GuestAddressReg(e, i.src1, e.w12);
-    auto addr = ComputeMemoryAddress(e, i.src1);
-    EmitTryAcquireReservation(e, guest_address);
-    e.ldr(i.dest, ptr(e.GetMembaseReg(), addr));
+    if (e.guest_tlb()) {
+      EmitTryAcquireReservation(e, guest_address);
+      EmitGuestMemAccess(e, i.src1, 4, false,
+                         [&](const auto& adr) { e.ldr(i.dest, adr); });
+    } else {
+      auto addr = ComputeMemoryAddress(e, i.src1);
+      EmitTryAcquireReservation(e, guest_address);
+      e.ldr(i.dest, ptr(e.GetMembaseReg(), addr));
+    }
     e.mov(e.w0, i.dest);
     e.str(e.x0, ptr(e.GetBackendCtxReg(),
                     BackendCtxOffset(
@@ -1021,9 +1025,15 @@ struct RESERVED_LOAD_I64
     : Sequence<RESERVED_LOAD_I64, I<OPCODE_RESERVED_LOAD, I64Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
     const WReg guest_address = GuestAddressReg(e, i.src1, e.w12);
-    auto addr = ComputeMemoryAddress(e, i.src1);
-    EmitTryAcquireReservation(e, guest_address);
-    e.ldr(i.dest, ptr(e.GetMembaseReg(), addr));
+    if (e.guest_tlb()) {
+      EmitTryAcquireReservation(e, guest_address);
+      EmitGuestMemAccess(e, i.src1, 8, false,
+                         [&](const auto& adr) { e.ldr(i.dest, adr); });
+    } else {
+      auto addr = ComputeMemoryAddress(e, i.src1);
+      EmitTryAcquireReservation(e, guest_address);
+      e.ldr(i.dest, ptr(e.GetMembaseReg(), addr));
+    }
     e.str(i.dest, ptr(e.GetBackendCtxReg(),
                       BackendCtxOffset(
                           offsetof(A64BackendContext, cached_reserve_value_))));
@@ -1130,8 +1140,7 @@ struct RESERVED_STORE_I32
                I<OPCODE_RESERVED_STORE, I8Op, I64Op, I32Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
     const WReg guest_address = GuestAddressReg(e, i.src1, e.w12);
-    auto addr = ComputeMemoryAddress(e, i.src1);
-    e.add(e.x1, e.GetMembaseReg(), addr);
+    ComputeGuestHostAddress(e, e.x1, i.src1, 4, true);
     if (i.src2.is_constant) {
       e.mov(e.w2,
             static_cast<uint64_t>(static_cast<uint32_t>(i.src2.constant())));
@@ -1146,8 +1155,7 @@ struct RESERVED_STORE_I64
                I<OPCODE_RESERVED_STORE, I8Op, I64Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
     const WReg guest_address = GuestAddressReg(e, i.src1, e.w12);
-    auto addr = ComputeMemoryAddress(e, i.src1);
-    e.add(e.x1, e.GetMembaseReg(), addr);
+    ComputeGuestHostAddress(e, e.x1, i.src1, 8, true);
     if (i.src2.is_constant) {
       e.mov(e.x2, static_cast<uint64_t>(i.src2.constant()));
     } else {

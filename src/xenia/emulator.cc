@@ -879,9 +879,13 @@ bool Emulator::KeepsXboxGame(const std::filesystem::path& path) const {
 }
 
 // Whether an executable is xbox.xex, which picks the XeFu build for a game.
-// The builds share its title ID but not its original PE name.
+// The builds share its title ID but not its bounding path, and older xbox.xex
+// releases have no original PE name.
 static bool IsXeFuDispatcher(const std::optional<vfs::XexMetadata>& xex) {
-  return xex && xe::utf8::equal_case(xex->module_name, "xboxc.exe");
+  return xex &&
+         xe::utf8::equal_case(
+             xex->bounding_path,
+             "\\Device\\Harddisk0\\SystemPartition\\Compatibility\\xbox.xex");
 }
 
 X_STATUS Emulator::LaunchXboxOriginal(const std::filesystem::path& path,
@@ -2009,12 +2013,6 @@ bool Emulator::ExceptionCallback(Exception* ex) {
   }
 
   // Within range. Log the crash and suspend the faulting thread.
-  // Only pause the entire emulator if debugging is enabled.
-  if (cvars::debug) {
-    Pause();
-  }
-
-  // Dump information into the log.
   auto current_thread = kernel::XThread::GetCurrentThread();
   assert_not_null(current_thread);
 
@@ -2073,6 +2071,14 @@ bool Emulator::ExceptionCallback(Exception* ex) {
                     context->v[i].u32[2], context->v[i].u32[3]));
   }
   XELOGE("{}", crash_msg);
+  FlushLog();
+
+  // Only pause the entire emulator if debugging is enabled. After the dump,
+  // since Pause() can block (e.g. waiting on the GPU/audio systems).
+  if (cvars::debug) {
+    Pause();
+  }
+
   std::string crash_dlg = fmt::format(
       "The guest has crashed.\n\n"
       "Xenia has now paused itself.\n\n"

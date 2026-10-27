@@ -497,9 +497,10 @@ dword_result_t KeDelayExecutionThread_entry(dword_t processor_mode,
                                             lpqword_t interval_ptr,
                                             const ppc_context_t& context) {
   SCOPE_profile_cpu_i("guestsync", "KeDelayExecutionThread");
+  // The kernel reads the interval unconditionally, so a null one faults on the
+  // console. Yield rather than crash the host.
   uint64_t interval = interval_ptr ? static_cast<uint64_t>(*interval_ptr) : 0u;
-  return KeDelayExecutionThread(processor_mode, alertable,
-                                interval_ptr ? &interval : nullptr, context);
+  return KeDelayExecutionThread(processor_mode, alertable, &interval, context);
 }
 DECLARE_XBOXKRNL_EXPORT3(KeDelayExecutionThread, kThreading, kImplemented,
                          kBlocking, kHighFrequency);
@@ -1030,21 +1031,17 @@ dword_result_t NtSetTimerEx_entry(dword_t timer_handle, lpqword_t due_time_ptr,
 DECLARE_XBOXKRNL_EXPORT1(NtSetTimerEx, kThreading, kImplemented);
 
 dword_result_t NtCancelTimer_entry(dword_t timer_handle,
-                                   lpdword_t current_state_ptr) {
-  X_STATUS result = X_STATUS_SUCCESS;
-
+                                   pointer_t<uint8_t> current_state_ptr) {
   auto timer =
       kernel_state()->object_table()->LookupObject<XTimer>(timer_handle);
-  if (timer) {
-    result = timer->Cancel();
-  } else {
-    result = X_STATUS_INVALID_HANDLE;
+  if (!timer) {
+    return X_STATUS_INVALID_HANDLE;
   }
+  // The BOOLEAN signal state, which cancelling leaves as it is.
   if (current_state_ptr) {
-    *current_state_ptr = 0;
+    *current_state_ptr = timer->IsSignaled() ? 1 : 0;
   }
-
-  return result;
+  return timer->Cancel();
 }
 DECLARE_XBOXKRNL_EXPORT1(NtCancelTimer, kThreading, kImplemented);
 
@@ -1531,10 +1528,9 @@ static bool ProcessApcList(PPCContext* ctx, X_KTHREAD* current_thread,
   ctx->r[1] = old_stack_pointer - 32;
 
   while (!apc_queue.empty(ctx)) {
-    uint32_t apc_ptr = apc_queue.flink_ptr;
-
     XAPC* apc = apc_queue.ListEntryObject(
-        ctx->TranslateVirtual<X_LIST_ENTRY*>(apc_ptr));
+        ctx->TranslateVirtual<X_LIST_ENTRY*>(apc_queue.flink_ptr));
+    uint32_t apc_ptr = ctx->HostToGuestVirtual(apc);
 
     uint8_t* scratch_ptr = ctx->TranslateVirtual(scratch_address);
     xe::store_and_swap<uint32_t>(scratch_ptr + 0, apc->normal_routine);
@@ -1760,7 +1756,19 @@ uint32_t xeKeInsertQueueApc(XAPC* apc, uint32_t arg1, uint32_t arg2,
 dword_result_t KeInsertQueueApc_entry(pointer_t<XAPC> apc, lpvoid_t arg1,
                                       lpvoid_t arg2, dword_t priority_increment,
                                       const ppc_context_t& context) {
-  return xeKeInsertQueueApc(apc, arg1, arg2, priority_increment, context);
+  auto kpcr = context->TranslateVirtualGPR<X_KPCR*>(context->r[13]);
+  const bool kernel_apc_to_self =
+      apc->apc_mode == 0 &&
+      context->TranslateVirtual<X_KTHREAD*>(apc->thread_ptr) ==
+          context->TranslateVirtual(kpcr->prcb_data.current_thread);
+  uint32_t result =
+      xeKeInsertQueueApc(apc, arg1, arg2, priority_increment, context);
+  // Lowering IRQL as the APC lock is released runs a kernel APC queued to this
+  // thread.
+  if (result && kernel_apc_to_self) {
+    xeProcessKernelApcs(context);
+  }
+  return result;
 }
 DECLARE_XBOXKRNL_EXPORT1(KeInsertQueueApc, kThreading, kImplemented);
 

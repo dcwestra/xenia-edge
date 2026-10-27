@@ -4490,18 +4490,21 @@ bool D3D12CommandProcessor::UpdateBindingsMesa(
     auto color_info = regs.Get<reg::RB_COLOR_INFO>(
         reg::RB_COLOR_INFO::rt_register_indices[i]);
     int32_t color_exp_bias = color_info.color_exp_bias;
+    float color_exp_bias_scale = xe::memory::Reinterpret<float>(
+        int32_t(0x3F800000 + (color_exp_bias << 23)));
     if ((color_info.color_format == xenos::ColorRenderTargetFormat::k_16_16 ||
          color_info.color_format ==
              xenos::ColorRenderTargetFormat::k_16_16_16_16) &&
         render_target_cache_->GetPath() ==
             RenderTargetCache::Path::kHostRenderTargets &&
         !render_target_cache_->IsFixed16TruncatedToMinus1To1()) {
-      // Remap from -32...32 to -1...1, getting the full range. In the FSI path
-      // the EDRAM store handles the format, so the bias must not be applied.
-      color_exp_bias -= 5;
+      // Remap to -1...1 by scaling the output values by 1024/32767, losing
+      // blending correctness, but getting the full range apart from -32,
+      // which SNORM folds into -32767/1024. In the FSI path the EDRAM store
+      // handles the format, so the scale must not be applied.
+      color_exp_bias_scale *= 1024.0f / 32767.0f;
     }
-    sc.color_exp_bias[i] = xe::memory::Reinterpret<float>(
-        int32_t(0x3F800000 + (color_exp_bias << 23)));
+    sc.color_exp_bias[i] = color_exp_bias_scale;
   }
 
   // Host depth polygon offset (applied in the pixel shader when depth is not

@@ -259,8 +259,7 @@ class BaseHeap {
     return access;
   }
 
-  // Queries the currently strictest readability and writability for the entire
-  // range.
+  // Queries access across committed pages in the inclusive address range.
   xe::memory::PageAccess QueryRangeAccess(uint32_t low_address,
                                           uint32_t high_address);
 
@@ -771,12 +770,30 @@ class Memory {
   // Claims the address space user mode code runs in, which starts empty.
   bool EnableUserModeViews();
 
-  // Drops every page mapped through the page table, which flushing the TB does.
+  // Drops every page mapped through the page table, which flushing the entire
+  // TB does.
   void FlushUserPageTable();
+  // Drops the pages mapped through the page table whose entries changed since
+  // they were mapped, which flushing the user mode TB does.
+  void FlushChangedUserPages();
 
   // Base of the user mode address space, null until it is created.
   inline uint8_t* user_virtual_membase() const {
     return user_virtual_membase_.load(std::memory_order_relaxed);
+  }
+
+  // On hosts whose pages hold more than one 4 KB page, JIT code translates
+  // guest addresses through tables of host_address - guest_address per 4 KB
+  // guest page, indexed by guest_address >> 12. Null on other hosts.
+  static constexpr uint32_t kGuestTlbEntryCount = 0x100000;
+  const uint64_t* kernel_tlb() const { return guest_tlbs_; }
+  const uint64_t* user_tlb(bool write) const {
+    return guest_tlbs_ ? guest_tlbs_ + kGuestTlbEntryCount * (write ? 2 : 1)
+                       : nullptr;
+  }
+  // Whether the tables are filled, which happens with the user mode views.
+  bool guest_tlbs_active() const {
+    return guest_tlbs_ && user_virtual_membase_.load(std::memory_order_acquire);
   }
 
   // The kernel address with the same contents as a user mode address.
@@ -824,6 +841,12 @@ class Memory {
     return const_cast<BaseHeap*>(
         const_cast<const Memory*>(this)->LookupHeap(address));
   }
+
+  // Queries access across committed pages in a guest virtual address range.
+  // Empty, overflowing, unmapped, or cross-heap ranges return kNoAccess.
+  // Returns kReadWrite if all pages are readable and writable, kReadOnly if
+  // all are readable, and kNoAccess otherwise.
+  xe::memory::PageAccess QueryRangeAccess(uint32_t address, uint32_t length);
 
   // Gets the heap with the given properties.
   BaseHeap* LookupHeapByType(bool physical, uint32_t page_size);
@@ -880,12 +903,68 @@ class Memory {
   // Maps the page a fault at |window_offset| falls in, under the lock.
   // Without |allow_fallback|, a page the table doesn't map stays unmapped.
   bool MapUserPage(uint32_t window_offset, bool allow_fallback);
-  // Maps user mode page |index| as one 4 KB view per entry, for entries no
-  // single view can show. Entries the table doesn't have stay unmapped and
-  // fault. Under the lock.
+  // Shows user mode page |index| per 4 KB piece, for entries no single view can
+  // show. Entries the table doesn't have stay unshown and fault. Under the
+  // lock.
   bool SplitUserPage(uint32_t index);
-  // Maps one 4 KB piece of a split page. Under the lock.
+  // Shows one 4 KB piece of a split page, in a view of its own on 4 KB hosts
+  // and through its host page on others. Under the lock.
   bool MapUserPiece(uint32_t piece, bool allow_fallback);
+  // Unmaps user mode page |index| and forgets what its pieces showed. Under
+  // the lock.
+  void ReleaseUserPage(uint32_t index);
+  // The descriptor and table words the translation of |piece| reads: kind,
+  // table frame and entry. Under the lock.
+  uint64_t UserPieceTableKey(uint32_t piece);
+  // The file offset and access a piece shows, from its entry or, with
+  // |allow_fallback|, the kernel address space. Under the lock.
+  bool ResolveUserPiece(uint32_t piece, bool allow_fallback,
+                        uint64_t* out_file_offset, bool* out_from_entry,
+                        xe::memory::PageAccess* out_access);
+  // Whether host pages hold more than one piece, so a split page is shown per
+  // host page and the rest is emulated.
+  bool UserHostPagesCoarse() const {
+    return system_page_size_ > kUserSmallPageSize;
+  }
+  uint32_t UserPiecesPerHostPage() const {
+    return system_page_size_ / kUserSmallPageSize;
+  }
+  // Maps the host page from |first_piece| as one view if its pieces show
+  // consecutive file pages. Under the lock.
+  void MapUserHostPage(uint32_t first_piece);
+  void SetUserHostPagesView(uint32_t first_piece, uint32_t count, bool view);
+  // Whether the host page holding |piece| is a view, always false on host pages
+  // of one piece.
+  bool UserHostPageIsView(uint32_t piece) const {
+    if (!UserHostPagesCoarse()) {
+      return false;
+    }
+    const uint32_t host_page = piece / UserPiecesPerHostPage();
+    return (user_host_page_view_[host_page / 64] >> (host_page % 64)) & 1;
+  }
+  // Protects the host pages holding |count| pieces from |first_piece| to the
+  // strictest access of their pieces. Under the lock.
+  void ProtectUserHostPages(uint32_t first_piece, uint32_t count);
+  // Protects the host memory showing |piece| after its access changed. Under
+  // the lock.
+  void ProtectUserPiece(uint32_t piece);
+  // Commits the guest address tables and points every entry at the kernel
+  // membase or |user_membase|.
+  bool FillGuestTlbs(uint8_t* user_membase);
+  // Points the user table entries of |count| pieces from |first_piece| at what
+  // the pieces show and allow. Under the lock.
+  void UpdateUserTlb(uint32_t first_piece, uint32_t count);
+  // Handles a fault at |window_offset| in the user mode views. Under the lock.
+  bool UserAccessViolation(global_unique_lock_type& global_lock_locked_once,
+                           uint32_t window_offset, bool is_write,
+                           Exception* ex);
+  // Runs the faulting access to a piece that allows it against the memory the
+  // piece shows. Under the lock.
+  bool EmulateUserAccess(global_unique_lock_type& global_lock_locked_once,
+                         Exception* ex);
+  static uint8_t* TranslateEmulatedUserAccess(void* context, uint64_t address,
+                                              bool is_write, size_t* span,
+                                              bool* natively_readable);
   // Records the physical memory |count| user mode pieces from |first_piece|
   // show. Under the lock.
   void TrackUserPieces(uint32_t first_piece, uint32_t count,
@@ -896,8 +975,8 @@ class Memory {
   // changed bit, and the write watch on the physical page it shows. Under the
   // lock.
   xe::memory::PageAccess UserPieceAccess(uint32_t piece) const;
-  // Protects |count| pieces from |first_piece|, mapped read-write, to their
-  // UserPieceAccess. Under the lock.
+  // Protects |count| pieces from |first_piece| to their UserPieceAccess,
+  // read-write ones included. Under the lock.
   void ProtectUserPieces(uint32_t first_piece, uint32_t count);
   // Write protects the range's physical pages in every user mode page that
   // shows them. Takes the lock.
@@ -1013,7 +1092,7 @@ class Memory {
   uint32_t user_page_table_ = 0;
   // One bit per user mode page mapped from the table, under the global lock.
   std::vector<uint64_t> user_page_mapped_;
-  // The split pages among them, with a bit per 4 KB piece that has a view.
+  // The split pages among them, with a bit per 4 KB piece that is shown.
   std::unordered_map<uint32_t, uint16_t> user_page_split_;
   // The user mode views are one more alias of physical memory and writes
   // through them have to reach the same watches. All under the global lock.
@@ -1023,6 +1102,9 @@ class Memory {
   // The PageAccess each piece's entry allows user mode, read-write where no
   // entry applies.
   std::vector<uint8_t> user_piece_access_;
+  // The UserPieceTableKey of each piece when it was mapped, or UINT64_MAX to
+  // drop it at the next flush.
+  std::vector<uint64_t> user_piece_table_key_;
   // The user mode pieces showing a page in each physical 64 KB block.
   std::vector<std::vector<uint32_t>> user_block_pieces_;
   // A bit per physical 4 KB page whose next user mode write is reported.
@@ -1030,7 +1112,20 @@ class Memory {
   // A bit per 4 KB piece whose entry allows writes with its changed bit clear,
   // kept read-only so its first write can set the bit.
   std::vector<uint64_t> user_piece_unchanged_;
-  bool user_write_watches_ = false;
+  // On host pages bigger than a piece, the file page each piece shows, and a
+  // bit per host page mapped as a view. An access to any other host page is
+  // emulated through user_file_alias_, which maps the whole file.
+  std::vector<uint32_t> user_piece_file_page_;
+  std::vector<uint64_t> user_host_page_view_;
+  static constexpr uint64_t kUserFileAliasSize = 0x120000000ull;
+  uint8_t* user_file_alias_ = nullptr;
+  // The kernel, user read and user write tables. A user entry points into
+  // user_file_alias_ where its piece allows the access, else at the window.
+  // TODO(has207): a thread can use an entry briefly after it changes, missing
+  // a new watch or reaching a flushed page.
+  static constexpr size_t kGuestTlbsSize =
+      size_t(kGuestTlbEntryCount) * 3 * sizeof(uint64_t);
+  uint64_t* guest_tlbs_ = nullptr;
   std::atomic<UserFaultHook> user_fault_hook_{nullptr};
 
   std::unique_ptr<cpu::MMIOHandler> mmio_handler_;

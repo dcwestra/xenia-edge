@@ -9,7 +9,13 @@ it into one XEX, built with `tools/xex`, with a fixed executor that makes the
 calls and records r3, the memory each call writes and overlapped completions.
 `run.py` runs that XEX on an RGH console over XBDM (XeCLI `rgh.exe`) or in the
 Release build of Xenia, and compares runs. The expected results checked in under
-`src/xenia/kernel/xam/testing/xam__gen_<corpus>.json` come from a console.
+`src/xenia/kernel/xam/testing/xam__gen_<corpus>.json`, or
+`src/xenia/kernel/xboxkrnl/testing/xboxkrnl__gen_<corpus>.json` for a corpus of
+kernel exports, come from a console.
+
+Where an export takes a callback, a step passes a recorder, which logs the
+arguments it's called with into the arena for a capture. A step marked `void`
+calls an export that returns nothing, so its r3 isn't compared.
 
 ```
 python3 tools/xamgen/xamgen.py build tools/xamgen/corpus/content.py OUT

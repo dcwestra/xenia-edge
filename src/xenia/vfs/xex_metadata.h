@@ -48,6 +48,8 @@ struct XexVersion {
 struct XexMetadata {
   XexFormat format = XexFormat::kUnknown;
   std::string module_name;
+  // The only path the executable may load from.
+  std::string bounding_path;
 
   // From XEX_HEADER_EXECUTION_INFO
   uint32_t title_id = 0;

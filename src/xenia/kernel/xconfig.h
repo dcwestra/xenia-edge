@@ -10,6 +10,7 @@
 #ifndef XENIA_KERNEL_XCONFIG_H_
 #define XENIA_KERNEL_XCONFIG_H_
 
+#include <array>
 #include <concepts>
 #include <cstdint>
 #include <map>
@@ -402,8 +403,11 @@ concept XConfigValidValueType =
 
 class XConfig {
  public:
-  XConfig() = default;
+  XConfig();
   ~XConfig() = default;
+
+  // The console's network adapter.
+  const std::array<uint8_t, 6>& mac_address() const { return mac_address_; }
 
   // Reads a setting's raw (guest big-endian) bytes into |buffer|.
   void ReadSetting(const X_CONFIG_CATEGORY category, const uint16_t setting_id,
@@ -428,6 +432,9 @@ class XConfig {
 
   uint16_t GetSettingSize(const X_CONFIG_CATEGORY category,
                           const uint16_t setting_id);
+
+ private:
+  std::array<uint8_t, 6> mac_address_;
 };
 
 }  // namespace kernel

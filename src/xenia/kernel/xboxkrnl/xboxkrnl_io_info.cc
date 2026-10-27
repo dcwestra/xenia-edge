@@ -17,6 +17,7 @@
 #include "xenia/kernel/info/volume.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
+#include "xenia/kernel/xboxkrnl/xboxkrnl_ob.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
 #include "xenia/kernel/xfile.h"
 #include "xenia/vfs/device.h"
@@ -168,6 +169,11 @@ dword_result_t NtQueryInformationFile_entry(
       out_length = sizeof(*info);
       break;
     }
+    case XFileBasicInformation:
+      // The file system takes it to set but not to query.
+      status = X_STATUS_INVALID_PARAMETER;
+      out_length = 0;
+      break;
     default: {
       // Unsupported, for now.
       assert_always();
@@ -177,7 +183,8 @@ dword_result_t NtQueryInformationFile_entry(
     }
   }
 
-  if (io_status_block_ptr) {
+  // A failed request leaves the status block alone.
+  if (io_status_block_ptr && XSUCCEEDED(status)) {
     io_status_block_ptr->status = status;
     io_status_block_ptr->information = out_length;
   }
@@ -235,11 +242,17 @@ dword_result_t NtSetInformationFile_entry(
   }
 
   X_STATUS result = X_STATUS_SUCCESS;
-  uint32_t out_length;
 
   switch (info_class) {
     case XFileBasicInformation: {
       auto info = info_ptr.as<X_FILE_BASIC_INFORMATION*>();
+      // Of the attributes only the directory bit is kept, which a file can't
+      // take.
+      if ((info->attributes & vfs::kFileAttributeDirectory) &&
+          !(file->entry()->attributes() & vfs::kFileAttributeDirectory)) {
+        result = X_STATUS_INVALID_PARAMETER;
+        break;
+      }
 
       // The host calls can block on a slow drive.
       bool basic_result = true;
@@ -259,22 +272,21 @@ dword_result_t NtSetInformationFile_entry(
               basic_result &=
                   file->entry()->SetWriteTimestamp(info->last_write_time);
             }
-
-            basic_result &= file->entry()->SetAttributes(info->attributes);
           },
           GuestScheduler::BlockingCallClass::kConcurrent);
       if (!basic_result) {
         result = X_STATUS_UNSUCCESSFUL;
       }
 
-      out_length = sizeof(*info);
       break;
     }
     case XFileRenameInformation: {
       auto info = info_ptr.as<X_FILE_RENAME_INFORMATION*>();
       // Compute path, possibly attrs relative.
-      std::filesystem::path target_path =
+      auto target_name =
           util::TranslateAnsiPath(kernel_memory(), &info->ansi_string);
+      xeObStripDosDevicesPrefix(target_name);
+      std::filesystem::path target_path = target_name;
 
       // Place IsValidPath in path from where it can be accessed everywhere
       if (!IsValidPath(xe::path_to_utf8(target_path), false)) {
@@ -286,14 +298,12 @@ dword_result_t NtSetInformationFile_entry(
       }
 
       result = file->Rename(target_path, info->replace_existing != 0);
-      out_length = sizeof(*info);
       break;
     }
     case XFileDispositionInformation: {
       auto info = info_ptr.as<X_FILE_DISPOSITION_INFORMATION*>();
       bool delete_on_close = info->delete_file ? true : false;
       file->entry()->SetForDeletion(static_cast<bool>(info->delete_file));
-      out_length = 0;
       XELOGW("NtSetInformationFile set deleting flag for {} on close to: {}",
              file->name(), delete_on_close);
       break;
@@ -301,12 +311,10 @@ dword_result_t NtSetInformationFile_entry(
     case XFilePositionInformation: {
       auto info = info_ptr.as<X_FILE_POSITION_INFORMATION*>();
       file->set_position(info->current_byte_offset);
-      out_length = sizeof(*info);
       break;
     }
     case XFileAllocationInformation: {
       auto info = info_ptr.as<X_FILE_ALLOCATION_INFORMATION*>();
-      out_length = sizeof(*info);
       if (!(file->file_access() &
             (xe::filesystem::FileAccess::kGenericWrite |
              xe::filesystem::FileAccess::kFileWriteData))) {
@@ -339,7 +347,6 @@ dword_result_t NtSetInformationFile_entry(
     case XFileEndOfFileInformation: {
       auto info = info_ptr.as<X_FILE_END_OF_FILE_INFORMATION*>();
       result = file->SetLength(info->end_of_file);
-      out_length = sizeof(*info);
 
       // Update the files vfs::Entry information
       kernel_state()->RunBlockingIo(
@@ -352,7 +359,6 @@ dword_result_t NtSetInformationFile_entry(
       auto info = info_ptr.as<X_FILE_COMPLETION_INFORMATION*>();
       auto handle = uint32_t(info->handle);
       auto key = uint32_t(info->key);
-      out_length = sizeof(*info);
       auto port =
           kernel_state()->object_table()->LookupObject<XIOCompletion>(handle);
       // Only an async handle binds to a port. It binds once.
@@ -368,13 +374,13 @@ dword_result_t NtSetInformationFile_entry(
     default:
       // Unsupported, for now.
       assert_always();
-      out_length = 0;
       break;
   }
 
-  if (io_status_block) {
+  // A failed request leaves the status block alone.
+  if (io_status_block && XSUCCEEDED(result)) {
     io_status_block->status = result;
-    io_status_block->information = out_length;
+    io_status_block->information = 0;
   }
 
   return result;

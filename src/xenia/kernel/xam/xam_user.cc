@@ -7,7 +7,9 @@
  ******************************************************************************
  */
 
-#include <ranges>
+#include <cstdlib>
+#include <iterator>
+#include <utility>
 
 #include "xenia/base/logging.h"
 #include "xenia/emulator.h"
@@ -114,9 +116,10 @@ X_HRESULT_result_t XamUserGetSigninInfo_entry(
   }
 
   info.Zero();
+  info->sponsor_user_index = XUserIndexNone;
 
   if (user_index >= XUserMaxUserCount) {
-    return X_E_NO_SUCH_USER;
+    return X_E_INVALIDARG;
   }
 
   if (!kernel_state()->xam_state()->IsUserSignedIn(user_index)) {
@@ -149,12 +152,13 @@ DECLARE_XAM_EXPORT1(XamUserGetSigninInfo, kUserProfiles, kImplemented);
 
 dword_result_t XamUserGetName_entry(dword_t user_index, dword_t buffer,
                                     dword_t buffer_len) {
+  // Based on XAM only first byte is cleared on failure.
   if (user_index >= XUserMaxUserCount) {
+    kernel_memory()->Zero(buffer, 1);
     return X_ERROR_INVALID_PARAMETER;
   }
 
   if (!kernel_state()->xam_state()->IsUserSignedIn(user_index)) {
-    // Based on XAM only first byte is cleared in case of lack of user.
     kernel_memory()->Zero(buffer, 1);
     return X_ERROR_NO_SUCH_USER;
   }
@@ -258,6 +262,13 @@ uint32_t XamUserReadProfileSettingsEx(
   auto run = [=](uint32_t& extended_error, uint32_t& length) {
     extended_error = 0;
     length = 0;
+
+    // An XUID array with no XUIDs or more than 16 fails after the buffer size
+    // check.
+    if (xuids && (!xuid_count || xuid_count > 16)) {
+      extended_error = X_E_INVALIDARG;
+      return X_ERROR_FUNCTION_FAILED;
+    }
 
     auto user_profile = kernel_state()->xam_state()->GetUserProfile(user_index);
 
@@ -417,8 +428,8 @@ dword_result_t XamUserWriteProfileSettings_entry(
 }
 DECLARE_XAM_EXPORT1(XamUserWriteProfileSettings, kUserProfiles, kImplemented);
 
-dword_result_t XamUserCheckPrivilege_entry(dword_t user_index, dword_t mask,
-                                           lpdword_t out_value) {
+X_RESULT CheckUserPrivilege(uint32_t user_index, uint32_t mask,
+                            uint32_t* out_value) {
   *out_value = 0;
 
   // With no Live service, a user signed in to Live holds every Live privilege.
@@ -458,48 +469,142 @@ dword_result_t XamUserCheckPrivilege_entry(dword_t user_index, dword_t mask,
   *out_value = granted;
   return X_ERROR_SUCCESS;
 }
+
+dword_result_t XamUserCheckPrivilege_entry(dword_t user_index, dword_t mask,
+                                           lpdword_t out_value) {
+  uint32_t value;
+  const X_RESULT result = CheckUserPrivilege(user_index, mask, &value);
+  *out_value = value;
+  return result;
+}
 DECLARE_XAM_EXPORT1(XamUserCheckPrivilege, kUserProfiles, kSketchy);
 
 dword_result_t XamUserContentRestrictionGetFlags_entry(dword_t user_index,
                                                        lpdword_t out_flags) {
+  if (user_index >= XUserMaxUserCount && user_index != XUserIndexAny) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
+  // No restrictions? Written before the user is checked.
+  *out_flags = 0;
+
   if (!kernel_state()->xam_state()->IsUserSignedIn(user_index)) {
     return X_ERROR_NO_SUCH_USER;
   }
 
-  // No restrictions?
-  *out_flags = 0;
   return X_ERROR_SUCCESS;
 }
 DECLARE_XAM_EXPORT1(XamUserContentRestrictionGetFlags, kUserProfiles, kStub);
 
-dword_result_t XamUserContentRestrictionGetRating_entry(dword_t user_index,
-                                                        dword_t unk1,
-                                                        lpdword_t out_unk2,
-                                                        lpdword_t out_unk3) {
-  if (!kernel_state()->xam_state()->IsUserSignedIn(user_index)) {
-    return X_ERROR_NO_SUCH_USER;
+// The rating system and highest allowed rating settings per content type:
+// games, movies, TV, explicit video and unrated video.
+constexpr std::pair<uint16_t, uint16_t> kContentRestrictionSettings[] = {
+    {XCONFIG_USER_PC_GAME_RATING, XCONFIG_USER_PC_GAME},
+    {XCONFIG_USER_PC_MOVIE_RATING, XCONFIG_USER_PC_MOVIE},
+    {XCONFIG_USER_PC_TV_RATING, XCONFIG_USER_PC_TV},
+    {XCONFIG_USER_PC_EXPLICIT_VIDEO_RATING, XCONFIG_USER_PC_EXPLICIT_VIDEO},
+    {XCONFIG_USER_PC_UNRATED_VIDEO_RATING, XCONFIG_USER_PC_UNRATED_VIDEO}};
+constexpr uint32_t kContentTypeExplicitVideo = 3;
+// Explicit video also needs this privilege.
+constexpr uint32_t kExplicitVideoPrivilege = 0xED;
+
+X_RESULT GetContentRestrictionRating(uint32_t user_index, uint32_t content_type,
+                                     uint32_t* rating_system,
+                                     uint32_t* max_rating) {
+  if (user_index >= XUserMaxUserCount && user_index != XUserIndexAny) {
+    return X_ERROR_INVALID_PARAMETER;
   }
 
-  // Some games have special case paths for 3F that differ from the failure
-  // path, so my guess is that's 'don't care'.
-  *out_unk2 = 0x3F;
-  *out_unk3 = 0;
+  auto xconfig = kernel_state()->xconfig();
+  const bool pc_enabled = (xconfig->ReadSetting<uint8_t>(
+                               XCONFIG_USER_CATEGORY, XCONFIG_USER_PC_FLAGS) &
+                           X_PC_FLAGS::PCEnabled) != 0;
+  // Without parental controls only explicit video has a rating, and the user
+  // isn't looked up for the others.
+  if (!pc_enabled && content_type != kContentTypeExplicitVideo) {
+    return X_ERROR_NOT_FOUND;
+  }
+  if (content_type >= std::size(kContentRestrictionSettings)) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
+  uint32_t system = 0;
+  uint32_t max = 0;
+  if (pc_enabled) {
+    system = xconfig->ReadSetting<uint32_t>(
+        XCONFIG_USER_CATEGORY, kContentRestrictionSettings[content_type].first);
+    max = xconfig->ReadSetting<uint32_t>(
+        XCONFIG_USER_CATEGORY,
+        kContentRestrictionSettings[content_type].second);
+  }
+  if (content_type == kContentTypeExplicitVideo) {
+    uint32_t granted;
+    if (CheckUserPrivilege(user_index, kExplicitVideoPrivilege, &granted)) {
+      // With parental controls the settings stand alone.
+      if (!pc_enabled) {
+        return X_ERROR_INVALID_PARAMETER;
+      }
+    } else {
+      const uint32_t system_mask = granted ? 7 : 0;
+      const uint32_t max_mask = granted ? 0xFF : 0;
+      system = pc_enabled ? system & system_mask : system_mask;
+      max = pc_enabled ? max & max_mask : max_mask;
+    }
+  }
+  *rating_system = system;
+  *max_rating = max;
+  return X_ERROR_SUCCESS;
+}
+
+dword_result_t XamUserContentRestrictionGetRating_entry(
+    dword_t user_index, dword_t content_type, lpdword_t rating_system_ptr,
+    lpdword_t max_rating_ptr) {
+  if (!rating_system_ptr || !max_rating_ptr) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  uint32_t rating_system, max_rating;
+  const X_RESULT result = GetContentRestrictionRating(
+      user_index, content_type, &rating_system, &max_rating);
+  if (result) {
+    return result;
+  }
+  *rating_system_ptr = rating_system;
+  *max_rating_ptr = max_rating;
   return X_ERROR_SUCCESS;
 }
 DECLARE_XAM_EXPORT1(XamUserContentRestrictionGetRating, kUserProfiles, kStub);
 
 dword_result_t XamUserContentRestrictionCheckAccess_entry(
-    dword_t user_index, dword_t unk1, dword_t unk2, dword_t unk3, dword_t unk4,
-    lpdword_t out_unk5, dword_t overlapped_ptr) {
-  *out_unk5 = 1;
-
-  if (overlapped_ptr) {
-    // TODO(benvanik): does this need the access arg on it?
-    kernel_state()->CompleteOverlappedImmediate(overlapped_ptr,
-                                                X_ERROR_SUCCESS);
-    return X_ERROR_IO_PENDING;
+    dword_t user_index, dword_t mode, dword_t content_type,
+    dword_t rating_system, dword_t rating, lpdword_t access_ptr,
+    dword_t overlapped_ptr) {
+  if (!access_ptr ||
+      (user_index >= XUserMaxUserCount && user_index != XUserIndexAny) ||
+      mode > 3) {
+    return X_ERROR_INVALID_PARAMETER;
   }
 
+  uint32_t user_rating_system, max_rating;
+  const X_RESULT result = GetContentRestrictionRating(
+      user_index, content_type, &user_rating_system, &max_rating);
+  // Nothing rated is allowed.
+  if (result == X_ERROR_NOT_FOUND) {
+    *access_ptr = 1;
+    return X_ERROR_SUCCESS;
+  }
+  if (result) {
+    return result;
+  }
+
+  if (rating_system !=
+      (user_rating_system > 0x40 ? 0x3F : user_rating_system)) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  // Unrated explicit video is denied too. A denied request in modes 1 and 2
+  // asks for the passcode on a console, pending on the overlapped. Xenia has
+  // no passcode, so it stays denied.
+  *access_ptr = rating <= max_rating &&
+                !(content_type == kContentTypeExplicitVideo && !rating);
   return X_ERROR_SUCCESS;
 }
 DECLARE_XAM_EXPORT1(XamUserContentRestrictionCheckAccess, kUserProfiles, kStub);
@@ -701,17 +806,19 @@ dword_result_t XamUserCreateTitlesPlayedEnumerator_entry(
     return X_ERROR_INVALID_PARAMETER;
   }
 
+  // Both are written before the user is looked up.
+  *buffer_size_ptr = game_count * sizeof(XTitleEnumerator::XTITLE_PLAYED);
+  *handle_ptr = X_INVALID_HANDLE_VALUE;
+
   const auto user = kernel_state()->xam_state()->GetUserProfile(user_index);
   if (!user) {
-    return X_ERROR_INVALID_PARAMETER;
+    return X_ERROR_FUNCTION_FAILED;
   }
 
   uint64_t requester_xuid = user->xuid();
   if (xuid) {
     requester_xuid = xuid;
   }
-
-  *buffer_size_ptr = game_count * sizeof(XTitleEnumerator::XTITLE_PLAYED);
 
   auto e = object_ref<XTitleEnumerator>(
       new XTitleEnumerator(kernel_state(), game_count, starting_index));
@@ -807,58 +914,48 @@ dword_result_t XamParseGamerTileKey_entry(pointer_t<X_USER_DATA> key_ptr,
     return X_ERROR_INVALID_PARAMETER;
   }
 
-  if (key_ptr->type != X_USER_DATA_TYPE::WSTRING) {
-    return X_ERROR_INVALID_PARAMETER;
+  // xam ignores the type and the size it's given. It sets the size from the
+  // string, up to 48 characters, then parses three 8 character fields at fixed
+  // offsets with wcstoul, so a short or non-hex key still succeeds.
+  const uint32_t string_address = key_ptr->data.unicode.ptr;
+  const auto* string =
+      string_address ? kernel_memory()->TranslateVirtual<const be<char16_t>*>(
+                           string_address)
+                     : nullptr;
+  uint32_t length = 0;
+  while (string && length < 48 && string[length]) {
+    ++length;
   }
+  key_ptr->data.unicode.size = string ? (length + 1) * sizeof(char16_t) : 0;
 
-  if (key_ptr->data.unicode.size > 0x64) {
-    return X_ERROR_INVALID_PARAMETER;
+  uint32_t ids[3] = {};
+  for (uint32_t i = 0; string && i < 3; ++i) {
+    std::string field;
+    for (uint32_t j = 0; j < 8; ++j) {
+      const char16_t c = string[i * 8 + j];
+      if (!c) {
+        break;
+      }
+      field.push_back(c < 0x80 ? char(c) : '?');
+    }
+    ids[i] = uint32_t(std::strtoul(field.c_str(), nullptr, 16));
   }
-
-  if (!key_ptr->data.unicode.ptr) {
-    return X_ERROR_INVALID_PARAMETER;
+  // No string, or an avatar key, gives the default picture.
+  if (!string || IsGamerPictureAvatar(ids[0])) {
+    ids[0] = kDashboardID;
+    ids[1] = 0x00020000;
+    ids[2] = 0x00010000;
   }
-
-  const std::string tile_key = xe::to_utf8(string_util::read_u16string_and_swap(
-      kernel_memory()->TranslateVirtual<const char16_t*>(
-          key_ptr->data.unicode.ptr)));
-
-  if (tile_key.empty() || tile_key.size() != sizeof(GamerPictureKey)) {
-    return X_ERROR_INVALID_PARAMETER;
-  }
-
-  const bool is_valid_hex_string = std::ranges::all_of(
-      tile_key, [](unsigned char c) { return std::isxdigit(c); });
-
-  if (!is_valid_hex_string) {
-    return X_ERROR_INVALID_PARAMETER;
-  }
-
-  const GamerPictureKey* gamer_picture_key =
-      reinterpret_cast<const GamerPictureKey*>(tile_key.data());
 
   if (title_id_ptr) {
-    *title_id_ptr = gamer_picture_key->GetTitleId();
+    *title_id_ptr = ids[0];
   }
-
   if (big_tile_id_ptr) {
-    *big_tile_id_ptr = gamer_picture_key->GetBigTileId();
+    *big_tile_id_ptr = ids[1];
   }
-
   if (small_tile_id_ptr) {
-    *small_tile_id_ptr = gamer_picture_key->GetSmallTileId();
+    *small_tile_id_ptr = ids[2];
   }
-
-  bool is_from_dash = false;
-  bool is_avatar = false;
-  bool is_custom = false;
-
-  if (title_id_ptr) {
-    is_from_dash = IsGamerPictureFromDash(*title_id_ptr);
-    is_avatar = IsGamerPictureAvatar(*title_id_ptr);
-    is_custom = IsGamerPictureCustom(*title_id_ptr);
-  }
-
   return X_ERROR_SUCCESS;
 }
 DECLARE_XAM_EXPORT1(XamParseGamerTileKey, kUserProfiles, kImplemented);
@@ -930,7 +1027,7 @@ dword_result_t XamWriteGamerTile_entry(
     dword_t small_tile_id, dword_t for_enumerate,
     pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
   if (user_index >= XUserMaxUserCount) {
-    return X_E_INVALIDARG;
+    return X_ERROR_FUNCTION_FAILED;
   }
 
   // What is 0x10 flag?
@@ -1073,18 +1170,18 @@ dword_result_t XamUserGetSubscriptionType_entry(
     dword_t user_index, lpdword_t subscription_length_ptr,
     lpdword_t subscription_payment_ptr) {
   if (user_index >= XUserMaxUserCount) {
-    return X_ERROR_INVALID_PARAMETER;
+    return X_E_INVALIDARG;
   }
 
   if (!subscription_length_ptr || !subscription_payment_ptr) {
-    return X_ERROR_INVALID_PARAMETER;
+    return X_E_INVALIDARG;
   }
 
   const auto user_profile =
       kernel_state()->xam_state()->GetUserProfile(user_index);
 
   if (!user_profile) {
-    return X_ERROR_FUNCTION_FAILED;
+    return X_E_NO_SUCH_USER;
   }
 
   const auto [subscription_period, subscription_payment] =
@@ -1132,9 +1229,11 @@ dword_result_t XamUserGetUserFlagsFromXUID_entry(qword_t xuid) {
 }
 DECLARE_XAM_EXPORT1(XamUserGetUserFlagsFromXUID, kUserProfiles, kImplemented);
 
+// A profile without a language or country, like an offline one, gets the
+// console's setting.
 dword_result_t XamUserGetOnlineLanguageFromXUID_entry(qword_t xuid) {
   const auto& user = kernel_state()->xam_state()->GetUserProfile(xuid);
-  if (!user) {
+  if (!user || !user->GetLanguage()) {
     return kernel_state()->xconfig()->ReadSetting<uint32_t>(
         XCONFIG_USER_CATEGORY, XCONFIG_USER_LANGUAGE);
   }
@@ -1145,7 +1244,7 @@ DECLARE_XAM_EXPORT1(XamUserGetOnlineLanguageFromXUID, kUserProfiles,
 
 dword_result_t XamUserGetOnlineCountryFromXUID_entry(qword_t xuid) {
   const auto& user = kernel_state()->xam_state()->GetUserProfile(xuid);
-  if (!user) {
+  if (!user || !user->GetCountry()) {
     return kernel_state()->xconfig()->ReadSetting<uint8_t>(
         XCONFIG_USER_CATEGORY, XCONFIG_USER_COUNTRY);
   }
@@ -1206,8 +1305,12 @@ DECLARE_XAM_EXPORT1(XamUserCreateStatsEnumerator, kUserProfiles, kSketchy);
 dword_result_t XamUserGetUserTenure_entry(
     dword_t user_index, lpdword_t tenure_level_ptr, lpdword_t milestone_ptr,
     lpqword_t milestone_date_ptr, pointer_t<XAM_OVERLAPPED> overlap_ptr) {
-  if (!kernel_state()->xam_state()->IsUserSignedIn(user_index)) {
+  if (user_index >= XUserMaxUserCount) {
     return X_E_INVALIDARG;
+  }
+
+  if (!kernel_state()->xam_state()->IsUserSignedIn(user_index)) {
+    return X_E_NO_SUCH_USER;
   }
 
   const auto& user_profile =
