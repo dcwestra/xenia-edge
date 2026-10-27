@@ -52,7 +52,8 @@ Kinect games do their own skeletal tracking and Kinect ID face matching, in code
 - **Kinect ID.** The identity data games store, and the links between Kinect IDs and profiles.
 - **The Kinect system dialogs.** The pause message and the sign-in prompt, with a hand cursor to press their buttons.
 - **Xbox avatars.** Avatars are built from the system avatar asset pack, the same data the console uses. Kinect Sports carries the pack on its disc, and discs with a Kinect system update (such as *Fable: The Journey*) carry a newer one.
-  - Bodies, heads with animated eyes, eyebrows and mouths, nose, chin and ear shapes, hair, clothes, shoes, accessories and the avatar's colors are all decoded from it.
+  - Bodies, heads with animated eyes, eyebrows and mouths, nose, chin and ear shapes, hair, clothes, shoes, accessories and the avatar's colors are all decoded from it, with the body hidden under clothes as on the console.
+  - Games can dress players in their own outfits: *Kinect Sports* puts its sports kits on them.
   - The first game with the pack on its disc installs it, so later avatar games have it too.
   - A profile without an avatar gets one generated from its profile ID, saved to the profile.
 - **An avatar editor.** **Profile → (your profile) → Edit avatar…** edits a signed-in profile's avatar with a live preview, and saves it to the profile, so every game shows the same avatar.
@@ -76,7 +77,7 @@ Related settings:
 - **Linux only**, and only the original **Kinect for Xbox 360 (model 1414)**. The Xbox One Kinect isn't supported.
 - **Two games tested.** Other Kinect games may reach parts that aren't implemented yet.
 - **No Kinect audio.** The microphone array and voice commands aren't implemented.
-- **Avatars are still missing some details.** Height and weight, and the custom items games add to an avatar (such as *Kinect Sports'* sports kits), aren't applied yet. The editor only offers the items in the avatar pack, not marketplace or award items.
+- **Avatars are still missing some details.** Height and weight aren't applied yet. The editor only offers the items in the avatar pack, not marketplace or award items.
 - **Not yet tried with Kinect on Batocera.**
 
 ## Key changes
