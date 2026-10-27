@@ -23,6 +23,7 @@
 #include "xenia/base/math.h"
 #include "xenia/base/memory.h"
 #include "xenia/cpu/lzx.h"
+#include "xenia/emulator.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/vfs/virtual_file_system.h"
@@ -714,39 +715,117 @@ const AvatarAssetPack* AvatarAssetPack::Get() {
   static std::once_flag once;
   static std::unique_ptr<AvatarAssetPack> pack;
   std::call_once(once, []() {
-    auto loaded = std::make_unique<AvatarAssetPack>();
-    std::vector<uint8_t> data, toc;
-    std::string source;
+    struct Candidate {
+      std::string source;
+      // The package's name, to install a disc's copy under.
+      std::string package;
+      std::unique_ptr<AvatarAssetPack> pack;
+      size_t present = 0;
+    };
+    std::vector<Candidate> candidates;
+    auto add = [&candidates](std::string source, std::string package,
+                             std::vector<uint8_t> data) {
+      std::vector<uint8_t> toc;
+      auto loaded = std::make_unique<AvatarAssetPack>();
+      if (!ExtractToc(std::move(data), &toc) || !loaded->Load(std::move(toc))) {
+        return false;
+      }
+      size_t present = 0;
+      for (const Record& record : loaded->records_) {
+        present += record.strb_offset != 0;
+      }
+      candidates.push_back(
+          {std::move(source), std::move(package), std::move(loaded), present});
+      return true;
+    };
+    std::vector<uint8_t> data;
     if (!cvars::avatar_asset_pack_path.empty()) {
-      if (ReadHostFile(cvars::avatar_asset_pack_path, &data) &&
-          ExtractToc(std::move(data), &toc)) {
-        source = xe::strip_pii(xe::path_to_utf8(cvars::avatar_asset_pack_path));
-      } else {
-        XELOGE("Avatars: no avatar asset pack in {}",
-               xe::strip_pii(xe::path_to_utf8(cvars::avatar_asset_pack_path)));
+      const std::string path =
+          xe::strip_pii(xe::path_to_utf8(cvars::avatar_asset_pack_path));
+      if (!ReadHostFile(cvars::avatar_asset_pack_path, &data) ||
+          !add(path, std::string(), std::move(data))) {
+        XELOGE("Avatars: no avatar asset pack in {}", path);
       }
     }
-    // Discs with Kinect system updates carry the system package; Kinect
-    // Sports also has a copy of its own.
-    for (const char* path :
-         {"game:\\$SystemUpdate\\FFFE07DF00000002", "game:\\AvatarAssetPack"}) {
-      if (!source.empty()) {
+    // Installed packs, where installing the system avatar package puts its
+    // files; then the disc's: discs with Kinect system updates carry the
+    // system package, and Kinect Sports also has a copy of its own.
+    const std::filesystem::path installed =
+        kernel_state()->emulator()->content_root() / "0000000000000000" /
+        "FFFE07DF" / "00008000";
+    if (candidates.empty()) {
+      std::error_code ec;
+      for (const auto& entry :
+           std::filesystem::directory_iterator(installed, ec)) {
+        const std::filesystem::path toc = entry.path() / "AvatarAssetPack.toc";
+        if (entry.is_directory(ec) && ReadHostFile(toc, &data)) {
+          add(xe::strip_pii(xe::path_to_utf8(toc)), std::string(),
+              std::move(data));
+        }
+      }
+      const size_t installed_count = candidates.size();
+      static const struct {
+        const char* package;
+        const char* path;
+      } kDiscPacks[] = {
+          {"FFFE07DF00000002", "game:\\$SystemUpdate\\FFFE07DF00000002"},
+          {"AvatarAssetPack", "game:\\AvatarAssetPack"},
+      };
+      for (const auto& disc_pack : kDiscPacks) {
+        if (ReadGuestFile(disc_pack.path, &data)) {
+          add(disc_pack.path, disc_pack.package, std::move(data));
+        }
+      }
+      // The disc's pack, installed when it has more assets than any installed
+      // one, so titles without one have avatars too.
+      for (size_t i = installed_count; i < candidates.size(); ++i) {
+        const Candidate& disc = candidates[i];
+        bool better = true;
+        for (size_t k = 0; k < installed_count; ++k) {
+          better = better && disc.present > candidates[k].present;
+        }
+        if (!better) {
+          continue;
+        }
+        const std::filesystem::path folder = installed / disc.package;
+        const std::filesystem::path file = folder / "AvatarAssetPack.toc";
+        const std::filesystem::path temporary =
+            folder / "AvatarAssetPack.toc.tmp";
+        std::error_code ec;
+        std::filesystem::create_directories(folder, ec);
+        bool written = false;
+        if (FILE* f = xe::filesystem::OpenFile(temporary, "wb")) {
+          written =
+              std::fwrite(disc.pack->toc_.data(), 1, disc.pack->toc_.size(),
+                          f) == disc.pack->toc_.size();
+          written = std::fclose(f) == 0 && written;
+        }
+        if (written) {
+          std::filesystem::rename(temporary, file, ec);
+          written = !ec;
+        }
+        if (written) {
+          XELOGI("Avatars: installed the avatar asset pack from {} to {}",
+                 disc.source, xe::strip_pii(xe::path_to_utf8(file)));
+        } else {
+          XELOGW("Avatars: couldn't install the avatar asset pack to {}",
+                 xe::strip_pii(xe::path_to_utf8(file)));
+        }
         break;
       }
-      if (ReadGuestFile(path, &data) && ExtractToc(std::move(data), &toc)) {
-        source = path;
-      }
     }
-    if (source.empty() || !loaded->Load(std::move(toc))) {
+    if (candidates.empty()) {
       XELOGW("Avatars: no avatar asset pack, avatars will be empty");
       return;
     }
-    size_t present = 0;
-    for (const Record& record : loaded->records_) {
-      present += record.strb_offset != 0;
-    }
-    XELOGI("Avatars: asset pack from {}: {} assets", source, present);
-    pack = std::move(loaded);
+    // The most complete one.
+    auto best = std::max_element(candidates.begin(), candidates.end(),
+                                 [](const Candidate& a, const Candidate& b) {
+                                   return a.present < b.present;
+                                 });
+    XELOGI("Avatars: asset pack from {}: {} assets", best->source,
+           best->present);
+    pack = std::move(best->pack);
   });
   return pack.get();
 }

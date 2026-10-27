@@ -223,9 +223,10 @@ dword_result_t XamAvatarGetManifestLocalUser_entry(
         user_profile->xuid(), kDashboardID, avatar_info_id,
         &avatar_info_setting_data, avatar_metadata_address);
 
-    // A profile without an avatar gets one made from its XUID, so it's the
-    // same every time. GetUserSetting has moved avatar_metadata_address past
-    // the setting.
+    // A profile without an avatar gets one made from its XUID, saved to the
+    // profile as XamAvatarSetManifest saves one, so every title shows the
+    // same avatar. GetUserSetting has moved avatar_metadata_address past the
+    // setting.
     if (!avatar_info_setting_data.data.data.binary.ptr) {
       if (!cvars::allow_avatar_initialization ||
           !GenerateAvatarManifest(
@@ -237,6 +238,19 @@ dword_result_t XamAvatarGetManifestLocalUser_entry(
         extended_error = X_E_FAIL;
         return X_ERROR_FUNCTION_FAILED;
       }
+      X_USER_PROFILE_SETTING setting_data = {};
+      setting_data.user_index = static_cast<uint32_t>(user_index);
+      setting_data.setting_id = avatar_info_id;
+      setting_data.data.type = X_USER_DATA_TYPE::BINARY;
+      setting_data.data.data.binary.size = uint32_t(kAvatarManifestSize);
+      setting_data.data.data.binary.ptr = avatar_metadata_ptr.guest_address();
+      const UserSetting setting(&setting_data);
+      kernel_state()->xam_state()->user_tracker()->UpsertSetting(
+          user_profile->xuid(), kDashboardID, &setting);
+      XELOGI(
+          "Avatars: profile {:016X} had no avatar; it has a generated one "
+          "now",
+          user_profile->xuid());
     }
 
     return X_ERROR_SUCCESS;
