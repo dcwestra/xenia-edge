@@ -5,7 +5,7 @@
 <h1 align="center">Xenia Edge — edge-linux fork</h1>
 
 <p align="center">
-An unofficial fork of <a href="https://github.com/has207/xenia-edge">Xenia Edge</a> focused on Linux, AMD/Batocera support, rendering accuracy and performance — <strong>developed with an AI coding assistant</strong>.
+An unofficial fork of <a href="https://github.com/has207/xenia-edge">Xenia Edge</a> focused on Linux, AMD/Batocera support, <strong>Kinect</strong>, rendering accuracy and performance — <strong>developed with an AI coding assistant</strong>.
 </p>
 
 > [!IMPORTANT]
@@ -27,12 +27,55 @@ What that means for you:
 
 - **Expect mistakes.** The changes compile, pass the existing unit tests and fixed the problems they were aimed at in the games that were tested. They have not had the scrutiny upstream changes get.
 - **Commits are marked.** Every commit made with the AI carries a `Co-Authored-By: Claude` trailer, so you can always tell what it touched.
-- **Testing covered a small set.** Three games: *Fable II*, *Fable III* and *Red Dead Redemption*. Two machines:
-  - Fedora 44 on an NVIDIA Quadro T2000 laptop.
+- **Testing covered a small set.** Five games: *Fable II*, *Fable III*, *Red Dead Redemption*, and the Kinect games *Fable: The Journey* and *Kinect Sports*. Two machines:
+  - Fedora 44 on an NVIDIA Quadro T2000 laptop, with a Kinect for Xbox 360 (model 1414).
   - Batocera 43 on an AMD Radeon RX 5700 with an Intel i7-9700.
 
   Other games and hardware may behave differently, for better or worse.
 - **Upstream's maintainer has asked not to receive AI-generated pull requests** (see [AGENTS.md](AGENTS.md)). This fork respects that and keeps its changes here.
+
+## Kinect for Xbox 360
+
+**This fork plays Kinect games with a real Kinect for Xbox 360 sensor on Linux.** Upstream Xenia has no Kinect camera support, so these games can't be played there.
+
+Tested by the owner with a Kinect for Xbox 360 (model 1414) on Fedora 44:
+
+- ***Fable: The Journey*** is playable. Getting the game's attention, Kinect ID sign-in and saving, horse brushing, reins and steering all work.
+- ***Kinect Sports*** is playable. The hand-cursor menus, signing in, bowling and the stadium crowd area all work, and **players appear as their Xbox avatars**, fully dressed and with animated faces.
+
+### How it works
+
+Kinect games do their own skeletal tracking and Kinect ID face matching, in code shipped on the disc. The console only supplies the camera feed and a few system services, and that is what this fork adds:
+
+- **The camera.** Depth and color at 640x480 and 30 fps, read straight from the sensor over USB (libusb), and delivered to the game the way the console does.
+- **The tilt motor, LED and accelerometer.** Games can aim the sensor at the floor and the player, as on a console.
+- **Kinect ID.** The identity data games store, and the links between Kinect IDs and profiles.
+- **The Kinect system dialogs.** The pause message and the sign-in prompt, with a hand cursor to press their buttons.
+- **Xbox avatars.** Avatars are built from the system avatar asset pack, the same data the console uses. Kinect Sports carries the pack on its disc, and discs with a Kinect system update (such as *Fable: The Journey*) carry a newer one.
+  - Bodies, heads with animated eyes, eyebrows and mouths, hair, clothes, shoes, accessories and the avatar's colors are all decoded from it.
+  - A profile without an avatar gets one generated from its profile ID.
+
+### Setting it up
+
+1. Plug the Kinect in with its power and USB adapter. `libusb-1.0` must be installed; most distributions have it.
+2. Give your user access to the sensor with the udev rule in [`tools/kinect/`](tools/kinect/). The file explains how to install it. Then replug the Kinect.
+3. Copy the game configs from [`game-configs/`](game-configs/) (`4D530A1A` for *Fable: The Journey*, `4D5308C9` for *Kinect Sports*) into your Xenia `config/` folder. They turn on `allow_nui_initialization`, plus `allow_avatar_initialization` for *Kinect Sports*.
+4. Stand about 2-3 m in front of the sensor. *Kinect Sports* doesn't track seated players.
+
+Related settings:
+
+- `kinect_tilt` (on): lets games move the tilt motor.
+- `kinect_record_path` and `kinect_playback_path`: record a session to a file and play it back later without a sensor. Recording takes about 22 MB/s.
+- `log_kinect`: logs the camera and Kinect service traffic.
+- `avatar_asset_pack_path`: the system avatar package (`FFFE07DF00000002` from a disc's `$SystemUpdate` folder, or *Kinect Sports'* `AvatarAssetPack`), for avatar games whose disc doesn't carry one.
+
+### Limits
+
+- **Linux only**, and only the original **Kinect for Xbox 360 (model 1414)**. The Xbox One Kinect isn't supported.
+- **Two games tested.** Other Kinect games may reach parts that aren't implemented yet.
+- **No Kinect audio.** The microphone array and voice commands aren't implemented.
+- **Avatars are still missing some details.** Height and weight, nose, chin and ear shapes, and the custom items games add to an avatar aren't applied yet. There is no avatar editor yet; one is planned.
+- **Not yet tried with Kinect on Batocera.**
 
 ## Key changes
 
@@ -90,13 +133,13 @@ These are separate from the code, and every patch is **off by default**. Copy wh
   - A working *Fable II* Collector's Edition unlock. The community version crashes this game version when the Guild Cave loads.
   - A *Fable III* Limited Collector's Edition unlock. It is new, and its in-game result is not yet confirmed.
   - The *Fable II* Realtime Texture Morphing patch, from himdo's research. In this fork it is only needed if `readback_resolve` is off.
-- [`game-configs/`](game-configs/) holds recommended per-game settings for *Fable II*.
+- [`game-configs/`](game-configs/) holds recommended per-game settings for *Fable II*, *Fable: The Journey* and *Kinect Sports*.
 
 ## Known issues
 
 - On NVIDIA, *Fable II* can still show an occasional single-frame white or blue flash on an object. `occlusion_query = "strict"` (in the recommended config) reduces it. It has not been seen on AMD with the game's own texture morphing, but testing there is still short.
 - AMD/RADV can't map the emulator's guest memory directly (`VK_EXT_external_memory_host` rejects shared memory). Readback therefore goes through an extra copy, which is safe but slower than on NVIDIA.
-- These changes were tested on three games only. Everything else is as upstream left it, for better or worse.
+- These changes were tested on five games only. Everything else is as upstream left it, for better or worse.
 
 ## Building
 

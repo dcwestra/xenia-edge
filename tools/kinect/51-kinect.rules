@@ -1,0 +1,6 @@
+# Gives the signed-in user access to a Kinect for Xbox 360 (model 1414): its
+# motor (02b0), audio (02ad) and camera (02ae). Install with:
+#   sudo cp 51-kinect.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload && sudo udevadm trigger
+# then unplug the Kinect and plug it back in.
+SUBSYSTEM=="usb", ATTR{idVendor}=="045e", ATTR{idProduct}=="02b0|02ad|02ae", TAG+="uaccess"

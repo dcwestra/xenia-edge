@@ -1,0 +1,12 @@
+# Kinect Sports (4D5308C9) - recommended per-game settings for the edge-linux
+# fork. Copy to <Xenia storage root>/config/4D5308C9.config.toml.
+
+[Console]
+# A Kinect game: lets its Kinect (NUI) runtime start. Needs a Kinect for Xbox
+# 360 on Linux (see tools/kinect/).
+allow_nui_initialization = true
+
+[Kernel]
+# Lets its avatar system start. The avatars come from the AvatarAssetPack on
+# its disc.
+allow_avatar_initialization = true

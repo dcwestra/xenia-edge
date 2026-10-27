@@ -1,0 +1,7 @@
+# Fable: The Journey (4D530A1A) - recommended per-game settings for the
+# edge-linux fork. Copy to <Xenia storage root>/config/4D530A1A.config.toml.
+
+[Console]
+# A Kinect game: lets its Kinect (NUI) runtime start. Needs a Kinect for Xbox
+# 360 on Linux (see tools/kinect/).
+allow_nui_initialization = true
