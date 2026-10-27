@@ -118,6 +118,50 @@ uint8_t GetAvatarManifestBodyType(std::span<const uint8_t> manifest);
 bool GenerateAvatarManifest(uint64_t seed, uint32_t body_type,
                             std::span<uint8_t> manifest);
 
+// An avatar's contents as a manifest holds them, for editing.
+struct AvatarDescription {
+  // 1 male, 2 female.
+  uint8_t gender = 1;
+  // From -1 to 1 (not applied to the skeleton yet).
+  float height = 0.0f;
+  float weight = 0.0f;
+  // Pack record indices of its items: hair, clothes, accessories and facial
+  // features (the head and the body are implied).
+  std::vector<uint32_t> items;
+  // Skin, hair, lips, eyes, eyebrows, eye shadow, facial hair, face paint 1
+  // and 2 (ARGB).
+  std::array<uint32_t, 9> colors = {};
+};
+
+bool ReadAvatarManifest(std::span<const uint8_t> manifest,
+                        AvatarDescription* avatar);
+bool WriteAvatarManifest(const AvatarDescription& avatar,
+                         std::span<uint8_t> manifest);
+bool RandomizeAvatar(uint64_t seed, uint32_t body_type,
+                     AvatarDescription* avatar);
+// Puts an item on, taking off the ones sharing a slot with it (an outfit
+// replaces the top and bottoms, new eyes the old ones).
+void SetAvatarItem(AvatarDescription* avatar, uint32_t index);
+// Takes off the items occupying any of the slots.
+void RemoveAvatarItems(AvatarDescription* avatar, uint32_t slots);
+// The pack's avatar editor items with exactly one of these slot masks, for
+// the gender, in the pack's order.
+std::vector<uint32_t> GetAvatarEditorItems(std::span<const uint32_t> slots,
+                                           uint8_t gender);
+
+// One slice of a result texture ({format, width, height, ..., address} with
+// the address in gpu_data) as RGBA8, from its GPU layout.
+bool DecodeAvatarTexture(const AvatarAssets& assets,
+                         const std::array<uint32_t, 11>& texture,
+                         uint32_t slice, std::vector<uint32_t>* rgba);
+
+// Renders the avatar in an idle pose on the CPU as titles' avatar shaders
+// color it (the body's base, tint mask and overlay textures; the head's
+// facial feature layers over the skin color), turned by yaw radians: RGB8,
+// width by height, for the avatar editor's preview.
+bool RenderAvatarPreview(const AvatarAssets& assets, uint32_t width,
+                         uint32_t height, float yaw, std::vector<uint8_t>* rgb);
+
 // The avatar skeleton titles render with, as the result's skeleton holds it:
 // hierarchy (0xFF none) and the bind pose in model and parent space.
 struct AvatarBone {

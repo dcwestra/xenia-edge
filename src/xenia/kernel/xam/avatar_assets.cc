@@ -49,6 +49,7 @@ constexpr size_t kTocRecordSize = 0xF8;
 
 constexpr uint32_t kStrbBlockTexture = 2;
 constexpr uint32_t kStrbBlockModel = 3;
+constexpr uint32_t kStrbBlockShapeOverrides = 4;
 constexpr uint32_t kStrbBlockColorTable = 7;
 constexpr uint32_t kStrbBlockMetadata = 8;
 
@@ -358,6 +359,8 @@ struct ModelMesh {
   // In the model's GPU data.
   uint32_t vb_offset = 0;
   uint32_t ib_offset = 0;
+  // Its positions' minimum z (shape overrides are relative to it).
+  float minimum_z = 0.0f;
   // 24-byte draw records (6 words): type 1 binds a texture, type 3 is a
   // color parameter {3, id, r, g, b, a}.
   std::vector<uint32_t> records;
@@ -463,6 +466,7 @@ bool DecodeModel(std::span<const uint8_t> raw, DecodedModel* model) {
       vertex_bits += width;
     }
     mesh.vertex_count = vertex_count;
+    mesh.minimum_z = minimum[2];
     mesh.uv_sets = uv_bits / 32;
     mesh.stride = 28 + 4 * mesh.uv_sets;
     const size_t stream = descriptor + 274;
@@ -575,6 +579,91 @@ bool DecodeModel(std::span<const uint8_t> raw, DecodedModel* model) {
     model->textures.push_back(texture);
   }
   return true;
+}
+
+// Applies a shape override (an STRB block 4: a nose, chin or ears) to its
+// model's GPU data. Sections of a 32-byte header {count, the size of the
+// buffer they change, ?, the model's asset ID, 0, index bits}: for the vertex
+// buffer, the model mesh descriptor (position step and minimum, the 274-bit
+// widths and bases) and records {VB byte offset, position, normal, weights,
+// bone indices, color}, replacing those vertices; for the index buffer,
+// triangles (not applied).
+void ApplyShapeOverride(std::span<const uint8_t> block,
+                        const DecodedModel& model, uint8_t* gpu) {
+  if (model.meshes.empty()) {
+    return;
+  }
+  const uint32_t vb_size = model.header[3];
+  const uint32_t stride = model.meshes[0].stride;
+  // Stored minimum z are scaled by 2/sqrt(3) about the model's (fitted to
+  // the head's vertices the overrides border on, within about 2 mm).
+  constexpr float kZScale = 1.15470054f;
+  const float z_origin = model.meshes[0].minimum_z;
+  const BitReader bits(block);
+  size_t offset = 0;
+  while (offset + 32 <= block.size()) {
+    const uint32_t count = LoadLE32(&block[offset]);
+    const uint32_t buffer_size = LoadLE32(&block[offset + 4]);
+    const uint32_t index_bits = LoadLE32(&block[offset + 28]);
+    offset += 32;
+    if (!count) {
+      continue;
+    }
+    if (buffer_size != vb_size || offset + 20 > block.size() || !index_bits ||
+        index_bits > 32) {
+      // Triangles: count indices of index_bits each.
+      offset = (offset * 8 + size_t(count) * index_bits + 7) / 8;
+      continue;
+    }
+    const float step = 2.0f * LoadLE32Float(&block[offset]);
+    const float minimum[3] = {
+        LoadLE32Float(&block[offset + 4]), LoadLE32Float(&block[offset + 8]),
+        z_origin + (LoadLE32Float(&block[offset + 12]) - z_origin) * kZScale};
+    const size_t descriptor = (offset + 16) * 8;
+    uint32_t position_widths[3];
+    for (uint32_t i = 0; i < 3; ++i) {
+      position_widths[i] = bits.Read(descriptor + 6 * i, 6);
+    }
+    uint32_t words[8];
+    for (uint32_t i = 0; i < 8; ++i) {
+      words[i] = bits.Read(descriptor + 18 + 32 * i, 32);
+    }
+    uint32_t record_bits = index_bits + position_widths[0] +
+                           position_widths[1] + position_widths[2];
+    for (uint32_t i = 1; i < 8; i += 2) {
+      if (words[i] > 32) {
+        return;
+      }
+      record_bits += words[i];
+    }
+    const size_t stream = descriptor + 274;
+    if (stream + size_t(count) * record_bits > bits.size_bits()) {
+      return;
+    }
+    for (uint32_t v = 0; v < count; ++v) {
+      size_t bit = stream + size_t(v) * record_bits;
+      const uint32_t vertex_offset = bits.Read(bit, index_bits);
+      bit += index_bits;
+      if (vertex_offset % stride || vertex_offset + stride > vb_size) {
+        continue;
+      }
+      uint8_t* out = gpu + model.header[7] + vertex_offset;
+      for (uint32_t i = 0; i < 3; ++i) {
+        const uint32_t q = bits.Read(bit, position_widths[i]);
+        bit += position_widths[i];
+        StoreBE32Float(
+            out + 4 * i,
+            minimum[i] + float(q) * step * (i == 1 ? kYStepScale : 1.0f));
+      }
+      // Normal, weights, bone indices, color.
+      for (uint32_t i = 0; i < 4; ++i) {
+        xe::store_and_swap<uint32_t>(
+            out + 12 + 4 * i, words[2 * i] + bits.Read(bit, words[2 * i + 1]));
+        bit += words[2 * i + 1];
+      }
+    }
+    offset = (stream + size_t(count) * record_bits + 7) / 8;
+  }
 }
 
 std::mutex model_cache_mutex;
@@ -712,122 +801,139 @@ int32_t HeadTextureSlot(uint32_t texture_details) {
 }  // namespace
 
 const AvatarAssetPack* AvatarAssetPack::Get() {
-  static std::once_flag once;
-  static std::unique_ptr<AvatarAssetPack> pack;
-  std::call_once(once, []() {
-    struct Candidate {
-      std::string source;
-      // The package's name, to install a disc's copy under.
-      std::string package;
-      std::unique_ptr<AvatarAssetPack> pack;
-      size_t present = 0;
-    };
-    std::vector<Candidate> candidates;
-    auto add = [&candidates](std::string source, std::string package,
-                             std::vector<uint8_t> data) {
-      std::vector<uint8_t> toc;
-      auto loaded = std::make_unique<AvatarAssetPack>();
-      if (!ExtractToc(std::move(data), &toc) || !loaded->Load(std::move(toc))) {
-        return false;
-      }
-      size_t present = 0;
-      for (const Record& record : loaded->records_) {
-        present += record.strb_offset != 0;
-      }
-      candidates.push_back(
-          {std::move(source), std::move(package), std::move(loaded), present});
-      return true;
-    };
-    std::vector<uint8_t> data;
+  // Packs stay loaded once found (callers keep pointers into them). The
+  // installed ones and avatar_asset_pack_path are checked once, each title's
+  // disc once, for a more complete pack.
+  static std::mutex mutex;
+  static std::vector<std::unique_ptr<AvatarAssetPack>> packs;
+  static size_t best_present = 0;
+  static size_t installed_present = 0;
+  static bool host_checked = false;
+  static bool path_given = false;
+  static uint32_t disc_checked_title = UINT32_MAX;
+  std::lock_guard<std::mutex> lock(mutex);
+  const uint32_t title_id = kernel_state()->title_id();
+  const bool check_host = !host_checked;
+  const bool check_disc =
+      !path_given && title_id && title_id != disc_checked_title;
+  if (!check_host && !check_disc) {
+    return packs.empty() ? nullptr : packs.back().get();
+  }
+  host_checked = true;
+  if (check_disc) {
+    disc_checked_title = title_id;
+  }
+  struct Candidate {
+    std::string source;
+    // The package's name, to install a disc's copy under; empty if installed.
+    std::string package;
+    std::unique_ptr<AvatarAssetPack> pack;
+    size_t present = 0;
+  };
+  std::vector<Candidate> candidates;
+  auto add = [&candidates](std::string source, std::string package,
+                           std::vector<uint8_t> data) {
+    std::vector<uint8_t> toc;
+    auto loaded = std::make_unique<AvatarAssetPack>();
+    if (!ExtractToc(std::move(data), &toc) || !loaded->Load(std::move(toc))) {
+      return false;
+    }
+    size_t present = 0;
+    for (const Record& record : loaded->records_) {
+      present += record.strb_offset != 0;
+    }
+    candidates.push_back(
+        {std::move(source), std::move(package), std::move(loaded), present});
+    return true;
+  };
+  std::vector<uint8_t> data;
+  // Where installing the system avatar package puts its files.
+  const std::filesystem::path installed =
+      kernel_state()->emulator()->content_root() / "0000000000000000" /
+      "FFFE07DF" / "00008000";
+  if (check_host) {
     if (!cvars::avatar_asset_pack_path.empty()) {
+      path_given = true;
       const std::string path =
           xe::strip_pii(xe::path_to_utf8(cvars::avatar_asset_pack_path));
       if (!ReadHostFile(cvars::avatar_asset_pack_path, &data) ||
           !add(path, std::string(), std::move(data))) {
         XELOGE("Avatars: no avatar asset pack in {}", path);
       }
-    }
-    // Installed packs, where installing the system avatar package puts its
-    // files; then the disc's: discs with Kinect system updates carry the
-    // system package, and Kinect Sports also has a copy of its own.
-    const std::filesystem::path installed =
-        kernel_state()->emulator()->content_root() / "0000000000000000" /
-        "FFFE07DF" / "00008000";
-    if (candidates.empty()) {
+    } else {
       std::error_code ec;
       for (const auto& entry :
            std::filesystem::directory_iterator(installed, ec)) {
         const std::filesystem::path toc = entry.path() / "AvatarAssetPack.toc";
-        if (entry.is_directory(ec) && ReadHostFile(toc, &data)) {
-          add(xe::strip_pii(xe::path_to_utf8(toc)), std::string(),
-              std::move(data));
+        if (entry.is_directory(ec) && ReadHostFile(toc, &data) &&
+            add(xe::strip_pii(xe::path_to_utf8(toc)), std::string(),
+                std::move(data))) {
+          installed_present =
+              std::max(installed_present, candidates.back().present);
         }
-      }
-      const size_t installed_count = candidates.size();
-      static const struct {
-        const char* package;
-        const char* path;
-      } kDiscPacks[] = {
-          {"FFFE07DF00000002", "game:\\$SystemUpdate\\FFFE07DF00000002"},
-          {"AvatarAssetPack", "game:\\AvatarAssetPack"},
-      };
-      for (const auto& disc_pack : kDiscPacks) {
-        if (ReadGuestFile(disc_pack.path, &data)) {
-          add(disc_pack.path, disc_pack.package, std::move(data));
-        }
-      }
-      // The disc's pack, installed when it has more assets than any installed
-      // one, so titles without one have avatars too.
-      for (size_t i = installed_count; i < candidates.size(); ++i) {
-        const Candidate& disc = candidates[i];
-        bool better = true;
-        for (size_t k = 0; k < installed_count; ++k) {
-          better = better && disc.present > candidates[k].present;
-        }
-        if (!better) {
-          continue;
-        }
-        const std::filesystem::path folder = installed / disc.package;
-        const std::filesystem::path file = folder / "AvatarAssetPack.toc";
-        const std::filesystem::path temporary =
-            folder / "AvatarAssetPack.toc.tmp";
-        std::error_code ec;
-        std::filesystem::create_directories(folder, ec);
-        bool written = false;
-        if (FILE* f = xe::filesystem::OpenFile(temporary, "wb")) {
-          written =
-              std::fwrite(disc.pack->toc_.data(), 1, disc.pack->toc_.size(),
-                          f) == disc.pack->toc_.size();
-          written = std::fclose(f) == 0 && written;
-        }
-        if (written) {
-          std::filesystem::rename(temporary, file, ec);
-          written = !ec;
-        }
-        if (written) {
-          XELOGI("Avatars: installed the avatar asset pack from {} to {}",
-                 disc.source, xe::strip_pii(xe::path_to_utf8(file)));
-        } else {
-          XELOGW("Avatars: couldn't install the avatar asset pack to {}",
-                 xe::strip_pii(xe::path_to_utf8(file)));
-        }
-        break;
       }
     }
-    if (candidates.empty()) {
-      XELOGW("Avatars: no avatar asset pack, avatars will be empty");
-      return;
+  }
+  if (check_disc && !path_given) {
+    // Discs with Kinect system updates carry the system package, and Kinect
+    // Sports has a copy of its own.
+    static const struct {
+      const char* package;
+      const char* path;
+    } kDiscPacks[] = {
+        {"FFFE07DF00000002", "game:\\$SystemUpdate\\FFFE07DF00000002"},
+        {"AvatarAssetPack", "game:\\AvatarAssetPack"},
+    };
+    for (const auto& disc_pack : kDiscPacks) {
+      if (ReadGuestFile(disc_pack.path, &data)) {
+        add(disc_pack.path, disc_pack.package, std::move(data));
+      }
     }
-    // The most complete one.
-    auto best = std::max_element(candidates.begin(), candidates.end(),
-                                 [](const Candidate& a, const Candidate& b) {
-                                   return a.present < b.present;
-                                 });
+  }
+  // A disc's pack is installed when it has more assets than the installed
+  // ones, so titles whose discs don't carry one have avatars too.
+  for (const Candidate& disc : candidates) {
+    if (disc.package.empty() || disc.present <= installed_present) {
+      continue;
+    }
+    const std::filesystem::path folder = installed / disc.package;
+    const std::filesystem::path file = folder / "AvatarAssetPack.toc";
+    const std::filesystem::path temporary = folder / "AvatarAssetPack.toc.tmp";
+    std::error_code ec;
+    std::filesystem::create_directories(folder, ec);
+    bool written = false;
+    if (FILE* f = xe::filesystem::OpenFile(temporary, "wb")) {
+      written = std::fwrite(disc.pack->toc_.data(), 1, disc.pack->toc_.size(),
+                            f) == disc.pack->toc_.size();
+      written = std::fclose(f) == 0 && written;
+    }
+    if (written) {
+      std::filesystem::rename(temporary, file, ec);
+      written = !ec;
+    }
+    if (written) {
+      installed_present = disc.present;
+      XELOGI("Avatars: installed the avatar asset pack from {} to {}",
+             disc.source, xe::strip_pii(xe::path_to_utf8(file)));
+    } else {
+      XELOGW("Avatars: couldn't install the avatar asset pack to {}",
+             xe::strip_pii(xe::path_to_utf8(file)));
+    }
+  }
+  // The most complete one, if it has more than the one in use.
+  auto best = std::max_element(candidates.begin(), candidates.end(),
+                               [](const Candidate& a, const Candidate& b) {
+                                 return a.present < b.present;
+                               });
+  if (best != candidates.end() && best->present > best_present) {
     XELOGI("Avatars: asset pack from {}: {} assets", best->source,
            best->present);
-    pack = std::move(best->pack);
-  });
-  return pack.get();
+    best_present = best->present;
+    packs.push_back(std::move(best->pack));
+  } else if (packs.empty() && check_host) {
+    XELOGW("Avatars: no avatar asset pack yet, avatars will be empty");
+  }
+  return packs.empty() ? nullptr : packs.back().get();
 }
 
 bool AvatarAssetPack::Load(std::vector<uint8_t> toc) {
@@ -985,6 +1091,16 @@ bool BuildAvatarAssets(std::span<const uint8_t> manifest,
     result.ib_offset = base + model->header[8];
     std::vector<ModelTexture> textures = model->textures;
     if (item->slots & kSlotHead) {
+      // The face's shape: nose, chin and ears.
+      for (const ManifestItem& feature : parsed.features) {
+        std::vector<uint8_t> block;
+        if (pack->GetRecord(feature.index)->type == 3 &&
+            pack->ReadBlock(feature.index, kStrbBlockShapeOverrides, &block)) {
+          ApplyShapeOverride(block, *model, &out->gpu_data[base]);
+        }
+      }
+    }
+    if (item->slots & kSlotHead) {
       // XAM fills the head's empty textures with the facial features: their
       // assets are slices of packed 128x64 masks (the head declares
       // placeholders of the same size).
@@ -1133,68 +1249,221 @@ uint8_t GetAvatarManifestBodyType(std::span<const uint8_t> manifest) {
   return 1;
 }
 
-bool GenerateAvatarManifest(uint64_t seed, uint32_t body_type,
-                            std::span<uint8_t> manifest) {
+namespace {
+// A manifest's facial features: shapes (chin, nose, ears), then textures
+// (mouth, eyes, eyebrows, facial hair, eye shadow, face paint).
+constexpr uint32_t kFeatureShapeSlots[] = {0x100000, 0x80000, 0x200000};
+constexpr uint32_t kFeatureTextureSlots[] = {0x8000,  0x2000,  0x4000,
+                                             0x10000, 0x40000, 0x20000};
+constexpr uint32_t kSlotHat = 0x40;
+
+bool IsFeatureSlots(uint32_t slots) {
+  return slots >= 0x2000 && slots < 0x400000;
+}
+
+// The slots an item occupies, for items replacing each other.
+uint32_t OccupiedSlots(const AvatarAssetPack::Record& record) {
+  return record.slots & 0x7FFFFF;
+}
+
+bool IsHatHairVariant(const AvatarAssetPack& pack, uint32_t index) {
+  const AvatarAssetPack::Record* record = pack.GetRecord(index);
+  return record && record->slots == kSlotHair && !(record->flags & 1);
+}
+}  // namespace
+
+bool ReadAvatarManifest(std::span<const uint8_t> manifest,
+                        AvatarDescription* avatar) {
   const AvatarAssetPack* pack = AvatarAssetPack::Get();
   if (!pack || manifest.size() < kAvatarManifestSize) {
     return false;
   }
-  std::mt19937_64 random(seed);
-  const uint8_t gender = body_type == 1 || body_type == 2
-                             ? uint8_t(body_type)
-                             : uint8_t(1 + random() % 2);
-  // A random editor item with exactly these slots.
-  auto pick = [&](std::initializer_list<uint32_t> slots, int32_t type,
-                  uint32_t* id) {
-    std::vector<uint32_t> candidates;
-    const auto& records = pack->records();
-    for (uint32_t i = 0; i < records.size(); ++i) {
-      const AvatarAssetPack::Record& r = records[i];
-      if (r.strb_offset && r.type == type && (r.flags & 1) &&
-          (r.gender == gender || r.gender == 3) &&
-          std::find(slots.begin(), slots.end(), r.slots) != slots.end()) {
-        candidates.push_back(i);
-      }
+  *avatar = AvatarDescription();
+  const ParsedManifest parsed = ParseManifest(*pack, manifest);
+  avatar->gender = GetAvatarManifestBodyType(manifest);
+  uint32_t bits = xe::load_and_swap<uint32_t>(&manifest[4]);
+  std::memcpy(&avatar->weight, &bits, sizeof(bits));
+  bits = xe::load_and_swap<uint32_t>(&manifest[8]);
+  std::memcpy(&avatar->height, &bits, sizeof(bits));
+  avatar->colors = parsed.colors;
+  for (const ManifestItem& item : parsed.features) {
+    avatar->items.push_back(item.index);
+  }
+  for (const ManifestItem& item : parsed.components) {
+    if (item.slots == kSlotHead || item.slots == kSlotBody) {
+      continue;
     }
-    if (candidates.empty()) {
-      return false;
+    // Hair under a hat is a variant after the hairstyle.
+    uint32_t index = item.index;
+    if (IsHatHairVariant(*pack, index) && index && pack->GetRecord(index - 1) &&
+        pack->GetRecord(index - 1)->slots == kSlotHair) {
+      --index;
     }
-    const uint32_t index = candidates[random() % candidates.size()];
-    *id = index << 16 | records[index].gender;
-    return true;
-  };
+    avatar->items.push_back(index);
+  }
+  return true;
+}
+
+bool WriteAvatarManifest(const AvatarDescription& avatar,
+                         std::span<uint8_t> manifest) {
+  const AvatarAssetPack* pack = AvatarAssetPack::Get();
+  if (!pack || manifest.size() < kAvatarManifestSize) {
+    return false;
+  }
   std::fill(manifest.begin(), manifest.end(), uint8_t(0));
   uint8_t id_namespace[8];
   std::memcpy(id_namespace, pack->id_namespace(), 8);
   id_namespace[0] |= 0xC0;
-  auto store_id = [&](size_t offset, uint32_t slots, uint32_t id) {
+  auto store_id = [&](size_t offset, uint32_t slots, uint32_t index) {
+    const AvatarAssetPack::Record* record = pack->GetRecord(index);
     xe::store_and_swap<uint32_t>(&manifest[offset], slots);
-    xe::store_and_swap<uint32_t>(&manifest[offset + 4], id);
+    xe::store_and_swap<uint32_t>(&manifest[offset + 4],
+                                 index << 16 | (record ? record->gender : 3));
     std::memcpy(&manifest[offset + 8], id_namespace, 8);
   };
-  static const float kShapes[] = {-0.5f, 0.0f, 0.5f};
-  StoreBE32Float(&manifest[4], kShapes[random() % 3]);
-  StoreBE32Float(&manifest[8], kShapes[random() % 3]);
+  StoreBE32Float(&manifest[4], avatar.weight);
+  StoreBE32Float(&manifest[8], avatar.height);
+  auto find = [&](uint32_t slots) -> const uint32_t* {
+    for (const uint32_t& index : avatar.items) {
+      const AvatarAssetPack::Record* record = pack->GetRecord(index);
+      if (record && record->slots == slots) {
+        return &index;
+      }
+    }
+    return nullptr;
+  };
   // Facial features: shapes {slots, ID} (16 bytes), then textures {slots,
   // ID, 1.0, 0...} (32 bytes).
   size_t offset = 0x0C;
-  uint32_t id;
-  for (uint32_t slots : {0x100000u, 0x80000u, 0x200000u}) {
-    if (pick({slots}, 3, &id)) {
-      store_id(offset, slots, id);
+  for (uint32_t slots : kFeatureShapeSlots) {
+    if (const uint32_t* index = find(slots)) {
+      store_id(offset, slots, *index);
       offset += 16;
     }
   }
-  std::vector<uint32_t> textures = {0x8000, 0x2000, 0x4000};
-  if (gender == 1 && random() % 3 == 0) {
-    textures.push_back(0x10000);
-  }
-  for (uint32_t slots : textures) {
-    if (pick({slots}, 2, &id)) {
-      store_id(offset, slots, id);
+  for (uint32_t slots : kFeatureTextureSlots) {
+    if (const uint32_t* index = find(slots)) {
+      store_id(offset, slots, *index);
       StoreBE32Float(&manifest[offset + 16], 1.0f);
       offset += 32;
     }
+  }
+  for (size_t i = 0; i < avatar.colors.size(); ++i) {
+    xe::store_and_swap<uint32_t>(&manifest[0xFC + 4 * i], avatar.colors[i]);
+  }
+  // Components {slots, ID (its last word the slots << 16), 3 custom colors}:
+  // the head and the body (records 2 and 0 or 1), then the rest, with the
+  // hat variant of the hairstyle under a hat. Up to 4 clothes again in
+  // reverse at 0x300.
+  bool hat = false;
+  for (uint32_t index : avatar.items) {
+    const AvatarAssetPack::Record* record = pack->GetRecord(index);
+    hat = hat || (record && (record->slots & kSlotHat));
+  }
+  struct Component {
+    uint32_t slots;
+    uint32_t index;
+  };
+  std::vector<Component> clothes;
+  for (uint32_t index : avatar.items) {
+    const AvatarAssetPack::Record* record = pack->GetRecord(index);
+    if (!record || record->type != 1 || IsFeatureSlots(record->slots)) {
+      continue;
+    }
+    if (hat && record->slots == kSlotHair &&
+        IsHatHairVariant(*pack, index + 1)) {
+      ++index;
+    }
+    clothes.push_back({record->slots, index});
+  }
+  std::vector<Component> components = {
+      {kSlotHead, 2}, {kSlotBody, avatar.gender == 2 ? 1u : 0u}};
+  components.insert(components.end(), clothes.begin(), clothes.end());
+  offset = 0x120;
+  for (const Component& component : components) {
+    if (offset + 32 > 0x300) {
+      break;
+    }
+    store_id(offset, component.slots, component.index);
+    xe::store_and_swap<uint32_t>(&manifest[offset + 16], component.slots << 16);
+    offset += 32;
+  }
+  offset = 0x300;
+  for (auto it = clothes.rbegin(); it != clothes.rend() && offset < 0x380;
+       ++it) {
+    store_id(offset, it->slots, it->index);
+    xe::store_and_swap<uint32_t>(&manifest[offset + 16], it->slots << 16);
+    offset += 32;
+  }
+  return true;
+}
+
+void SetAvatarItem(AvatarDescription* avatar, uint32_t index) {
+  const AvatarAssetPack* pack = AvatarAssetPack::Get();
+  const AvatarAssetPack::Record* record =
+      pack ? pack->GetRecord(index) : nullptr;
+  if (!record) {
+    return;
+  }
+  RemoveAvatarItems(avatar, OccupiedSlots(*record));
+  avatar->items.push_back(index);
+}
+
+void RemoveAvatarItems(AvatarDescription* avatar, uint32_t slots) {
+  const AvatarAssetPack* pack = AvatarAssetPack::Get();
+  if (!pack) {
+    return;
+  }
+  std::erase_if(avatar->items, [pack, slots](uint32_t index) {
+    const AvatarAssetPack::Record* record = pack->GetRecord(index);
+    return !record || (OccupiedSlots(*record) & slots);
+  });
+}
+
+std::vector<uint32_t> GetAvatarEditorItems(std::span<const uint32_t> slots,
+                                           uint8_t gender) {
+  std::vector<uint32_t> items;
+  const AvatarAssetPack* pack = AvatarAssetPack::Get();
+  if (!pack) {
+    return items;
+  }
+  const auto& records = pack->records();
+  for (uint32_t i = 0; i < records.size(); ++i) {
+    const AvatarAssetPack::Record& r = records[i];
+    if (r.strb_offset && r.type >= 1 && r.type <= 3 && (r.flags & 1) &&
+        (r.gender == gender || r.gender == 3) &&
+        std::find(slots.begin(), slots.end(), r.slots) != slots.end()) {
+      items.push_back(i);
+    }
+  }
+  return items;
+}
+
+bool RandomizeAvatar(uint64_t seed, uint32_t body_type,
+                     AvatarDescription* avatar) {
+  if (!AvatarAssetPack::Get()) {
+    return false;
+  }
+  std::mt19937_64 random(seed);
+  *avatar = AvatarDescription();
+  avatar->gender = body_type == 1 || body_type == 2 ? uint8_t(body_type)
+                                                    : uint8_t(1 + random() % 2);
+  static const float kShapes[] = {-0.5f, 0.0f, 0.5f};
+  avatar->weight = kShapes[random() % 3];
+  avatar->height = kShapes[random() % 3];
+  auto pick = [&](std::initializer_list<uint32_t> slots) {
+    const std::vector<uint32_t> items = GetAvatarEditorItems(
+        std::span<const uint32_t>(slots.begin(), slots.size()), avatar->gender);
+    if (!items.empty()) {
+      avatar->items.push_back(items[random() % items.size()]);
+    }
+  };
+  for (uint32_t slots :
+       {0x100000u, 0x80000u, 0x200000u, 0x8000u, 0x2000u, 0x4000u}) {
+    pick({slots});
+  }
+  if (avatar->gender == 1 && random() % 3 == 0) {
+    pick({0x10000});
   }
   // Colors (from titles' default avatars).
   static const uint32_t kSkin[] = {0xFF40280E, 0xFF64411B, 0xFF98652F,
@@ -1210,53 +1479,120 @@ bool GenerateAvatarManifest(uint64_t seed, uint32_t body_type,
   static const uint32_t kPaint[] = {0xFF399251, 0xFF4265BC, 0xFF654428,
                                     0xFFAD5F47, 0xFFD13927};
   const uint32_t hair = kHair[random() % std::size(kHair)];
-  const uint32_t colors[9] = {kSkin[random() % std::size(kSkin)],
-                              hair,
-                              kLips[random() % std::size(kLips)],
-                              kEyes[random() % std::size(kEyes)],
-                              hair,
-                              kEyeShadow[random() % std::size(kEyeShadow)],
-                              hair,
-                              kPaint[random() % std::size(kPaint)],
-                              kPaint[random() % std::size(kPaint)]};
-  for (size_t i = 0; i < 9; ++i) {
-    xe::store_and_swap<uint32_t>(&manifest[0xFC + 4 * i], colors[i]);
+  avatar->colors = {kSkin[random() % std::size(kSkin)],
+                    hair,
+                    kLips[random() % std::size(kLips)],
+                    kEyes[random() % std::size(kEyes)],
+                    hair,
+                    kEyeShadow[random() % std::size(kEyeShadow)],
+                    hair,
+                    kPaint[random() % std::size(kPaint)],
+                    kPaint[random() % std::size(kPaint)]};
+  pick({kSlotHair});
+  pick({0x8, 0x208});
+  pick({0x10});
+  pick({0x20});
+  return true;
+}
+
+bool DecodeAvatarTexture(const AvatarAssets& assets,
+                         const std::array<uint32_t, 11>& texture,
+                         uint32_t slice, std::vector<uint32_t>* rgba) {
+  const uint32_t format = texture[0];
+  const uint32_t width = texture[1];
+  const uint32_t height = texture[2];
+  const uint32_t block_bytes = TextureBlockBytes(format);
+  if (!block_bytes || !width || !height || width > 4096 || height > 4096 ||
+      slice >= std::max<uint32_t>(texture[8], 1)) {
+    return false;
   }
-  // Components {slots, ID (its last word the slots << 16), 3 custom colors};
-  // the clothes again in reverse at 0x300.
-  struct Component {
-    uint32_t slots;
-    uint32_t id;
+  const bool tiled = (format & 0x100) != 0;
+  const uint32_t blocks_x = (width + 3) / 4;
+  const uint32_t blocks_y = (height + 3) / 4;
+  const uint32_t pitch = xe::align<uint32_t>(blocks_x, 32);
+  const size_t base = size_t(texture[9]) + size_t(slice) * texture[5];
+  rgba->assign(size_t(width) * height, 0);
+  auto expand565 = [](uint32_t c, uint32_t* rgb) {
+    rgb[0] = (c >> 11) * 255 / 31;
+    rgb[1] = ((c >> 5) & 63) * 255 / 63;
+    rgb[2] = (c & 31) * 255 / 31;
   };
-  std::vector<Component> components = {
-      {kSlotHead, 2u << 16 | 3},
-      {kSlotBody, gender == 1 ? 0u << 16 | 1 : 1u << 16 | 2}};
-  std::vector<Component> clothes;
-  if (pick({kSlotHair}, 1, &id)) {
-    clothes.push_back({kSlotHair, id});
-  }
-  if (pick({0x8, 0x208}, 1, &id)) {
-    clothes.push_back({pack->GetRecord(id >> 16)->slots, id});
-  }
-  for (uint32_t slots : {0x10u, 0x20u}) {
-    if (pick({slots}, 1, &id)) {
-      clothes.push_back({slots, id});
+  for (uint32_t by = 0; by < blocks_y; ++by) {
+    for (uint32_t bx = 0; bx < blocks_x; ++bx) {
+      const size_t offset =
+          base +
+          (tiled
+               ? size_t(TiledOffset2D(bx, by, pitch, block_bytes == 8 ? 3 : 4))
+               : (size_t(by) * pitch + bx) * block_bytes);
+      if (offset + block_bytes > assets.gpu_data.size()) {
+        continue;
+      }
+      // 8-in-16 endianness.
+      uint8_t block[16];
+      for (uint32_t i = 0; i < block_bytes; i += 2) {
+        block[i] = assets.gpu_data[offset + i + 1];
+        block[i + 1] = assets.gpu_data[offset + i];
+      }
+      const uint8_t* color = block_bytes == 16 ? block + 8 : block;
+      const uint32_t c0 = color[0] | color[1] << 8;
+      const uint32_t c1 = color[2] | color[3] << 8;
+      const uint32_t indices = LoadLE32(color + 4);
+      uint32_t palette[4][3];
+      expand565(c0, palette[0]);
+      expand565(c1, palette[1]);
+      const bool four = c0 > c1 || block_bytes == 16;
+      for (uint32_t k = 0; k < 3; ++k) {
+        palette[2][k] = four ? (2 * palette[0][k] + palette[1][k]) / 3
+                             : (palette[0][k] + palette[1][k]) / 2;
+        palette[3][k] = four ? (palette[0][k] + 2 * palette[1][k]) / 3 : 0;
+      }
+      uint32_t alphas[16];
+      if ((format & 0x3F) == 0x14) {
+        // DXT5: interpolated alpha.
+        const uint32_t a0 = block[0], a1 = block[1];
+        uint32_t alpha_palette[8] = {a0, a1};
+        for (uint32_t k = 0; k < 6; ++k) {
+          alpha_palette[2 + k] =
+              a0 > a1 ? ((6 - k) * a0 + (k + 1) * a1) / 7
+                      : (k < 4 ? ((4 - k) * a0 + (k + 1) * a1) / 5
+                               : (k == 4 ? 0 : 255));
+        }
+        uint64_t bits = 0;
+        for (uint32_t k = 0; k < 6; ++k) {
+          bits |= uint64_t(block[2 + k]) << (8 * k);
+        }
+        for (uint32_t k = 0; k < 16; ++k) {
+          alphas[k] = alpha_palette[(bits >> (3 * k)) & 7];
+        }
+      } else if ((format & 0x3F) == 0x13) {
+        // DXT3: explicit alpha.
+        for (uint32_t k = 0; k < 16; ++k) {
+          alphas[k] = ((block[k / 2] >> (4 * (k & 1))) & 15) * 17;
+        }
+      } else {
+        for (uint32_t k = 0; k < 16; ++k) {
+          alphas[k] = (!four && ((indices >> (2 * k)) & 3) == 3) ? 0 : 255;
+        }
+      }
+      for (uint32_t k = 0; k < 16; ++k) {
+        const uint32_t x = bx * 4 + (k & 3), y = by * 4 + (k >> 2);
+        if (x >= width || y >= height) {
+          continue;
+        }
+        const uint32_t* p = palette[(indices >> (2 * k)) & 3];
+        (*rgba)[size_t(y) * width + x] =
+            p[0] | p[1] << 8 | p[2] << 16 | alphas[k] << 24;
+      }
     }
   }
-  components.insert(components.end(), clothes.begin(), clothes.end());
-  offset = 0x120;
-  for (const Component& component : components) {
-    store_id(offset, component.slots, component.id);
-    xe::store_and_swap<uint32_t>(&manifest[offset + 16], component.slots << 16);
-    offset += 32;
-  }
-  offset = 0x300;
-  for (auto it = clothes.rbegin(); it != clothes.rend(); ++it) {
-    store_id(offset, it->slots, it->id);
-    xe::store_and_swap<uint32_t>(&manifest[offset + 16], it->slots << 16);
-    offset += 32;
-  }
   return true;
+}
+
+bool GenerateAvatarManifest(uint64_t seed, uint32_t body_type,
+                            std::span<uint8_t> manifest) {
+  AvatarDescription avatar;
+  return RandomizeAvatar(seed, body_type, &avatar) &&
+         WriteAvatarManifest(avatar, manifest);
 }
 
 }  // namespace xam
