@@ -15,6 +15,7 @@
 #include "xenia/ui/game_list_panel_wx.h"
 #include "xenia/ui/game_scan_progress_dialog_wx.h"
 #include "xenia/ui/install_progress_dialog_wx.h"
+#include "xenia/ui/avatar_editor_dialog_wx.h"
 #include "xenia/ui/profile_editor_dialog_wx.h"
 #include "xenia/ui/quick_settings_dialog_wx.h"
 #include "xenia/ui/windowed_app_wx.h"
@@ -2585,6 +2586,18 @@ void EmulatorWindow::PopulateProfileMenu(ui::MenuItem* parent) {
         auto* edit_ptr = edit_item.get();
         entry->AddChild(std::move(edit_item));
         edit_ptr->SetEnabled(signed_in);
+
+        auto avatar_item = ui::WxMenuItem::Create(
+            ui::MenuItem::Type::kString, _("Edit avatar..."), "",
+            [this, edit_xuid]() {
+              auto* wx_window = dynamic_cast<ui::WxWindow*>(window_.get());
+              AvatarEditorDialog dlg(wx_window ? wx_window->frame() : nullptr,
+                                     this, edit_xuid);
+              dlg.ShowModal();
+            });
+        auto* avatar_ptr = avatar_item.get();
+        entry->AddChild(std::move(avatar_item));
+        avatar_ptr->SetEnabled(signed_in);
 
         parent->AddChild(std::move(entry));
       }
