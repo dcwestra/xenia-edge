@@ -93,6 +93,7 @@ struct FileAccess {
   static constexpr uint32_t kFileReadData = 0x00000001;
   static constexpr uint32_t kFileWriteData = 0x00000002;
   static constexpr uint32_t kFileAppendData = 0x00000004;
+  static constexpr uint32_t kFileWriteAttributes = 0x00000100;
 };
 
 class FileHandle {
@@ -120,6 +121,10 @@ class FileHandle {
 
   // Set length of the file in bytes.
   virtual bool SetLength(size_t length) = 0;
+
+  // Sets the FILETIMEs that aren't 0, the others left alone.
+  virtual bool SetTimes(uint64_t create_timestamp, uint64_t access_timestamp,
+                        uint64_t write_timestamp) = 0;
 
   // Flushes any pending write buffers to the underlying filesystem.
   virtual void Flush() = 0;

@@ -500,6 +500,16 @@ X_STATUS XFile::SetLength(size_t length) {
   });
   return result;
 }
+X_STATUS XFile::SetTimes(uint64_t create_timestamp, uint64_t access_timestamp,
+                         uint64_t write_timestamp) {
+  X_STATUS result = X_STATUS_SUCCESS;
+  RunSynchronousIo([&]() {
+    std::lock_guard<std::mutex> lock(file_lock_);
+    result =
+        file_->SetTimes(create_timestamp, access_timestamp, write_timestamp);
+  });
+  return result;
+}
 X_STATUS XFile::Rename(const std::filesystem::path file_path,
                        bool replace_existing) {
   X_STATUS result = X_STATUS_SUCCESS;

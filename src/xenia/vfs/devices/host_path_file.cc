@@ -74,5 +74,18 @@ X_STATUS HostPathFile::SetLength(size_t length) {
   }
 }
 
+X_STATUS HostPathFile::SetTimes(uint64_t create_timestamp,
+                                uint64_t access_timestamp,
+                                uint64_t write_timestamp) {
+  // Set through this handle, since a host file system can restamp a file when
+  // a handle that wrote it closes, unless the times were set through it.
+  if (static_cast<HostPathEntry*>(entry_)->SetTimes(
+          *file_handle_, create_timestamp, access_timestamp, write_timestamp)) {
+    return X_STATUS_SUCCESS;
+  } else {
+    return X_STATUS_UNSUCCESSFUL;
+  }
+}
+
 }  // namespace vfs
 }  // namespace xe

@@ -222,30 +222,12 @@ dword_result_t NtSetInformationFile_entry(
         break;
       }
 
-      // The host calls can block on a slow drive.
-      bool basic_result = true;
-      kernel_state()->RunBlockingIo(
-          [&]() {
-            if (info->creation_time) {
-              basic_result &=
-                  file->entry()->SetCreateTimestamp(info->creation_time);
-            }
-
-            if (info->last_access_time) {
-              basic_result &=
-                  file->entry()->SetAccessTimestamp(info->last_access_time);
-            }
-
-            if (info->last_write_time) {
-              basic_result &=
-                  file->entry()->SetWriteTimestamp(info->last_write_time);
-            }
-          },
-          GuestScheduler::BlockingCallClass::kConcurrent);
-      if (!basic_result) {
-        result = X_STATUS_UNSUCCESSFUL;
+      // The change time follows the write time.
+      if (info->creation_time || info->last_access_time ||
+          info->last_write_time) {
+        result = file->SetTimes(info->creation_time, info->last_access_time,
+                                info->last_write_time);
       }
-
       break;
     }
     case XFileRenameInformation: {

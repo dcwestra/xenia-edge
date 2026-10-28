@@ -44,9 +44,11 @@ class HostPathEntry : public Entry {
   void RetainFile() override { open_files_.fetch_add(1); }
   void ReleaseFile() override;
 
-  bool SetCreateTimestamp(uint64_t timestamp) override;
-  bool SetAccessTimestamp(uint64_t timestamp) override;
-  bool SetWriteTimestamp(uint64_t timestamp) override;
+  // Sets the FILETIMEs that aren't 0 through |file_handle|, one of this
+  // entry's.
+  bool SetTimes(xe::filesystem::FileHandle& file_handle,
+                uint64_t create_timestamp, uint64_t access_timestamp,
+                uint64_t write_timestamp);
 
  private:
   friend class HostPathDevice;

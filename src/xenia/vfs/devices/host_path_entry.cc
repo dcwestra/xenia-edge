@@ -77,8 +77,13 @@ X_STATUS HostPathEntry::Open(uint32_t desired_access, File** out_file) {
     XELOGE("Attempting to open file for write access on read-only device");
     return X_STATUS_ACCESS_DENIED;
   }
+  // FATX sets times through any handle, even one opened only to read.
+  uint32_t host_access = desired_access & ~FileAccess::kFileWriteAttributes;
+  if (!is_read_only()) {
+    host_access |= FileAccess::kFileWriteAttributes;
+  }
   auto file_handle =
-      xe::filesystem::FileHandle::OpenExisting(host_path_, desired_access);
+      xe::filesystem::FileHandle::OpenExisting(host_path_, host_access);
   if (!file_handle) {
     // TODO(benvanik): pick correct response.
     return X_STATUS_NO_SUCH_FILE;
@@ -175,38 +180,35 @@ void HostPathEntry::update() {
   }
 }
 
-bool HostPathEntry::SetCreateTimestamp(uint64_t timestamp) {
+bool HostPathEntry::SetTimes(xe::filesystem::FileHandle& file_handle,
+                             uint64_t create_timestamp,
+                             uint64_t access_timestamp,
+                             uint64_t write_timestamp) {
   if (device_->is_read_only()) {
-    XELOGW(
-        "{} - Tried to change read-only creation timestamp for file: {} to: {}",
-        __FUNCTION__, name_, timestamp);
+    XELOGW("{}: Tried to set the times of read-only file {}", __func__, name_);
     return false;
   }
-  XELOGI("{} - Tried to change creation timestamp for file: {} to: {}",
-         __FUNCTION__, name_, timestamp);
-  return true;
-}
-
-bool HostPathEntry::SetAccessTimestamp(uint64_t timestamp) {
-  if (device_->is_read_only()) {
-    XELOGW(
-        "{} - Tried to change read-only access timestamp for file: {} to: {}",
-        __FUNCTION__, name_, timestamp);
+  // FATX keeps times in 2 s units, rounding up.
+  constexpr uint64_t kTimeUnit = 2 * 10000000;
+  create_timestamp = xe::round_up(create_timestamp, kTimeUnit, false);
+  access_timestamp = xe::round_up(access_timestamp, kTimeUnit, false);
+  write_timestamp = xe::round_up(write_timestamp, kTimeUnit, false);
+  if (!file_handle.SetTimes(create_timestamp, access_timestamp,
+                            write_timestamp)) {
+    XELOGE("{}: Cannot set the times of {}", __func__,
+           xe::strip_pii(xe::path_to_utf8(host_path_)));
     return false;
   }
-  XELOGI("{} - Tried to change access timestamp for file: {} to: {}",
-         __FUNCTION__, name_, timestamp);
-  return true;
-}
-
-bool HostPathEntry::SetWriteTimestamp(uint64_t timestamp) {
-  if (device_->is_read_only()) {
-    XELOGW("{} - Tried to change read-only write timestamp for file: {} to: {}",
-           __FUNCTION__, name_, timestamp);
-    return false;
+  // update() never rereads the creation time, which a POSIX host can't keep.
+  if (create_timestamp) {
+    create_timestamp_ = create_timestamp;
   }
-  XELOGI("{} - Tried to change write timestamp for file: {} to: {}",
-         __FUNCTION__, name_, timestamp);
+  if (access_timestamp) {
+    access_timestamp_ = access_timestamp;
+  }
+  if (write_timestamp) {
+    write_timestamp_ = write_timestamp;
+  }
   return true;
 }
 

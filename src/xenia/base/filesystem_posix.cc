@@ -143,6 +143,22 @@ static uint64_t convertUnixtimeToWinFiletime(time_t unixtime) {
   return filetime;
 }
 
+// A 0 FILETIME leaves the time alone.
+static timespec convertWinFiletimeToTimespec(uint64_t filetime) {
+  if (!filetime) {
+    return {0, UTIME_OMIT};
+  }
+  int64_t ticks = int64_t(filetime) - 116444736000000000LL;
+  int64_t seconds = ticks / 10000000;
+  int64_t remainder = ticks % 10000000;
+  // tv_nsec can't be negative, so a time before 1970 borrows a second.
+  if (remainder < 0) {
+    seconds -= 1;
+    remainder += 10000000;
+  }
+  return {time_t(seconds), long(remainder * 100)};
+}
+
 bool CreateEmptyFile(const std::filesystem::path& path) {
   int file = creat(path.c_str(), 0774);
   if (file >= 0) {
@@ -188,6 +204,13 @@ class PosixFileHandle : public FileHandle {
   }
   bool SetLength(size_t length) override {
     return ftruncate(handle_, length) >= 0 ? true : false;
+  }
+  bool SetTimes(uint64_t create_timestamp, uint64_t access_timestamp,
+                uint64_t write_timestamp) override {
+    // There's no creation time to set.
+    const timespec times[2] = {convertWinFiletimeToTimespec(access_timestamp),
+                               convertWinFiletimeToTimespec(write_timestamp)};
+    return futimens(handle_, times) == 0;
   }
   void Flush() override { fsync(handle_); }
 

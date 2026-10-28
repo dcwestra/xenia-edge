@@ -190,6 +190,9 @@ class XFile : public XObject {
                  uint32_t apc_context, bool notify_completion = true);
 
   X_STATUS SetLength(size_t length);
+  // Sets the FILETIMEs that aren't 0.
+  X_STATUS SetTimes(uint64_t create_timestamp, uint64_t access_timestamp,
+                    uint64_t write_timestamp);
   X_STATUS Rename(const std::filesystem::path file_path, bool replace_existing);
 
   // False when the handle already has a port.
