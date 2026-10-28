@@ -42,9 +42,44 @@ bool HostPathEntry::has_open_files() const {
 
 void HostPathEntry::ReleaseFile() {
   auto global_lock = global_critical_region_.Acquire();
-  if (open_files_.fetch_sub(1) == 1 && delete_on_close() && parent()) {
-    Delete();
+  if (open_files_.fetch_sub(1) != 1) {
+    return;
   }
+  if (delete_on_close() && parent()) {
+    Delete();
+  } else if (overwritten_) {
+    // The old bytes past the size go with the last handle. A host file
+    // already that size is left alone so its times stay.
+    overwritten_ = false;
+    auto file_info = xe::filesystem::GetInfo(host_path_);
+    if (file_info && file_info->total_size != size_) {
+      std::error_code ec;
+      std::filesystem::resize_file(host_path_, size_, ec);
+      if (ec) {
+        XELOGE("{}: Cannot trim {}: {}", __func__,
+               xe::strip_pii(xe::path_to_utf8(host_path_)), ec.message());
+      }
+    }
+  }
+}
+
+bool HostPathEntry::Overwrite() {
+  auto global_lock = global_critical_region_.Acquire();
+  if (is_read_only() || (attributes_ & kFileAttributeDirectory) ||
+      reported_size_fixed_ || has_open_files()) {
+    return false;
+  }
+  // FATX frees the clusters without clearing them and hands the same ones back
+  // when the file grows again.
+  overwritten_ = true;
+  size_ = 0;
+  allocation_size_ = 0;
+  return true;
+}
+
+void HostPathEntry::SetOverwrittenSize(size_t size) {
+  size_ = size;
+  allocation_size_ = xe::round_up(size, device()->bytes_per_sector());
 }
 
 HostPathEntry* HostPathEntry::Create(Device* device, Entry* parent,
@@ -171,9 +206,10 @@ void HostPathEntry::update() {
   // moves on every write.
   access_timestamp_ = file_info->access_timestamp;
   write_timestamp_ = file_info->write_timestamp;
-  // A synthesized size, such as a collapsed package container, must stand.
+  // A synthesized size, such as a collapsed package container, must stand, as
+  // must an overwritten file's.
   if (file_info->type == xe::filesystem::FileInfo::Type::kFile &&
-      !reported_size_fixed_) {
+      !reported_size_fixed_ && !overwritten_) {
     size_ = file_info->total_size;
     allocation_size_ =
         xe::round_up(file_info->total_size, device()->bytes_per_sector());

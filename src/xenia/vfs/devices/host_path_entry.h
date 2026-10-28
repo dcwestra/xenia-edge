@@ -43,6 +43,7 @@ class HostPathEntry : public Entry {
   bool has_open_files() const override;
   void RetainFile() override { open_files_.fetch_add(1); }
   void ReleaseFile() override;
+  bool Overwrite() override;
 
   // Sets the FILETIMEs that aren't 0 through |file_handle|, one of this
   // entry's.
@@ -52,6 +53,9 @@ class HostPathEntry : public Entry {
 
  private:
   friend class HostPathDevice;
+  friend class HostPathFile;
+
+  void SetOverwrittenSize(size_t size);
 
   std::unique_ptr<Entry> CreateEntryInternal(const std::string_view name,
                                              uint32_t attributes) override;
@@ -65,6 +69,9 @@ class HostPathEntry : public Entry {
   // collapsed content package) and update() must not overwrite it with the
   // backing file's real size.
   bool reported_size_fixed_ = false;
+  // Set by Overwrite until the last handle closes. The host file still holds
+  // the old bytes past size_, which growing the file brings back.
+  bool overwritten_ = false;
 };
 
 }  // namespace vfs

@@ -383,11 +383,13 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry,
         break;
       case FileDisposition::kOverwrite:
       case FileDisposition::kOverwriteIf:
-        // Overwrite (we do by delete + recreate).
-        if (!entry->Delete()) {
-          return X_STATUS_ACCESS_DENIED;
+        // In place where the entry can, otherwise by delete + recreate.
+        if (!entry->Overwrite()) {
+          if (!entry->Delete()) {
+            return X_STATUS_ACCESS_DENIED;
+          }
+          entry = nullptr;
         }
-        entry = nullptr;
         *out_action = FileAction::kOverwritten;
         break;
     }
