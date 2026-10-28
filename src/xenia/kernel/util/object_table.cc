@@ -236,9 +236,20 @@ X_STATUS ObjectTable::RemoveHandle(X_HANDLE handle) {
 
     XELOGD("Removed handle:{:08X} for {}", handle, typeid(*object).name());
 
-    // Remove object name from mapping to prevent naming collision.
+    // The name moves to another of the object's guest handles and goes with
+    // its last.
     if (!object->name().empty()) {
-      RemoveNameMapping(object->name());
+      auto it = name_table_.find(string_key_case(object->name()));
+      if (it != name_table_.end() && it->second == handle) {
+        auto next = std::ranges::find_if(object->handles(), [](X_HANDLE h) {
+          return !XObject::is_handle_host_object(h);
+        });
+        if (next != object->handles().end()) {
+          it->second = *next;
+        } else {
+          name_table_.erase(it);
+        }
+      }
     }
     // Release now that the object has been removed from the table.
     object->Release();
