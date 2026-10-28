@@ -1,8 +1,8 @@
 """File corpus: a plain open, opens of a path's target directory, which open
 the directory holding the last component and say whether that exists, failed
-opens, a file's basic information, times set on a file and a rename to a \\??
-path and back. Everything is under game:\\krnlgen, which the first scenario
-makes.
+opens, a file's basic information, times set on a file, a write past the end
+of a sized file, an overwritten file sized again and a rename to a \\?? path
+and back. Everything is under game:\\krnlgen, which the first scenario makes.
 
 The target directory's handle is checked through its attributes. A failed
 open's handle is captured instead of closed. Basic information is captured
@@ -19,6 +19,7 @@ GENERIC_READ = 0x80000000
 GENERIC_WRITE = 0x40000000
 DELETE = 0x00010000
 SYNCHRONIZE = 0x00100000
+FILE_READ_ATTRIBUTES = 0x80
 FILE_WRITE_ATTRIBUTES = 0x100
 FILE_ATTRIBUTE_READONLY = 0x1
 FILE_ATTRIBUTE_DIRECTORY = 0x10
@@ -29,6 +30,7 @@ FILE_CREATE = 2
 FILE_OPEN_IF = 3
 FILE_OVERWRITE_IF = 5
 FILE_DIRECTORY_FILE = 0x1
+FILE_NO_INTERMEDIATE_BUFFERING = 0x8
 FILE_SYNCHRONOUS_IO_NONALERT = 0x20
 FILE_NON_DIRECTORY_FILE = 0x40
 OPEN_TARGET_DIRECTORY = 0x4
@@ -36,6 +38,7 @@ FILE_BASIC_INFORMATION = 4
 BASIC_INFORMATION_SIZE = 0x28
 FILE_RENAME_INFORMATION = 10
 FILE_POSITION_INFORMATION = 14
+FILE_ALLOCATION_INFORMATION = 19
 FILE_END_OF_FILE_INFORMATION = 20
 FILE_NETWORK_OPEN_INFORMATION = 34
 NETWORK_OPEN_INFORMATION_SIZE = 0x38
@@ -89,15 +92,22 @@ def create(s, path, access, file_attributes, disposition, create_options,
     return handle
 
 
-def query_attributes(s, handle, times=False):
-    """Captures the attributes, or with `times` the four times instead."""
+def query_attributes(s, handle, times=False, end_of_file=False):
+    """Captures the attributes, or with `times` the four times or with
+    `end_of_file` the end of file instead."""
     iosb = s.alloc(8, 'query iosb')
     # Zeroed, so the padding after the attributes reads alike written or not.
     info = s.alloc(NETWORK_OPEN_INFORMATION_SIZE, 'network open information',
                    fill=0)
+    if times:
+        part = info.prefix(0x20)
+    elif end_of_file:
+        part = (info + 0x28).prefix(8)
+    else:
+        part = info + 0x30
     s.call('NtQueryInformationFile', handle, iosb, info,
            NETWORK_OPEN_INFORMATION_SIZE, FILE_NETWORK_OPEN_INFORMATION,
-           capture=[iosb, info.prefix(0x20) if times else info + 0x30])
+           capture=[iosb, part])
 
 
 def query_basic(s, handle, length=BASIC_INFORMATION_SIZE):
@@ -132,6 +142,17 @@ def set_times(s, handle, creation, access, write, name):
                     status_only=True)
 
 
+def set_size(s, handle, size):
+    """Sets the end of file and then the allocation size, as XeFu titles size
+    a file. Like a rename, FATX can leave the Information of the cache's last
+    page read, so only the status is captured."""
+    data = struct.pack('>Q', size)
+    set_information(s, handle, FILE_END_OF_FILE_INFORMATION, data,
+                    'set end of file', status_only=True)
+    set_information(s, handle, FILE_ALLOCATION_INFORMATION, data,
+                    'set allocation size', status_only=True)
+
+
 def write(s, handle, size=0x200):
     """Writes `size` bytes at the start."""
     iosb = s.alloc(8, 'write iosb')
@@ -139,6 +160,15 @@ def write(s, handle, size=0x200):
     offset = s.alloc(8, 'offset', fill=0)
     s.call('NtWriteFile', handle, 0, 0, 0, iosb, data, size, offset,
            capture=[iosb])
+
+
+def read(s, handle, size):
+    """Reads `size` bytes from the start, capturing the first and last 16."""
+    iosb = s.alloc(8, 'read iosb')
+    data = s.alloc(size, 'read data')
+    offset = s.alloc(8, 'read offset', fill=0)
+    s.call('NtReadFile', handle, 0, 0, 0, iosb, data, size, offset,
+           capture=[iosb, data.prefix(0x10), data + (size - 0x10)])
 
 
 def rename(s, handle, root, path, name):
@@ -274,6 +304,44 @@ def build(corpus):
                     FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT)
     set_information(s, handle, FILE_END_OF_FILE_INFORMATION, bytes(8),
                     'set end of file')
+    s.call('NtClose', handle)
+
+    # Sized through one handle, then written unbuffered through another in
+    # whole sectors, the last one running past the end, as XeFu titles install
+    # files.
+    s = corpus.scenario('write past end of file')
+    path = ROOT + '\\sized'
+    access = GENERIC_WRITE | FILE_READ_ATTRIBUTES | SYNCHRONIZE
+    handle = create(s, path, access, 0, FILE_OVERWRITE_IF,
+                    FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+                    capture_status=False)
+    set_size(s, handle, 0x2FB)
+    s.call('NtClose', handle)
+    handle = create(s, path, access, 0, FILE_OPEN,
+                    FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT |
+                    FILE_NO_INTERMEDIATE_BUFFERING)
+    query_attributes(s, handle, end_of_file=True)
+    write(s, handle, 0x400)
+    query_attributes(s, handle, end_of_file=True)
+    s.call('NtClose', handle)
+
+    # An overwritten file keeps its old bytes, which come back when it's sized
+    # again.
+    s = corpus.scenario('overwrite then size again')
+    path = ROOT + '\\overwritten'
+    handle = create(s, path, access, 0, FILE_OVERWRITE_IF,
+                    FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+                    capture_status=False)
+    write(s, handle, 0x400)
+    s.call('NtClose', handle)
+    handle = create(s, path, access, 0, FILE_OVERWRITE_IF,
+                    FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT)
+    set_size(s, handle, 0x400)
+    s.call('NtClose', handle)
+    handle = create(s, path, GENERIC_READ | SYNCHRONIZE, 0, FILE_OPEN,
+                    FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT)
+    query_attributes(s, handle, end_of_file=True)
+    read(s, handle, 0x400)
     s.call('NtClose', handle)
 
     # A full \\?? name with no root, as XeFu renames, and back by a name under
