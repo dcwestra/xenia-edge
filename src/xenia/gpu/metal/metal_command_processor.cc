@@ -5275,6 +5275,7 @@ MTL::CommandBuffer* MetalCommandProcessor::EnsureCommandBuffer() {
     primitive_processor_->BeginFrame();
     if (render_target_cache_) {
       render_target_cache_->BeginFrame();
+      render_target_cache_->AdvanceRenderTargetUseFrame();
     }
     if (texture_cache_) {
       texture_cache_->BeginFrame();

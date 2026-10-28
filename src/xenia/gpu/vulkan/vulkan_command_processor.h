@@ -265,6 +265,9 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // submission using them now has completed. Any of them may be null.
   void DestroyScratchImageWhenIdle(VkImage image, VkImageView image_view,
                                    VkDeviceMemory memory);
+  // Queues a framebuffer for destruction once the submission using it now has
+  // completed.
+  void DestroyFramebufferWhenIdle(VkFramebuffer framebuffer);
 
   // A frame must be open.
   VkDescriptorSet AllocateSingleTransientDescriptor(

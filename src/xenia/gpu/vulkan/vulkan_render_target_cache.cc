@@ -1067,6 +1067,22 @@ void VulkanRenderTargetCache::CompletedSubmissionUpdated() {
   }
 }
 
+void VulkanRenderTargetCache::RenderTargetReused(RenderTarget& render_target,
+                                                 RenderTargetKey old_key) {
+  // Framebuffers reference views of the attachment images but aren't keyed by
+  // the render targets, so drop all of them, ending the render pass that may
+  // use one.
+  command_processor_.EndRenderPass();
+  last_update_framebuffer_ = nullptr;
+  std::memset(last_update_framebuffer_attachments_, 0,
+              sizeof(last_update_framebuffer_attachments_));
+  for (const auto& framebuffer_pair : framebuffers_) {
+    command_processor_.DestroyFramebufferWhenIdle(
+        framebuffer_pair.second.framebuffer);
+  }
+  framebuffers_.clear();
+}
+
 void VulkanRenderTargetCache::EndSubmission() {
   if (transfer_vertex_buffer_pool_) {
     transfer_vertex_buffer_pool_->FlushWrites();
