@@ -1,13 +1,16 @@
 """File corpus: a plain open, opens of a path's target directory, which open
 the directory holding the last component and say whether that exists, failed
-opens, a file's basic information and a rename to a \\?? path and back.
-Everything is under game:\\krnlgen, which the first scenario makes.
+opens, a file's basic information, times set on a file and a rename to a \\??
+path and back. Everything is under game:\\krnlgen, which the first scenario
+makes.
 
 The target directory's handle is checked through its attributes. A failed
 open's handle is captured instead of closed. Basic information is captured
-from its attributes on, the times being the host's.
+from its attributes on, the times being the host's, except the times the
+corpus sets.
 """
 
+import datetime
 import struct
 
 DOS_DEVICES = 0xFFFFFFFD
@@ -41,6 +44,22 @@ ROOT = 'game:\\krnlgen'
 FILE = ROOT + '\\file'
 
 
+def filetime(year, month, day, hour, minute, second, ticks):
+    """100 ns units since 1601, `ticks` of them past `second`."""
+    delta = (datetime.datetime(year, month, day, hour, minute, second) -
+             datetime.datetime(1601, 1, 1))
+    return (delta.days * 86400 + delta.seconds) * 10**7 + ticks
+
+
+# Odd seconds and parts of one, so rounding to a coarser unit shows. The last
+# is just past an even second, where rounding up and to the nearest differ.
+CREATION_TIME = filetime(2021, 3, 4, 5, 6, 7, 1234567)
+ACCESS_TIME = filetime(2022, 4, 5, 6, 7, 9, 2345678)
+WRITE_TIME = filetime(2023, 5, 6, 7, 8, 11, 3456789)
+REWRITE_TIME = filetime(2024, 6, 7, 8, 9, 13, 4567891)
+EVEN_WRITE_TIME = filetime(2025, 7, 8, 9, 10, 12, 1)
+
+
 def attributes(s, path):
     """OBJECT_ATTRIBUTES naming `path` under \\??."""
     text = s.string(path, 'path')
@@ -70,14 +89,15 @@ def create(s, path, access, file_attributes, disposition, create_options,
     return handle
 
 
-def query_attributes(s, handle):
+def query_attributes(s, handle, times=False):
+    """Captures the attributes, or with `times` the four times instead."""
     iosb = s.alloc(8, 'query iosb')
     # Zeroed, so the padding after the attributes reads alike written or not.
     info = s.alloc(NETWORK_OPEN_INFORMATION_SIZE, 'network open information',
                    fill=0)
     s.call('NtQueryInformationFile', handle, iosb, info,
            NETWORK_OPEN_INFORMATION_SIZE, FILE_NETWORK_OPEN_INFORMATION,
-           capture=[iosb, info + 0x30])
+           capture=[iosb, info.prefix(0x20) if times else info + 0x30])
 
 
 def query_basic(s, handle, length=BASIC_INFORMATION_SIZE):
@@ -101,6 +121,24 @@ def set_basic(s, handle, file_attributes, at=0x20):
     struct.pack_into('>I', data, at, file_attributes)
     set_information(s, handle, FILE_BASIC_INFORMATION, bytes(data),
                     f'set attributes {file_attributes:#x} at {at:#x}')
+
+
+def set_times(s, handle, creation, access, write, name):
+    """Sets only the times, a 0 one left alone. Like a rename, FATX can leave
+    the Information of the cache's last page read, so only the status is
+    captured."""
+    data = struct.pack('>QQQQI4x', creation, access, write, 0, 0)
+    set_information(s, handle, FILE_BASIC_INFORMATION, data, name,
+                    status_only=True)
+
+
+def write(s, handle, size=0x200):
+    """Writes `size` bytes at the start."""
+    iosb = s.alloc(8, 'write iosb')
+    data = s.alloc(size, 'data', fill=0x5A)
+    offset = s.alloc(8, 'offset', fill=0)
+    s.call('NtWriteFile', handle, 0, 0, 0, iosb, data, size, offset,
+           capture=[iosb])
 
 
 def rename(s, handle, root, path, name):
@@ -202,6 +240,33 @@ def build(corpus):
     query_attributes(s, handle)
     set_information(s, handle, FILE_POSITION_INFORMATION, bytes(8),
                     'set position')
+    s.call('NtClose', handle)
+
+    # Stamped through the handle that wrote it, as Xbox 1 titles under XeFu
+    # stamp their cache copies, then read back after the close.
+    s = corpus.scenario('set times')
+    handle = create(s, ROOT + '\\times',
+                    GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE,
+                    FILE_ATTRIBUTE_NORMAL, FILE_OVERWRITE_IF,
+                    FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+                    capture_status=False)
+    write(s, handle)
+    set_times(s, handle, CREATION_TIME, ACCESS_TIME, WRITE_TIME,
+              'set all times')
+    query_attributes(s, handle, times=True)
+    set_times(s, handle, 0, 0, REWRITE_TIME, 'set write time')
+    query_attributes(s, handle, times=True)
+    set_times(s, handle, 0, 0, EVEN_WRITE_TIME,
+              'set write time past an even second')
+    query_attributes(s, handle, times=True)
+    s.call('NtClose', handle)
+    handle = create(s, ROOT + '\\times', GENERIC_READ | SYNCHRONIZE, 0,
+                    FILE_OPEN,
+                    FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT)
+    query_attributes(s, handle, times=True)
+    set_times(s, handle, 0, 0, WRITE_TIME,
+              'set write time without write access')
+    query_attributes(s, handle, times=True)
     s.call('NtClose', handle)
 
     s = corpus.scenario('set end of file')
