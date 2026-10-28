@@ -414,6 +414,12 @@ X_STATUS ObjectTable::AddNameMapping(const std::string_view name,
   return X_STATUS_SUCCESS;
 }
 
+bool ObjectTable::IsNameMappedTo(const std::string_view name, X_HANDLE handle) {
+  auto global_lock = global_critical_region_.Acquire();
+  auto it = name_table_.find(string_key_case(name));
+  return it != name_table_.end() && it->second == handle;
+}
+
 void ObjectTable::RemoveNameMapping(const std::string_view name) {
   // Names are case-insensitive.
   auto global_lock = global_critical_region_.Acquire();

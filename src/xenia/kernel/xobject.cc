@@ -94,6 +94,15 @@ bool XObject::ReleaseHandle() {
 }
 
 void XObject::Retain() { ++pointer_ref_count_; }
+bool XObject::TryRetain() {
+  int32_t count = pointer_ref_count_.load();
+  while (count > 0) {
+    if (pointer_ref_count_.compare_exchange_weak(count, count + 1)) {
+      return true;
+    }
+  }
+  return false;
+}
 
 void XObject::Release() {
   if (--pointer_ref_count_ == 0) {

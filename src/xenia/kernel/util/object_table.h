@@ -64,6 +64,7 @@ class ObjectTable {
   }
 
   X_STATUS AddNameMapping(const std::string_view name, X_HANDLE handle);
+  bool IsNameMappedTo(const std::string_view name, X_HANDLE handle);
   void RemoveNameMapping(const std::string_view name);
   X_STATUS GetObjectByName(const std::string_view name, X_HANDLE* out_handle);
   template <typename T>
