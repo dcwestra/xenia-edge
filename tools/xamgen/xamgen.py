@@ -13,7 +13,9 @@ variables later steps can pass.
 
 A recorder is a routine a step passes where the system takes a callback, such
 as an APC's kernel routine. Each call counts itself in the recorder's arena
-log and, for the first calls it has room for, logs r3 onward, then returns 0.
+log and, for the first calls it has room for, logs r3 onward, then returns its
+result, 0 by default. Its address can also be written into the arena, for a
+structure the system calls through.
 
 When the steps are done it writes the results to cache:\\xamgen.bin, or to
 game:\\xamgen.bin where cache: isn't mounted (a console title without a utility
@@ -431,7 +433,13 @@ def recorder_routine(asm, recorder, index):
         a.std(3 + i, 8 + 8 * i, 12)
     a.sync()
     a.label(f'recorder_{index}_full')
-    a.li(3, 0)
+    result = recorder.result
+    if isinstance(result, Pointer):
+        a.load32(3, result.address)
+    elif result:
+        a.load32(3, result)
+    else:
+        a.li(3, 0)
     a.blr()
 
 
@@ -482,12 +490,14 @@ class Variable:
 
 class Recorder:
     """A callback whose `log` holds its call count and then `args`
-    doublewords from r3 for each of its first `calls` calls."""
+    doublewords from r3 for each of its first `calls` calls. It returns
+    `result`, a value or a Pointer's address."""
 
-    def __init__(self, log, args, calls):
+    def __init__(self, log, args, calls, result):
         self.log = log
         self.args = args
         self.calls = calls
+        self.result = result
         self.address = None
 
 
@@ -524,7 +534,13 @@ class Scenario:
         return self.alloc(size or len(data), name, data, fill=0)
 
     def write(self, pointer, data):
-        """Writes `data` at `pointer` before the next call."""
+        """Writes `data` at `pointer` before the next call, bytes or a
+        Recorder's address."""
+        if isinstance(data, Recorder):
+            if pointer.size < 4:
+                raise ValueError(f'{self.name}: write past {pointer.name}')
+            self.pending.append((pointer.offset, data))
+            return
         if len(data) > pointer.size:
             raise ValueError(f'{self.name}: write past {pointer.name}')
         self.pending.append((pointer.offset, bytes(data)))
@@ -532,12 +548,12 @@ class Scenario:
     def variable(self, name):
         return self.corpus.variable(name)
 
-    def recorder(self, name, args=1, calls=1):
+    def recorder(self, name, args=1, calls=1, result=0):
         """A Recorder for up to 8 arguments, its log zeroed."""
         if not 1 <= args <= 8:
             raise ValueError(f'{self.name}: {name} records 1 to 8 arguments')
         log = self.alloc(8 + 8 * args * calls, name, fill=0)
-        recorder = Recorder(log, args, calls)
+        recorder = Recorder(log, args, calls, result)
         self.recorders.append(recorder)
         return recorder
 
@@ -624,6 +640,8 @@ def compile_corpus(corpus, imports):
                 first = False
             record += struct.pack('>I', len(patches))
             for offset, data in patches:
+                if isinstance(data, Recorder):
+                    data = struct.pack('>I', data.address)
                 record += struct.pack('>II', offset, len(data)) + data
                 record += bytes(-len(data) % 4)
             record += struct.pack('>I', len(step['args']))
