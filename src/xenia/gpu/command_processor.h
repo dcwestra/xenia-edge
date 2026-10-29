@@ -418,6 +418,8 @@ class CommandProcessor {
   void AwaitHeldSignalsWriting(uint32_t physical_address);
   // Waits for export output and performs all held-back signals.
   void AwaitHeldSignalsAndMemexport();
+  // AwaitSubmissionForHeldSignals, counted for log_fps.
+  void AwaitSubmissionForHeldSignalsTimed(uint64_t submission);
   // At a guest wait or event packet, where the guest may expect the writes of
   // the draws before it to be ordered with later ones. Backends hide it.
   void OnGuestSyncPacket() {}
@@ -849,6 +851,14 @@ class CommandProcessor {
   std::atomic<uint64_t> guest_swaps_queued_{0};
   uint64_t guest_swaps_processed_ = 0;
   uint64_t fps_max_frames_queued_ = 0;
+  // Signals held back over the log_fps window, and the waits for the GPU to
+  // perform them: all, and those for a fence a PM4_WAIT_REG_MEM polls, which
+  // stop the command processor feeding the GPU until it catches up.
+  uint64_t fps_signals_held_ = 0;
+  uint64_t fps_held_signal_awaits_ = 0;
+  int64_t fps_held_signal_await_ns_ = 0;
+  uint64_t fps_held_fence_poll_awaits_ = 0;
+  int64_t fps_held_fence_poll_await_ns_ = 0;
 
  private:
   void SetTitleStateSuffix(std::string suffix);

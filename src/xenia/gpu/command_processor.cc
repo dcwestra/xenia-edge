@@ -532,20 +532,34 @@ void CommandProcessor::NoteGuestSwapForFpsLog() {
   if (window_ns >= int64_t(interval_s) * 1000000000) {
     // Waiting for commands is the guest not submitting, mostly the game's own
     // CPU work. Guest waits are for vertical blank or the guest's fences.
+    // Held signals: fences and interrupts held back until the GPU gets past
+    // what is before them, per frame, and the command processor's waits for
+    // that, in all and for a fence it polls.
+    const double frames = double(fps_window_frames_);
     XELOGI(
         "Guest frame rate: {:.1f} fps, longest frame {:.1f} ms ({:.1f} ms "
         "waiting for commands, {:.1f} ms in guest waits, {:.1f} ms for the "
-        "GPU), up to {} guest frames queued{}",
-        double(fps_window_frames_) * 1e9 / double(window_ns),
-        double(fps_worst_frame_ns_) / 1e6,
+        "GPU), up to {} guest frames queued, held signals {:.1f} (awaited "
+        "{:.1f} for {:.2f} ms, {:.1f} for fence polls for {:.2f} ms){}",
+        frames * 1e9 / double(window_ns), double(fps_worst_frame_ns_) / 1e6,
         double(fps_worst_frame_idle_ns_) / 1e6,
         double(fps_worst_frame_guest_wait_ns_) / 1e6,
         double(fps_worst_frame_gpu_await_ns_) / 1e6, fps_max_frames_queued_,
+        double(fps_signals_held_) / frames,
+        double(fps_held_signal_awaits_) / frames,
+        double(fps_held_signal_await_ns_) / 1e6 / frames,
+        double(fps_held_fence_poll_awaits_) / frames,
+        double(fps_held_fence_poll_await_ns_) / 1e6 / frames,
         TakeGpuTimeReport(fps_window_frames_));
     fps_window_start_ns_ = now_ns;
     fps_worst_frame_ns_ = 0;
     fps_window_frames_ = 0;
     fps_max_frames_queued_ = 0;
+    fps_signals_held_ = 0;
+    fps_held_signal_awaits_ = 0;
+    fps_held_signal_await_ns_ = 0;
+    fps_held_fence_poll_awaits_ = 0;
+    fps_held_fence_poll_await_ns_ = 0;
   }
 }
 
@@ -898,6 +912,7 @@ void CommandProcessor::HoldOrPerformGuestSignal(const HeldGuestSignal& signal) {
     return;
   }
   HeldGuestSignal& held = held_guest_signals_.emplace_back(signal);
+  ++fps_signals_held_;
   held.submission = submission;
   held.held_since = std::chrono::steady_clock::now();
   held_guest_signals_submission_ =
@@ -943,15 +958,36 @@ void CommandProcessor::AwaitHeldSignalsWriting(uint32_t physical_address) {
       break;
     }
   }
+  uint64_t awaits_before = fps_held_signal_awaits_;
+  int64_t await_ns_before = fps_held_signal_await_ns_;
   PerformHeldSignals(await_count);
+  if (await_count && fps_held_signal_awaits_ != awaits_before) {
+    ++fps_held_fence_poll_awaits_;
+    fps_held_fence_poll_await_ns_ +=
+        fps_held_signal_await_ns_ - await_ns_before;
+  }
 }
 
 void CommandProcessor::AwaitHeldSignalsAndMemexport() {
   uint64_t submission = TakeMemexportSignalSubmission();
   if (submission) {
-    AwaitSubmissionForHeldSignals(submission);
+    AwaitSubmissionForHeldSignalsTimed(submission);
   }
   PerformHeldSignals(held_guest_signals_.size());
+}
+
+void CommandProcessor::AwaitSubmissionForHeldSignalsTimed(uint64_t submission) {
+  if (!cvars::log_fps) {
+    AwaitSubmissionForHeldSignals(submission);
+    return;
+  }
+  auto start = std::chrono::steady_clock::now();
+  AwaitSubmissionForHeldSignals(submission);
+  ++fps_held_signal_awaits_;
+  fps_held_signal_await_ns_ +=
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - start)
+          .count();
 }
 
 void CommandProcessor::PerformHeldSignals(size_t await_count) {
@@ -967,7 +1003,7 @@ void CommandProcessor::PerformHeldSignals(size_t await_count) {
             std::chrono::steady_clock::now() - signal.held_since < kMaxHold) {
           return;
         }
-        AwaitSubmissionForHeldSignals(signal.submission);
+        AwaitSubmissionForHeldSignalsTimed(signal.submission);
         if (signal.submission > GetCompletedSubmission()) {
           XELOGE(
               "A guest signal was held back for submission {}, which didn't "
