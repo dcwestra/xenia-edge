@@ -589,6 +589,8 @@ std::unique_ptr<EmulatorWindow> EmulatorWindow::Create(
 }
 
 EmulatorWindow::~EmulatorWindow() {
+  library_fill_alive_->store(false);
+
   // Stop the gamepad poll thread and wait for it to exit; it touches members of
   // this window and Thread::reset() does not join.
   gamepad_poll_running_ = false;
@@ -654,6 +656,29 @@ void EmulatorWindow::InitializeGameLibrary() {
 
   game_library_ = std::make_unique<GameLibrary>(library_root);
   game_library_->Load();
+
+  // The files are read off the UI thread, and each result is recorded back on
+  // it so the library is only ever changed from there.
+  if (auto missing = game_library_->FindMissingFields(); !missing.empty()) {
+    std::thread([missing = std::move(missing), alive = library_fill_alive_,
+                 app_context = &app_context_, this]() {
+      for (const auto& release : missing) {
+        if (!alive->load(std::memory_order_relaxed)) {
+          return;
+        }
+        auto info = GameLibrary::ReadMissingFields(release);
+        if (!info) {
+          continue;
+        }
+        app_context->CallInUIThread(
+            [alive, this, key = release.key, info = std::move(*info)]() {
+              if (alive->load(std::memory_order_relaxed)) {
+                game_library_->FillMissingFields(key, info);
+              }
+            });
+      }
+    }).detach();
+  }
 
   // Load() identifies releases the library recorded before media ids were
   // kept, which separates any title that turned out to hold more than one.

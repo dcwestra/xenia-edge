@@ -247,6 +247,10 @@ class EmulatorWindow {
 
   GameListPanel* game_list_panel_ = nullptr;
   std::unique_ptr<GameLibrary> game_library_;
+  // Cleared when this window goes, which drops what the library fill thread
+  // still has queued for it.
+  std::shared_ptr<std::atomic<bool>> library_fill_alive_ =
+      std::make_shared<std::atomic<bool>>(true);
   std::unique_ptr<WxToolbarState> wx_toolbar_state_;
   // True when the app was started with --target and the title hasn't been
   // explicitly stopped yet — keeps the render pane visible during the gap

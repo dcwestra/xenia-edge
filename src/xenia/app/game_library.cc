@@ -95,6 +95,7 @@ GameFileInfo FromXbe(vfs::XbeMetadata m) {
   info.disc_number = uint8_t(m.disc_number);
   info.icon = std::move(m.icon_png);
   info.title_name = std::move(m.title_name);
+  info.content_type = XContentType::kXboxTitle;
   return info;
 }
 }  // namespace
@@ -141,7 +142,8 @@ std::optional<GameFileInfo> ReadGameFileInfo(
                         m->disc_count,
                         std::move(m->icon_data),
                         std::move(m->title_name),
-                        std::move(m->display_name)};
+                        std::move(m->display_name),
+                        XContentType(m->content_type)};
   }
   return std::nullopt;
 }
@@ -240,6 +242,10 @@ bool GameLibrary::ReadEntry(const std::filesystem::path& game_toml,
   }
   entry.last_played =
       static_cast<time_t>(tbl["last_played"].value_or(int64_t(0)));
+  if (auto content_type_str = tbl["content_type"].value<std::string>()) {
+    entry.content_type = XContentType(
+        xe::string_util::from_string<uint32_t>(*content_type_str, true));
+  }
 
   if (auto* paths = tbl["paths"].as_array()) {
     for (auto&& node : *paths) {
@@ -314,6 +320,7 @@ std::vector<GameLibrary::Release> GameLibrary::SplitIntoReleases(
       part.entry.title_id = entry.title_id;
       part.entry.version = info.version;
       part.entry.name = entry.name;
+      part.entry.content_type = info.content_type;
       result.push_back(std::move(part));
       best_disc.push_back(0);
       it = std::prev(result.end());
@@ -522,6 +529,49 @@ void GameLibrary::MigrateTitle(const std::filesystem::path& title_dir) {
   }
 }
 
+std::vector<GameLibrary::MissingFields> GameLibrary::FindMissingFields() const {
+  std::vector<MissingFields> missing;
+  std::error_code ec;
+  for (const auto& entry : entries_) {
+    // A title still in an older layout gets its fields when it is migrated.
+    if (entry.content_type != XContentType::kInvalid ||
+        !std::filesystem::exists(EntryDir(entry.key()) / "game.toml", ec)) {
+      continue;
+    }
+    MissingFields release{entry.key()};
+    for (const auto& path : entry.paths) {
+      release.paths.push_back(path.path);
+    }
+    missing.push_back(std::move(release));
+  }
+  return missing;
+}
+
+std::optional<GameFileInfo> GameLibrary::ReadMissingFields(
+    const MissingFields& missing) {
+  for (const auto& path : missing.paths) {
+    // A path that was unreadable when the title was split can belong to
+    // another release.
+    auto info = ReadGameFileInfo(path);
+    if (info && info->version == missing.key.version) {
+      return info;
+    }
+  }
+  return std::nullopt;
+}
+
+void GameLibrary::FillMissingFields(const LibraryKey& key,
+                                    const GameFileInfo& info) {
+  const auto* existing = Find(key);
+  if (!existing || existing->content_type != XContentType::kInvalid ||
+      info.content_type == XContentType::kInvalid) {
+    return;
+  }
+  LibraryEntry entry = *existing;
+  entry.content_type = info.content_type;
+  Upsert(std::move(entry));
+}
+
 bool GameLibrary::WriteEntryAtomic(const LibraryEntry& entry,
                                    const std::filesystem::path& dir) {
   std::error_code ec;
@@ -548,6 +598,11 @@ bool GameLibrary::WriteEntryAtomic(const LibraryEntry& entry,
   }
 
   toml::table tbl;
+  // Omitted while unknown, which is what makes Load() look for it.
+  if (entry.content_type != XContentType::kInvalid) {
+    tbl.insert("content_type",
+               fmt::format("{:08X}", uint32_t(entry.content_type)));
+  }
   // Seconds since the epoch. Omitted while unset so a release that has never
   // been launched doesn't carry a field claiming it was.
   if (entry.last_played) {
@@ -645,6 +700,9 @@ bool GameLibrary::AddDisc(uint32_t title_id, const std::string& name,
   if (info) {
     added.media_id = info->media_id;
     added.disc_number = info->disc_number;
+    if (entry.content_type == XContentType::kInvalid) {
+      entry.content_type = info->content_type;
+    }
   }
   entry.paths.push_back(std::move(added));
   return Upsert(std::move(entry));

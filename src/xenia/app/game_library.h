@@ -18,6 +18,8 @@
 #include <string>
 #include <vector>
 
+#include "xenia/xbox.h"
+
 namespace xe {
 namespace app {
 
@@ -39,6 +41,8 @@ struct GameFileInfo {
   // content's own, which is what tells the two apart.
   std::string title_name;
   std::string display_name;
+  // A disc image or bare XEX has no type of its own, so it counts as a title.
+  XContentType content_type = XContentType::kXbox360Title;
 };
 std::optional<GameFileInfo> ReadGameFileInfo(const std::filesystem::path& path);
 
@@ -92,6 +96,8 @@ struct LibraryEntry {
   // When this release was last launched. Per release because the profile
   // GPD only records a time per title, which cannot say which of them ran.
   time_t last_played = 0;
+  // Invalid until one of its files has been read.
+  XContentType content_type = XContentType::kInvalid;
 
   LibraryKey key() const { return {title_id, version}; }
 
@@ -111,6 +117,20 @@ class GameLibrary {
   // already has a version folder costs only a directory listing, so the
   // orphaned root game.toml is never parsed again.
   void Load();
+
+  // A release recorded without a field its files can supply.
+  struct MissingFields {
+    LibraryKey key;
+    std::vector<std::filesystem::path> paths;
+  };
+  // Filling these reads game files, which is slow enough to belong off the UI
+  // thread. Only ReadMissingFields() is safe to call from another thread.
+  std::vector<MissingFields> FindMissingFields() const;
+  // What the release's own files say. Empty while none of them can be read.
+  static std::optional<GameFileInfo> ReadMissingFields(
+      const MissingFields& missing);
+  // Fills in what the release still lacks from `info` and persists it.
+  void FillMissingFields(const LibraryKey& key, const GameFileInfo& info);
 
   // Titles that Load() separated into several releases, for telling the user
   // once. Cleared by the next Load().
