@@ -13,8 +13,8 @@
 // TakeMemexportSignalSubmission, EndSubmissionForHeldSignals and
 // AwaitSubmissionForHeldSignals implement CommandProcessor's virtuals. The
 // include site must already provide
-// SharedMemory, Shader, RegisterFile, xenos, xe::bit_scan_forward, <array> and
-// <vector>.
+// SharedMemory, Shader, RegisterFile, xenos, xe::bit_scan_forward, <array>,
+// <atomic> and <vector>.
 // No include guard: this is injected into a class body, not a standalone
 // header.
 //
@@ -44,11 +44,20 @@ void MarkMemexportPagesWritten(uint32_t base_bytes, uint32_t size_bytes,
   size_bytes = std::min(size_bytes, SharedMemory::kBufferSize - base_bytes);
   uint32_t first_page = base_bytes >> 12;
   uint32_t last_page = (base_bytes + size_bytes - 1) >> 12;
+  if (memexport_page_submissions_.empty()) {
+    memexport_page_submissions_.resize(kMemexportPageCount);
+  }
+  uint64_t submission = GetCurrentSubmission();
   for (uint32_t page = first_page; page <= last_page; ++page) {
-    memexport_written_pages_[page >> 6] |= uint64_t(1) << (page & 63);
+    uint64_t page_bit = uint64_t(1) << (page & 63);
+    memexport_written_pages_[page >> 6] |= page_bit;
+    // Fresh output, whatever the CPU wrote there before.
+    memexport_cpu_written_pages_[page >> 6].fetch_and(
+        ~page_bit, std::memory_order_relaxed);
+    memexport_page_submissions_[page] = submission;
   }
   any_memexport_pages_written_ = true;
-  memexport_last_submission_ = GetCurrentSubmission();
+  memexport_last_submission_ = submission;
   memexport_fence_pending_ = true;
   if (awaited) {
     memexport_await_pending_ = true;
@@ -207,9 +216,136 @@ bool GatherMemexportCopyRuns(uint32_t base_bytes, uint32_t size_bytes,
   return true;
 }
 
+// Pages stay marked until a resolve overwrites them, so once the game reuses
+// the memory for CPU-written data - its per-frame geometry, say - draws
+// fetching that data still route to the host buffer and refresh copies still
+// read it on the GPU timeline. The GPU runs behind the guest's fences, which
+// signal when the CP passes them, so by then the guest may have written the
+// next frame's data over it, and objects flash for a frame. This drops the
+// marks in a range that the CPU has written since their export, once that
+// export has finished: guest RAM then holds the newest data, which the usual
+// CP-time upload takes. Called on the command processor thread only.
+void ForgetCpuRewrittenMemexportPages(uint32_t base_bytes,
+                                      uint32_t size_bytes) {
+  if (!any_memexport_pages_written_ || !size_bytes ||
+      base_bytes >= SharedMemory::kBufferSize) {
+    return;
+  }
+  size_bytes = std::min(size_bytes, SharedMemory::kBufferSize - base_bytes);
+  uint32_t first_page = std::max(base_bytes >> 12, memexport_written_page_min_);
+  uint32_t last_page = std::min((base_bytes + size_bytes - 1) >> 12,
+                                memexport_written_page_max_);
+  if (first_page > last_page) {
+    return;
+  }
+  uint64_t completed_submission = GetCompletedSubmission();
+  for (uint32_t block = first_page >> 6; block <= last_page >> 6; ++block) {
+    uint64_t pages =
+        memexport_written_pages_[block] &
+        memexport_cpu_written_pages_[block].load(std::memory_order_relaxed);
+    if (block == first_page >> 6) {
+      pages &= UINT64_MAX << (first_page & 63);
+    }
+    if (block == last_page >> 6) {
+      pages &= UINT64_MAX >> (63 - (last_page & 63));
+    }
+    uint32_t page_in_block;
+    while (xe::bit_scan_forward(pages, &page_in_block)) {
+      uint64_t page_bit = uint64_t(1) << page_in_block;
+      pages &= ~page_bit;
+      if (memexport_page_submissions_[(block << 6) | page_in_block] >
+          completed_submission) {
+        // The export may still land, after the CPU write.
+        continue;
+      }
+      memexport_written_pages_[block] &= ~page_bit;
+      memexport_cpu_written_pages_[block].fetch_and(~page_bit,
+                                                    std::memory_order_relaxed);
+      ++memexport_pages_forgotten_;
+    }
+  }
+}
+
+// Draws reading guest RAM through the host buffer, and the copies refreshing
+// the device buffer from it, read it when the GPU executes them. The next fence
+// or interrupt is held back until then, as for export output: the guest reuses
+// memory once those signal, possibly before the GPU got to it.
+void HoldSignalsForHostBufferRead() {
+  memexport_last_submission_ = GetCurrentSubmission();
+  memexport_fence_pending_ = true;
+}
+
+void ForgetCpuRewrittenMemexportPagesInVertexFetch(
+    const RegisterFile& regs, const Shader& vertex_shader) {
+  const Shader::ConstantRegisterMap& constant_map =
+      vertex_shader.constant_register_map();
+  for (uint32_t i = 0; i < xe::countof(constant_map.vertex_fetch_bitmap); ++i) {
+    uint32_t vfetch_bits = constant_map.vertex_fetch_bitmap[i];
+    uint32_t j;
+    while (xe::bit_scan_forward(vfetch_bits, &j)) {
+      vfetch_bits = xe::clear_lowest_bit(vfetch_bits);
+      xenos::xe_gpu_vertex_fetch_t vfetch_constant =
+          regs.GetVertexFetch(i * 32 + j);
+      if (vfetch_constant.type == xenos::FetchConstantType::kVertex) {
+        ForgetCpuRewrittenMemexportPages(vfetch_constant.address << 2,
+                                         vfetch_constant.size << 2);
+      }
+    }
+  }
+}
+
+// On the guest thread that wrote, within the global critical region, so only
+// the atomic bitmap is touched.
+void NoteMemexportCpuWrite(uint32_t address_first, uint32_t address_last) {
+  if (address_first > address_last ||
+      address_first >= SharedMemory::kBufferSize) {
+    return;
+  }
+  address_last = std::min(address_last, SharedMemory::kBufferSize - 1);
+  uint32_t first_page = address_first >> 12;
+  uint32_t last_page = address_last >> 12;
+  for (uint32_t block = first_page >> 6; block <= last_page >> 6; ++block) {
+    uint64_t pages = UINT64_MAX;
+    if (block == first_page >> 6) {
+      pages &= UINT64_MAX << (first_page & 63);
+    }
+    if (block == last_page >> 6) {
+      pages &= UINT64_MAX >> (63 - (last_page & 63));
+    }
+    memexport_cpu_written_pages_[block].fetch_or(pages,
+                                                 std::memory_order_relaxed);
+  }
+}
+
+// After the shared memory is created, and before it is destroyed.
+void RegisterMemexportCpuWriteWatch() {
+  using Self = std::remove_pointer_t<decltype(this)>;
+  memexport_cpu_write_watch_ = shared_memory_->RegisterGlobalWatch(
+      [](const global_unique_lock_type& global_lock, void* context,
+         uint32_t address_first, uint32_t address_last,
+         bool invalidated_by_gpu) {
+        if (!invalidated_by_gpu) {
+          static_cast<Self*>(context)->NoteMemexportCpuWrite(address_first,
+                                                             address_last);
+        }
+      },
+      this);
+}
+
+void UnregisterMemexportCpuWriteWatch() {
+  if (memexport_cpu_write_watch_) {
+    shared_memory_->UnregisterGlobalWatch(memexport_cpu_write_watch_);
+    memexport_cpu_write_watch_ = nullptr;
+  }
+}
+
 // Resets all tracking, called from each backend's ShutdownContext.
 void ResetMemexportPages() {
   memexport_written_pages_.fill(0);
+  for (std::atomic<uint64_t>& pages : memexport_cpu_written_pages_) {
+    pages.store(0, std::memory_order_relaxed);
+  }
+  memexport_page_submissions_.clear();
   any_memexport_pages_written_ = false;
   memexport_fence_pending_ = false;
   memexport_await_pending_ = false;
@@ -222,6 +358,15 @@ void ResetMemexportPages() {
 // Guest pages (4 KB) any memexport draw has written, at host buffer offsets.
 static constexpr uint32_t kMemexportPageCount = SharedMemory::kBufferSize >> 12;
 std::array<uint64_t, kMemexportPageCount / 64> memexport_written_pages_{};
+// Pages the CPU has written since an export last did, set from a shared memory
+// global watch on the writing thread.
+std::array<std::atomic<uint64_t>, kMemexportPageCount / 64>
+    memexport_cpu_written_pages_{};
+SharedMemory::GlobalWatchHandle memexport_cpu_write_watch_ = nullptr;
+// Submission each page was last exported in, allocated with the first export.
+std::vector<uint64_t> memexport_page_submissions_;
+// Marks ForgetCpuRewrittenMemexportPages dropped, for the log_fps report.
+uint64_t memexport_pages_forgotten_ = 0;
 // Cleared until the first memexport draw, so consumer-side routing is skipped
 // entirely for titles that never memexport.
 bool any_memexport_pages_written_ = false;
@@ -229,7 +374,7 @@ bool any_memexport_pages_written_ = false;
 bool memexport_fence_pending_ = false;
 // Same, of awaited output, which coherency requests also wait for.
 bool memexport_await_pending_ = false;
-// Submission the last export draw was recorded in.
+// Submission the last export draw, or host buffer read, was recorded in.
 uint64_t memexport_last_submission_ = 0;
 // Same, of the last export draw that is awaited.
 uint64_t memexport_awaited_submission_ = 0;

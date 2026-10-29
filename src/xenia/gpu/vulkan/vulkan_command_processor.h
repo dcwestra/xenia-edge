@@ -774,6 +774,10 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // Comparable against the Metal backend's render encoder count: on a TBDR GPU
   // each one is a tile store plus an attachment reload.
   uint64_t render_passes_total_ = 0;
+  // Draws routed to the host buffer since the last log_fps report, and of
+  // those, the ones not exporting themselves.
+  uint64_t host_routed_draws_ = 0;
+  uint64_t host_routed_consumer_draws_ = 0;
   uint64_t render_passes_window_start_ = 0;
   uint32_t render_pass_window_frames_ = 0;
 

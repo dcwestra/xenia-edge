@@ -33,6 +33,8 @@ DECLARE_bool(enable_host_buffer);
 DECLARE_bool(memexport_enable);
 DECLARE_bool(memexport_await_pixel_exports);
 DECLARE_bool(memexport_await_vertex_exports);
+DECLARE_bool(memexport_forget_cpu_rewritten_pages);
+DECLARE_bool(memexport_hold_signals_for_host_reads);
 
 DECLARE_bool(non_seamless_cube_map);
 

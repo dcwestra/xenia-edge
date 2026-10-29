@@ -143,6 +143,26 @@ DEFINE_bool(
     "GPU");
 
 DEFINE_bool(
+    memexport_forget_cpu_rewritten_pages, true,
+    "Stop treating a page as memory export output once the CPU has written it "
+    "and the export that wrote it has finished on the GPU. Otherwise the "
+    "geometry a game later places on such a page is read from guest RAM on "
+    "the GPU timeline, possibly after the game has already reused it, and "
+    "objects flash for a frame (Fable II). Vulkan with the host buffer only.",
+    "GPU");
+
+DEFINE_bool(
+    memexport_hold_signals_for_host_reads, true,
+    "Hold a fence or interrupt back until the draws and copies before it that "
+    "read guest RAM through the host buffer have run on the GPU, as is done "
+    "for export output. They read it when the GPU executes them, which can be "
+    "frames after the command processor passes the fence, and a game reuses "
+    "memory once its fence signals, so objects drawn from exported data can "
+    "flash for a frame (Fable II's characters). Vulkan with the host buffer "
+    "only.",
+    "GPU");
+
+DEFINE_bool(
     precise_interpolation, true,
     "Manually interpolate pixel shader inputs with barycentric coordinates to "
     "exactly match the guest and avoid hardware interpolation precision "

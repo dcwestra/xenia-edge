@@ -431,6 +431,7 @@ bool VulkanCommandProcessor::SetupContext() {
     XELOGE("Failed to initialize shared memory");
     return false;
   }
+  RegisterMemexportCpuWriteWatch();
 
   // Read-watch consumption tracking for resolves.
   InitResolveReadWatch();
@@ -1575,6 +1576,9 @@ void VulkanCommandProcessor::ShutdownContext() {
 
   primitive_processor_.reset();
 
+  if (shared_memory_) {
+    UnregisterMemexportCpuWriteWatch();
+  }
   shared_memory_.reset();
 
   ClearTransientDescriptorPools();
@@ -4088,16 +4092,37 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   bool route_to_host = false;
   if (cvars::memexport_enable &&
       shared_memory_host_and_edram_descriptor_set_ != VK_NULL_HANDLE) {
+    bool guest_dma_indices =
+        primitive_processing_result.index_buffer_type ==
+        PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA;
+    uint32_t guest_index_bytes =
+        primitive_processing_result.guest_draw_vertex_count *
+        uint32_t(sizeof(uint32_t));
+    if (!memexport_used && any_memexport_pages_written_ &&
+        cvars::memexport_forget_cpu_rewritten_pages) {
+      if (guest_dma_indices) {
+        ForgetCpuRewrittenMemexportPages(
+            primitive_processing_result.guest_index_base, guest_index_bytes);
+      }
+      ForgetCpuRewrittenMemexportPagesInVertexFetch(regs, *vertex_shader);
+    }
     route_to_host =
         memexport_used ||
         (any_memexport_pages_written_ &&
-         ((primitive_processing_result.index_buffer_type ==
-               PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA &&
-           IsMemexportRange(
-               primitive_processing_result.guest_index_base,
-               primitive_processing_result.guest_draw_vertex_count *
-                   uint32_t(sizeof(uint32_t)))) ||
+         ((guest_dma_indices &&
+           IsMemexportRange(primitive_processing_result.guest_index_base,
+                            guest_index_bytes)) ||
           VertexFetchInMemexportRange(regs, *vertex_shader)));
+    if (route_to_host) {
+      ++host_routed_draws_;
+      if (!memexport_used) {
+        ++host_routed_consumer_draws_;
+        // Exporting draws hold signals when marking their output.
+        if (cvars::memexport_hold_signals_for_host_reads) {
+          HoldSignalsForHostBufferRead();
+        }
+      }
+    }
   }
   {
     // Select this draw's shared-memory set, forcing a re-bind only if it
@@ -4508,9 +4533,17 @@ bool VulkanCommandProcessor::EnsureMemexportRangeInDeviceBuffer(
   // keeps it ordered against the writes that produced it, which a CPU read
   // cannot be.
   if (!cvars::memexport_enable ||
-      shared_memory_host_and_edram_descriptor_set_ == VK_NULL_HANDLE ||
-      !GatherMemexportCopyRuns(base_bytes, size_bytes, whole_range)) {
+      shared_memory_host_and_edram_descriptor_set_ == VK_NULL_HANDLE) {
     return false;
+  }
+  if (cvars::memexport_forget_cpu_rewritten_pages) {
+    ForgetCpuRewrittenMemexportPages(base_bytes, size_bytes);
+  }
+  if (!GatherMemexportCopyRuns(base_bytes, size_bytes, whole_range)) {
+    return false;
+  }
+  if (cvars::memexport_hold_signals_for_host_reads) {
+    HoldSignalsForHostBufferRead();
   }
   // The barriers span the runs.
   base_bytes = memexport_copy_runs_.front().first;
@@ -6025,6 +6058,19 @@ std::string VulkanCommandProcessor::TakeGpuTimeReport(uint32_t frames) {
       ", shared memory barriers between draws {:.1f} ({:.1f} skipped)",
       double(draw_barriers.first) / frames,
       double(draw_barriers.second) / frames);
+  if (host_routed_draws_ || memexport_pages_forgotten_) {
+    // Consumers read guest RAM on the GPU timeline, so CPU-written data among
+    // them can be torn by the guest reusing it.
+    report += fmt::format(
+        ", host buffer draws {:.1f} ({:.1f} not exporting), {:.1f} export "
+        "pages forgotten",
+        double(host_routed_draws_) / frames,
+        double(host_routed_consumer_draws_) / frames,
+        double(memexport_pages_forgotten_) / frames);
+    host_routed_draws_ = 0;
+    host_routed_consumer_draws_ = 0;
+    memexport_pages_forgotten_ = 0;
+  }
   if (gpu_phase_untimed_submissions_) {
     report +=
         fmt::format(", {} submissions untimed", gpu_phase_untimed_submissions_);
