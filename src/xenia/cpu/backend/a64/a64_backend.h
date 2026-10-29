@@ -35,6 +35,11 @@ class A64CodeCache;
 typedef void* (*HostToGuestThunk)(void* target, void* arg0, void* arg1);
 typedef void* (*GuestToHostThunk)(void* target, void* arg0, void* arg1);
 typedef void (*ResolveFunctionThunk)();
+// Host entry to a stwcx. helper, returns 1 if the store landed. The value is
+// guest endian.
+typedef uint32_t (*ReservedStoreThunk)(uint32_t guest_address,
+                                       ppc::PPCContext* context, uint64_t value,
+                                       void* host_address);
 
 // Place guest trampolines in an address range that the HV normally occupies.
 static constexpr uint32_t GUEST_TRAMPOLINE_BASE = 0x80000000;
@@ -154,6 +159,8 @@ struct A64BackendContext {
   uint64_t vrsqrtefp_scalar_helper_address;
   uint64_t vrsqrtefp_vector_helper_address;
   uint64_t frsqrte_helper_address;
+  uint64_t reserved_store_32_helper_address;
+  uint64_t reserved_store_64_helper_address;
   // The address of the yield handler pointer, not the handler: the scheduler
   // installs the handler after guest threads exist and drops it on shutdown.
   uint64_t preempt_yield_handler_address;
@@ -257,6 +264,8 @@ class A64Backend : public Backend {
     return reinterpret_cast<A64BackendContext*>(
         reinterpret_cast<intptr_t>(ctx) - sizeof(A64BackendContext));
   }
+  // lwarx found the granule claimed, refreshes the generation it took.
+  static uint64_t AwaitReservation(void* raw_context, uint64_t guest_address);
 
   uint32_t CreateGuestTrampoline(GuestTrampolineProc proc, void* userdata1,
                                  void* userdata2, bool long_term) override;
@@ -287,6 +296,7 @@ class A64Backend : public Backend {
  private:
   static bool ExceptionCallbackThunk(Exception* ex, void* data);
   bool ExceptionCallback(Exception* ex);
+  static uint64_t ReleaseFaultingReservedStore(void* data, Exception* ex);
 
   uintptr_t capstone_handle_ = 0;
 
@@ -302,6 +312,11 @@ class A64Backend : public Backend {
   void* vrsqrtefp_scalar_helper_ = nullptr;
   void* vrsqrtefp_vector_helper_ = nullptr;
   void* frsqrte_helper_ = nullptr;
+  void* reserved_store_32_helper_ = nullptr;
+  void* reserved_store_64_helper_ = nullptr;
+  ReservedStoreThunk reserved_store_32_thunk_ = nullptr;
+  ReservedStoreThunk reserved_store_64_thunk_ = nullptr;
+  ReservedStoreFaultSite reserved_store_fault_sites_[2] = {};
 
   alignas(64) ReserveHelper reserve_helper_;
   // The registered backend contexts, whose dynamic call caches a sweep clears.

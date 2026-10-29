@@ -16,8 +16,10 @@
 #include <vector>
 
 #include "xenia/base/byte_order.h"
+#include "xenia/base/mutex.h"
 #include "xenia/base/platform.h"
 #include "xenia/cpu/thread_state.h"
+#include "xenia/memory.h"
 
 #if XE_ARCH_ARM64
 #include "xenia/base/cvar.h"
@@ -273,6 +275,85 @@ uint32_t StressStack(Processor* processor, Memory* memory, Attempt attempt) {
   memory->SystemHeapFree(nodes);
   memory->SystemHeapFree(head);
   return double_pops.load();
+}
+
+// Guest addresses this far apart share a granule counter.
+#if XE_ARCH_AMD64
+constexpr uint32_t kGranuleTablePeriod = backend::x64::RESERVE_NUM_ENTRIES
+                                         << backend::x64::RESERVE_GRANULE_SHIFT;
+#elif XE_ARCH_ARM64
+constexpr uint32_t kGranuleTablePeriod =
+    backend::a64::A64_RESERVE_NUM_ENTRIES
+    << backend::a64::A64_RESERVE_GRANULE_SHIFT;
+#endif  // XE_ARCH
+
+std::pair<uint32_t, uint32_t> UnwatchAnyRange(void*, uint32_t, uint32_t, bool) {
+  return {0, UINT32_MAX};
+}
+
+// A worker's stwcx. faults on a write-watched page, whose handling waits on the
+// global lock. This thread holds that lock while it retries a stwcx. on another
+// page with the same granule counter. Returns whether the retry got through.
+template <typename Store>
+bool StoreDuringFaultingStore(Processor* processor, Memory* memory,
+                              Store store) {
+  constexpr uint32_t kWatched = 0xE4000000;
+  constexpr uint32_t kSameCounter = kWatched + kGranuleTablePeriod;
+  for (uint32_t address : {kWatched, kSameCounter}) {
+    REQUIRE(memory->LookupHeap(address)->AllocFixed(
+        address, 4096, 4096, kMemoryAllocationReserve | kMemoryAllocationCommit,
+        kMemoryProtectRead | kMemoryProtectWrite));
+  }
+  void* invalidation_callback =
+      memory->RegisterPhysicalMemoryInvalidationCallback(UnwatchAnyRange,
+                                                         nullptr);
+  memory->EnablePhysicalMemoryAccessCallbacks(
+      memory->GetPhysicalAddress(kWatched), 4096, true, false);
+
+  // Both before the lock, setting up a thread state takes it.
+  SecondThread holder(processor, memory);
+  SecondThread faulting(processor, memory);
+  auto* backend = processor->backend();
+  std::atomic<bool> storing{false};
+  bool stuck_in_fault = false;
+  bool stored = false;
+  {
+    auto global_lock = global_critical_region::AcquireDirect();
+    std::thread worker([&]() {
+      PPCContext* ctx = faulting.context();
+      ctx->lr = 0xBCBCBCBC;
+      ctx->r[4] = kWatched;
+      ctx->r[5] = 0x12345678;
+      storing = true;
+      do {
+        backend->ReservedLoad32(ctx, kWatched);
+        store(ctx);
+      } while (!ctx->r[6]);
+    });
+    while (!storing) {
+      std::this_thread::yield();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    stuck_in_fault = GuestRead32(memory, kWatched) == 0;
+
+    PPCContext* ctx = holder.context();
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!stored && std::chrono::steady_clock::now() < deadline) {
+      uint32_t value = backend->ReservedLoad32(ctx, kSameCounter);
+      stored = backend->ReservedStore32(ctx, kSameCounter, value + 1);
+    }
+    global_lock.unlock();
+    worker.join();
+  }
+
+  REQUIRE(stuck_in_fault);
+  REQUIRE(GuestRead32(memory, kWatched) == 0x12345678u);
+  memory->UnregisterPhysicalMemoryInvalidationCallback(invalidation_callback);
+  for (uint32_t address : {kWatched, kSameCounter}) {
+    memory->LookupHeap(address)->Release(address);
+  }
+  return stored;
 }
 }  // namespace
 
@@ -713,6 +794,32 @@ TEST_CASE("RESERVED_GUEST_STACK_STRESS", "[reserve]") {
         fn->Call(ctx->thread_state, uint32_t(ctx->lr));
       });
   REQUIRE(double_pops == 0);
+}
+
+// =============================================================================
+// Faulting stores
+// =============================================================================
+TEST_CASE("RESERVED_GUEST_STORE_FAULT_UNDER_LOCK", "[reserve]") {
+  ScopedAtomicsMode atomics_mode(GENERATE(XE_RESERVE_ATOMICS_MODES));
+  TestFunction test(EmitGuestReservedStoreOnly);
+  auto* processor = test.processors[0].get();
+  // compiling takes the global lock, so not on the first call under it
+  auto* fn = processor->ResolveFunction(0x80000000);
+  REQUIRE(fn);
+  REQUIRE(StoreDuringFaultingStore(
+      processor, test.memory.get(), [&](PPCContext* ctx) {
+        fn->Call(ctx->thread_state, uint32_t(ctx->lr));
+      }));
+}
+
+TEST_CASE("RESERVED_HOST_STORE_FAULT_UNDER_LOCK", "[reserve]") {
+  TestFunction test([](HIRBuilder& b) { b.Return(); });
+  auto* processor = test.processors[0].get();
+  REQUIRE(StoreDuringFaultingStore(
+      processor, test.memory.get(), [&](PPCContext* ctx) {
+        ctx->r[6] = processor->backend()->ReservedStore32(
+            ctx, uint32_t(ctx->r[4]), uint32_t(ctx->r[5]));
+      }));
 }
 
 // =============================================================================
