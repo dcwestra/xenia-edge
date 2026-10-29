@@ -14,6 +14,7 @@
 #include <fstream>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "xenia/base/byte_order.h"
@@ -23,6 +24,7 @@
 #include "xenia/vfs/file.h"
 #include "xenia/vfs/gdfx_util.h"
 #include "xenia/vfs/xbe_metadata.h"
+#include "xenia/vfs/xbox_original_data.h"
 #include "xenia/vfs/xex_metadata.h"
 
 #include "third_party/catch/include/catch.hpp"
@@ -161,6 +163,155 @@ TEST_CASE("XBE metadata", "[xbe]") {
     xbe[0] = 0;
     REQUIRE(!ExtractXbeMetadata(xbe.data(), xbe.size()));
   }
+}
+
+// UTF-16 text behind the byte order mark the Xbox writes ahead of it.
+static std::vector<uint8_t> Utf16Text(std::u16string_view text) {
+  std::vector<uint8_t> bytes = {0xFF, 0xFE};
+  for (char16_t c : text) {
+    bytes.push_back(uint8_t(c));
+    bytes.push_back(uint8_t(c >> 8));
+  }
+  return bytes;
+}
+
+// A ContentMeta.xbx whose first section is |section|.
+static std::vector<uint8_t> MakeContentMeta(
+    const std::vector<uint8_t>& section) {
+  std::vector<uint8_t> meta(0x88);
+  std::memcpy(&meta[0x14], "XCSF", 4);
+  Put<uint32_t>(meta, 0x34, 0x88);
+  Put<uint32_t>(meta, 0x38, uint32_t(section.size()));
+  meta.insert(meta.end(), section.begin(), section.end());
+  return meta;
+}
+
+TEST_CASE("Original Xbox save and content names", "[xbox_original]") {
+  SECTION("A save is named by its SaveMeta") {
+    const auto meta = Utf16Text(u"Name=PRINCE_01\r\nNoCopy=1\r\n");
+    REQUIRE(ReadSaveMetaName(meta) == "PRINCE_01");
+  }
+
+  SECTION("A SaveMeta without a name names nothing") {
+    REQUIRE(ReadSaveMetaName({}).empty());
+    REQUIRE(ReadSaveMetaName(Utf16Text(u"NoCopy=1\r\n")).empty());
+  }
+
+  SECTION("The first two bytes are skipped whatever they hold") {
+    auto meta = Utf16Text(u"Name=Career\r\n");
+    meta[0] = 'X';
+    meta[1] = 0;
+    REQUIRE(ReadSaveMetaName(meta) == "Career");
+  }
+
+  SECTION("A broken surrogate pair doesn't stop the name being read") {
+    auto meta = Utf16Text(u"Name=A");
+    meta.push_back(0x00);
+    meta.push_back(0xD8);
+    REQUIRE(ReadSaveMetaName(meta) == "A\xEF\xBF\xBD");
+  }
+
+  SECTION("Padding after a name is not part of it") {
+    const auto meta = Utf16Text(std::u16string(u"Name=Foo") + u'\0' + u'\0');
+    REQUIRE(ReadSaveMetaName(meta) == "Foo");
+  }
+
+  const auto packs = MakeContentMeta(
+      Utf16Text(u"[Default]\r\nName=Bonus Map Pack\r\n[DE]\r\n"
+                u"Name=Bonus-Karten-Paket\r\n[JA]\r\nName=\r\n"));
+
+  SECTION("Content is named in the language asked for") {
+    REQUIRE(ReadContentMetaName(packs, XLanguage::kGerman) ==
+            "Bonus-Karten-Paket");
+  }
+
+  SECTION("A language without a name falls back to the default") {
+    REQUIRE(ReadContentMetaName(packs, XLanguage::kJapanese) ==
+            "Bonus Map Pack");
+    REQUIRE(ReadContentMetaName(packs, XLanguage::kRussian) ==
+            "Bonus Map Pack");
+  }
+
+  SECTION("Without a default name, English comes before other languages") {
+    const auto meta = MakeContentMeta(
+        Utf16Text(u"[JA]\r\nName=Japanese\r\n[EN]\r\nName=English\r\n"));
+    REQUIRE(ReadContentMetaName(meta, XLanguage::kGerman) == "English");
+  }
+
+  SECTION("Quotes around a name are not part of it") {
+    const auto meta = MakeContentMeta(
+        Utf16Text(u"[default]\r\nName=\"Blastacular Pack\"\r\n"));
+    REQUIRE(ReadContentMetaName(meta, XLanguage::kEnglish) ==
+            "Blastacular Pack");
+  }
+
+  SECTION("A title update's binary section names nothing") {
+    const auto meta = MakeContentMeta({1, 0, 0, 0, 0x46, 0, 0, 0});
+    REQUIRE(ReadContentMetaName(meta, XLanguage::kEnglish).empty());
+  }
+
+  SECTION("Anything else names nothing") {
+    auto meta = packs;
+    meta[0x14] = 0;
+    REQUIRE(ReadContentMetaName(meta, XLanguage::kEnglish).empty());
+    meta = packs;
+    Put<uint32_t>(meta, 0x34, uint32_t(meta.size()));
+    REQUIRE(ReadContentMetaName(meta, XLanguage::kEnglish).empty());
+  }
+}
+
+TEST_CASE("Original Xbox title data on disk", "[xbox_original]") {
+  const std::filesystem::path root =
+      std::filesystem::temp_directory_path() /
+      ("xenia-vfs-xbox-" +
+       std::to_string(
+           std::chrono::steady_clock::now().time_since_epoch().count()));
+  auto write = [](const std::filesystem::path& path,
+                  const std::vector<uint8_t>& bytes) {
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream(path, std::ios::binary)
+        .write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+  };
+  const auto saves_dir = root / "UDATA" / "4D53004B";
+  write(saves_dir / "AAAAAAAAAAAA" / "SaveMeta.xbx",
+        Utf16Text(u"Name=career\r\n"));
+  write(saves_dir / "CCCCCCCCCCCC" / "SaveMeta.xbx",
+        Utf16Text(u"Name=Zeta\r\n"));
+  write(saves_dir / "12E9194916CD" / "SaveMeta.xbx", {});
+  std::filesystem::create_directories(saves_dir / "BBBBBBBBBBBB");
+  write(saves_dir / "TitleMeta.xbx", Utf16Text(u"TitleName=PGR2\r\n"));
+  const auto title_data = root / "TDATA" / "4d530064";
+  write(title_data / "$c" / "4D53006400000001" / "ContentMeta.xbx",
+        MakeContentMeta(Utf16Text(u"[Default]\r\nName=Bonus Map Pack\r\n")));
+  std::filesystem::create_directories(title_data / "$c" / "4D53006400000002");
+  write(title_data / "$u" / "default.xbe", {0});
+
+  SECTION("Folders are found in any case") {
+    REQUIRE(FindXboxOriginalPath(root / "UDATA", "4d53004b") == saves_dir);
+    REQUIRE(FindXboxOriginalPath(root / "TDATA", "4D530064") == title_data);
+    REQUIRE(FindXboxOriginalPath(title_data, "$U") == title_data / "$u");
+    REQUIRE(FindXboxOriginalPath(root, "missing").empty());
+  }
+
+  SECTION("Each save folder is a save, named ones first") {
+    const auto saves = ListXboxOriginalSaves(saves_dir);
+    REQUIRE(saves.size() == 4);
+    REQUIRE(saves[0].name == "career");
+    REQUIRE(saves[1].name == "Zeta");
+    REQUIRE(saves[2].name.empty());
+    REQUIRE(saves[2].path.filename() == "12E9194916CD");
+    REQUIRE(saves[3].name.empty());
+  }
+
+  SECTION("Each content folder is a package") {
+    const auto content =
+        ListXboxOriginalContent(title_data / "$c", XLanguage::kEnglish);
+    REQUIRE(content.size() == 2);
+    REQUIRE(content[0].name == "Bonus Map Pack");
+    REQUIRE(content[1].name.empty());
+  }
+
+  std::filesystem::remove_all(root);
 }
 
 // A XEX2 header holding just the security info, which allows |media|.
