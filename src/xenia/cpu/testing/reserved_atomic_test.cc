@@ -9,9 +9,17 @@
 
 #include "xenia/cpu/testing/util.h"
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <thread>
+#include <vector>
+
 #include "xenia/base/byte_order.h"
+#include "xenia/base/mutex.h"
 #include "xenia/base/platform.h"
 #include "xenia/cpu/thread_state.h"
+#include "xenia/memory.h"
 
 #if XE_ARCH_ARM64
 #include "xenia/base/cvar.h"
@@ -178,6 +186,175 @@ void EmitGuestReservedPair64(HIRBuilder& b) {
   b.Return();
 }
 
+// One lock-free stack attempt on the head at r4: r7 = 0 pops into r3, r7 = 1
+// pushes r5. r6 = 1 if it landed. A pop links the dummy node in r8.
+void EmitGuestStackAttempt(HIRBuilder& b) {
+  auto head = LoadGPR(b, 4);
+  auto push = b.CompareNE(LoadGPR(b, 7), b.LoadConstantUint64(0));
+  auto node = b.Select(push, LoadGPR(b, 5), LoadGPR(b, 8));
+  auto top = b.LoadWithReserve(head, INT32_TYPE);
+  auto top_node = b.ZeroExtend(b.ByteSwap(top), INT64_TYPE);
+  StoreGPR(b, 3, top_node);
+  b.Store(b.Add(node, b.LoadConstantUint64(4)), top);
+  auto next = b.Load(b.Add(top_node, b.LoadConstantUint64(4)), INT32_TYPE);
+  auto stored = b.StoreWithReserve(
+      head, b.Select(push, b.ByteSwap(b.Truncate(node, INT32_TYPE)), next),
+      INT32_TYPE);
+  StoreGPR(b, 6, b.ZeroExtend(stored, INT64_TYPE));
+  b.Return();
+}
+
+// Oversubscribed threads pop and push a few nodes, returns how many pops got a
+// node another thread already owned.
+template <typename Attempt>
+uint32_t StressStack(Processor* processor, Memory* memory, Attempt attempt) {
+  const uint32_t thread_count =
+      std::max(4u, 2 * std::thread::hardware_concurrency());
+  const uint32_t node_count = thread_count + 2;
+  constexpr uint32_t kNodeStride = 64;
+
+  uint32_t head = AllocScratch(memory);
+  uint32_t nodes = memory->SystemHeapAlloc(node_count * kNodeStride + 128, 128);
+  // only a corrupted list can run dry and pop the trap
+  uint32_t trap = nodes + node_count * kNodeStride;
+  uint32_t dummy = trap + kNodeStride;
+  GuestWrite32(memory, trap + 4, trap);
+  for (uint32_t i = 0; i < node_count; ++i) {
+    uint32_t node = nodes + i * kNodeStride;
+    GuestWrite32(memory, node + 4,
+                 i + 1 < node_count ? node + kNodeStride : trap);
+  }
+  GuestWrite32(memory, head, nodes);
+
+  std::vector<std::atomic<uint32_t>> owned(node_count);
+  std::atomic<uint32_t> double_pops{0};
+  std::atomic<bool> stop{false};
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+
+  std::vector<std::thread> threads;
+  for (uint32_t t = 0; t < thread_count; ++t) {
+    threads.emplace_back([&, t]() {
+      SecondThread thread(processor, memory);
+      PPCContext* ctx = thread.context();
+      ctx->lr = 0xBCBCBCBC;
+      ctx->r[4] = head;
+      ctx->r[8] = dummy;
+      uint32_t ops = 0;
+      while (!stop.load(std::memory_order_relaxed)) {
+        if (!(++ops & 1023) && std::chrono::steady_clock::now() > deadline) {
+          break;
+        }
+        do {
+          attempt(ctx, false);
+        } while (!ctx->r[6]);
+        uint32_t node = uint32_t(ctx->r[3]);
+        if (node == trap) {
+          double_pops.fetch_add(1);
+          stop = true;
+          break;
+        }
+        uint32_t index = (node - nodes) / kNodeStride;
+        if (owned[index].exchange(1)) {
+          double_pops.fetch_add(1);
+          stop = true;
+          break;
+        }
+        owned[index].store(0);
+        ctx->r[5] = node;
+        do {
+          attempt(ctx, true);
+        } while (!ctx->r[6]);
+      }
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+
+  memory->SystemHeapFree(nodes);
+  memory->SystemHeapFree(head);
+  return double_pops.load();
+}
+
+// Guest addresses this far apart share a granule counter.
+#if XE_ARCH_AMD64
+constexpr uint32_t kGranuleTablePeriod = backend::x64::RESERVE_NUM_ENTRIES
+                                         << backend::x64::RESERVE_GRANULE_SHIFT;
+#elif XE_ARCH_ARM64
+constexpr uint32_t kGranuleTablePeriod =
+    backend::a64::A64_RESERVE_NUM_ENTRIES
+    << backend::a64::A64_RESERVE_GRANULE_SHIFT;
+#endif  // XE_ARCH
+
+std::pair<uint32_t, uint32_t> UnwatchAnyRange(void*, uint32_t, uint32_t, bool) {
+  return {0, UINT32_MAX};
+}
+
+// A worker's stwcx. faults on a write-watched page, whose handling waits on the
+// global lock. This thread holds that lock while it retries a stwcx. on another
+// page with the same granule counter. Returns whether the retry got through.
+template <typename Store>
+bool StoreDuringFaultingStore(Processor* processor, Memory* memory,
+                              Store store) {
+  constexpr uint32_t kWatched = 0xE4000000;
+  constexpr uint32_t kSameCounter = kWatched + kGranuleTablePeriod;
+  for (uint32_t address : {kWatched, kSameCounter}) {
+    REQUIRE(memory->LookupHeap(address)->AllocFixed(
+        address, 4096, 4096, kMemoryAllocationReserve | kMemoryAllocationCommit,
+        kMemoryProtectRead | kMemoryProtectWrite));
+  }
+  void* invalidation_callback =
+      memory->RegisterPhysicalMemoryInvalidationCallback(UnwatchAnyRange,
+                                                         nullptr);
+  memory->EnablePhysicalMemoryAccessCallbacks(
+      memory->GetPhysicalAddress(kWatched), 4096, true, false);
+
+  // Both before the lock, setting up a thread state takes it.
+  SecondThread holder(processor, memory);
+  SecondThread faulting(processor, memory);
+  auto* backend = processor->backend();
+  std::atomic<bool> storing{false};
+  bool stuck_in_fault = false;
+  bool stored = false;
+  {
+    auto global_lock = global_critical_region::AcquireDirect();
+    std::thread worker([&]() {
+      PPCContext* ctx = faulting.context();
+      ctx->lr = 0xBCBCBCBC;
+      ctx->r[4] = kWatched;
+      ctx->r[5] = 0x12345678;
+      storing = true;
+      do {
+        backend->ReservedLoad32(ctx, kWatched);
+        store(ctx);
+      } while (!ctx->r[6]);
+    });
+    while (!storing) {
+      std::this_thread::yield();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    stuck_in_fault = GuestRead32(memory, kWatched) == 0;
+
+    PPCContext* ctx = holder.context();
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!stored && std::chrono::steady_clock::now() < deadline) {
+      uint32_t value = backend->ReservedLoad32(ctx, kSameCounter);
+      stored = backend->ReservedStore32(ctx, kSameCounter, value + 1);
+    }
+    global_lock.unlock();
+    worker.join();
+  }
+
+  REQUIRE(stuck_in_fault);
+  REQUIRE(GuestRead32(memory, kWatched) == 0x12345678u);
+  memory->UnregisterPhysicalMemoryInvalidationCallback(invalidation_callback);
+  for (uint32_t address : {kWatched, kSameCounter}) {
+    memory->LookupHeap(address)->Release(address);
+  }
+  return stored;
+}
 }  // namespace
 
 // =============================================================================
@@ -579,6 +756,70 @@ TEST_CASE("RESERVED_GUEST_PAIR_64", "[reserve]") {
                     addr)) == 0xAABBCCDDEEFF0011ull);
         FreeScratch(test.memory.get(), ctx);
       });
+}
+
+// =============================================================================
+// Stalled stores
+// =============================================================================
+TEST_CASE("RESERVED_HOST_STACK_STRESS", "[reserve]") {
+  TestFunction test([](HIRBuilder& b) { b.Return(); });
+  auto* processor = test.processors[0].get();
+  auto* memory = test.memory.get();
+  auto* backend = processor->backend();
+  uint32_t double_pops =
+      StressStack(processor, memory, [&](PPCContext* ctx, bool push) {
+        uint32_t head = uint32_t(ctx->r[4]);
+        uint32_t top = backend->ReservedLoad32(ctx, head);
+        if (push) {
+          GuestWrite32(memory, uint32_t(ctx->r[5]) + 4, top);
+          ctx->r[6] = backend->ReservedStore32(ctx, head, uint32_t(ctx->r[5]));
+        } else {
+          ctx->r[3] = top;
+          ctx->r[6] =
+              backend->ReservedStore32(ctx, head, GuestRead32(memory, top + 4));
+        }
+      });
+  REQUIRE(double_pops == 0);
+}
+
+TEST_CASE("RESERVED_GUEST_STACK_STRESS", "[reserve]") {
+  ScopedAtomicsMode atomics_mode(GENERATE(XE_RESERVE_ATOMICS_MODES));
+  TestFunction test(EmitGuestStackAttempt);
+  auto* processor = test.processors[0].get();
+  auto* fn = processor->ResolveFunction(0x80000000);
+  REQUIRE(fn);
+  uint32_t double_pops = StressStack(
+      processor, test.memory.get(), [&](PPCContext* ctx, bool push) {
+        ctx->r[7] = push ? 1 : 0;
+        fn->Call(ctx->thread_state, uint32_t(ctx->lr));
+      });
+  REQUIRE(double_pops == 0);
+}
+
+// =============================================================================
+// Faulting stores
+// =============================================================================
+TEST_CASE("RESERVED_GUEST_STORE_FAULT_UNDER_LOCK", "[reserve]") {
+  ScopedAtomicsMode atomics_mode(GENERATE(XE_RESERVE_ATOMICS_MODES));
+  TestFunction test(EmitGuestReservedStoreOnly);
+  auto* processor = test.processors[0].get();
+  // compiling takes the global lock, so not on the first call under it
+  auto* fn = processor->ResolveFunction(0x80000000);
+  REQUIRE(fn);
+  REQUIRE(StoreDuringFaultingStore(
+      processor, test.memory.get(), [&](PPCContext* ctx) {
+        fn->Call(ctx->thread_state, uint32_t(ctx->lr));
+      }));
+}
+
+TEST_CASE("RESERVED_HOST_STORE_FAULT_UNDER_LOCK", "[reserve]") {
+  TestFunction test([](HIRBuilder& b) { b.Return(); });
+  auto* processor = test.processors[0].get();
+  REQUIRE(StoreDuringFaultingStore(
+      processor, test.memory.get(), [&](PPCContext* ctx) {
+        ctx->r[6] = processor->backend()->ReservedStore32(
+            ctx, uint32_t(ctx->r[4]), uint32_t(ctx->r[5]));
+      }));
 }
 
 // =============================================================================

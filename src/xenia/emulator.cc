@@ -872,6 +872,24 @@ void Emulator::InsertXboxGame(const std::filesystem::path& path) {
   xbox_game_ = vfs::ExtractXbeMetadata(path);
 }
 
+std::optional<vfs::XbeMetadata> Emulator::running_xbe() const {
+  std::lock_guard<std::mutex> lock(running_xbe_mutex_);
+  return running_xbe_;
+}
+
+void Emulator::SetRunningXbe(vfs::XbeMetadata xbe) {
+  {
+    std::lock_guard<std::mutex> lock(running_xbe_mutex_);
+    // A title opens its data folder more than once as it starts.
+    if (running_xbe_ && running_xbe_->title_id == xbe.title_id &&
+        running_xbe_->version == xbe.version) {
+      return;
+    }
+    running_xbe_ = std::move(xbe);
+  }
+  on_title_name_change();
+}
+
 bool Emulator::KeepsXboxGame(const std::filesystem::path& path) const {
   // XeFu launches from its own folder.
   std::error_code error;
@@ -2344,6 +2362,10 @@ X_STATUS Emulator::PrepareLaunch(const std::filesystem::path& path,
               kMemoryProtectRead | kMemoryProtectWrite, false,
               &workspace_address);
 
+  {
+    std::lock_guard<std::mutex> lock(running_xbe_mutex_);
+    running_xbe_.reset();
+  }
   if (!info) {
     title_id_ = 0;
     current_disc_number_ = 0;
@@ -2358,8 +2380,8 @@ X_STATUS Emulator::PrepareLaunch(const std::filesystem::path& path,
 
   if (title_id_ == kXeFuTitleId) {
     auto compatibility_device = std::make_unique<vfs::HostPathDevice>(
-        "\\Device\\Harddisk0\\Partition1\\Compatibility",
-        storage_root_ / "compatibility", false);
+        "\\Device\\Harddisk0\\Partition1\\Compatibility", compatibility_path(),
+        false);
     if (compatibility_device->Initialize()) {
       file_system_->RegisterDevice(std::move(compatibility_device));
     }

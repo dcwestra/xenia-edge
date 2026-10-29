@@ -128,7 +128,7 @@ void ShaderInterpreter::Execute() {
             *reinterpret_cast<const ucode::ControlFlowLoopStartInstruction*>(
                 &cf_instr);
         assert_true(state_.loop_stack_depth < 4);
-        if (++state_.loop_stack_depth > 4) {
+        if (state_.loop_stack_depth >= 4) {
           cf_index_next = cf_loop_start.address();
           continue;
         }
@@ -150,11 +150,6 @@ void ShaderInterpreter::Execute() {
       case ucode::ControlFlowOpcode::kLoopEnd: {
         assert_not_zero(state_.loop_stack_depth);
         if (!state_.loop_stack_depth) {
-          continue;
-        }
-        assert_true(state_.loop_stack_depth <= 4);
-        if (state_.loop_stack_depth > 4) {
-          --state_.loop_stack_depth;
           continue;
         }
         ucode::ControlFlowLoopEndInstruction cf_loop_end =

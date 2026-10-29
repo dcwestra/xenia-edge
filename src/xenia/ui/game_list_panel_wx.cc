@@ -494,6 +494,14 @@ void GameListPanel::MarkPlayed(const LibraryKey& key) {
   }
 }
 
+void GameListPanel::RefreshEntry(const LibraryKey& key) {
+  // Cards don't show the content type, only the pane does.
+  const Entry* entry = SelectedEntry();
+  if (entry && entry->key() == key) {
+    RefreshInfoPane();
+  }
+}
+
 void GameListPanel::RefreshInfoPane() {
   if (!info_panel_) {
     return;

@@ -1099,6 +1099,44 @@ void MetalRenderTargetCache::ClearCache() {
   RenderTargetCache::ClearCache();
 }
 
+void MetalRenderTargetCache::RenderTargetReused(RenderTarget& render_target,
+                                                RenderTargetKey old_key) {
+  MetalRenderTarget& metal_render_target =
+      static_cast<MetalRenderTarget&>(render_target);
+  auto it = render_target_map_.find(old_key.key);
+  if (it != render_target_map_.end() && it->second == &metal_render_target) {
+    render_target_map_.erase(it);
+  }
+  render_target_map_[render_target.key().key] = &metal_render_target;
+  // Cleared on the first use like a new one.
+  metal_render_target.SetNeedsInitialClear(true);
+}
+
+bool MetalRenderTargetCache::CanReuseRenderTarget(
+    const RenderTarget& render_target) const {
+  // Transfers that failed to flush still reference their sources.
+  if (HasPendingDrawPassTransfers()) {
+    return false;
+  }
+  for (uint32_t i = 0; i < 4; ++i) {
+    if (current_color_targets_[i] == &render_target ||
+        last_real_color_targets_[i] == &render_target) {
+      return false;
+    }
+  }
+  if (current_depth_target_ == &render_target ||
+      last_real_depth_target_ == &render_target) {
+    return false;
+  }
+  for (const RenderTarget* pending_render_target :
+       pending_draw_pass_render_targets_) {
+    if (pending_render_target == &render_target) {
+      return false;
+    }
+  }
+  return true;
+}
+
 void MetalRenderTargetCache::BeginFrame() {
   SCOPE_profile_cpu_f("gpu");
   (void)FlushPendingDrawPassTransfers();

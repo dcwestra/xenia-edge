@@ -9,6 +9,7 @@
 
 #include "xenia/gpu/render_target_cache.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -603,23 +604,9 @@ void RenderTargetCache::ClearCache() {
   if (!render_targets_.empty()) {
     std::unordered_set<RenderTargetKey, RenderTargetKey::Hasher>
         used_render_targets;
-    for (const auto& ownership_range_pair : ownership_ranges_) {
-      const OwnershipRange& ownership_range = ownership_range_pair.second;
-      if (!ownership_range.render_target.IsEmpty()) {
-        used_render_targets.emplace(ownership_range.render_target);
-      }
-      if (!ownership_range.depth_bits_target.IsEmpty()) {
-        used_render_targets.emplace(ownership_range.depth_bits_target);
-      }
-      if (!ownership_range.host_depth_render_target_unorm24.IsEmpty()) {
-        used_render_targets.emplace(
-            ownership_range.host_depth_render_target_unorm24);
-      }
-      if (!ownership_range.host_depth_render_target_float24.IsEmpty()) {
-        used_render_targets.emplace(
-            ownership_range.host_depth_render_target_float24);
-      }
-    }
+    ForEachEdramOwner([&used_render_targets](RenderTargetKey owner) {
+      used_render_targets.emplace(owner);
+    });
     if (render_targets_.size() != used_render_targets.size()) {
       typename decltype(render_targets_)::iterator it_next;
       for (auto it = render_targets_.begin(); it != render_targets_.end();
@@ -2023,6 +2010,9 @@ RenderTargetCache::RenderTarget* RenderTargetCache::GetOrCreateRenderTarget(
   RenderTarget* render_target;
   if (it_rt != render_targets_.end()) {
     render_target = it_rt->second;
+  } else if (RenderTarget* reused_render_target = ReuseRenderTarget(key)) {
+    render_target = reused_render_target;
+    render_targets_.emplace(key, render_target);
   } else {
     render_target = CreateRenderTarget(key);
     uint32_t width = key.GetWidth();
@@ -2046,6 +2036,67 @@ RenderTargetCache::RenderTarget* RenderTargetCache::GetOrCreateRenderTarget(
     // Insert even if failed to create, not to try to create again.
     render_targets_.emplace(key, render_target);
   }
+  if (render_target) {
+    render_target->SetLastUseFrame(render_target_use_frame_);
+  }
+  return render_target;
+}
+
+RenderTargetCache::RenderTarget* RenderTargetCache::ReuseRenderTarget(
+    RenderTargetKey key) {
+  // The host size and format don't depend on the base.
+  auto GetShape = [](RenderTargetKey shape_key) {
+    shape_key.base_tiles = 0;
+    shape_key.next_period = 0;
+    return shape_key;
+  };
+  RenderTargetKey shape = GetShape(key);
+  bool owners_gathered = false;
+  auto it_reuse = render_targets_.end();
+  for (auto it = render_targets_.begin(); it != render_targets_.end(); ++it) {
+    const RenderTarget* render_target = it->second;
+    if (!render_target || GetShape(it->first) != shape ||
+        render_target_use_frame_ - render_target->last_use_frame() <
+            kRenderTargetReuseUnusedFrames ||
+        (it_reuse != render_targets_.end() &&
+         it_reuse->second->last_use_frame() <=
+             render_target->last_use_frame())) {
+      continue;
+    }
+    bool used_by_last_update = false;
+    for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+      if (last_update_used_render_targets_[i] == render_target ||
+          last_update_accumulated_render_targets_[i] == render_target) {
+        used_by_last_update = true;
+        break;
+      }
+    }
+    if (used_by_last_update) {
+      continue;
+    }
+    if (!owners_gathered) {
+      owners_gathered = true;
+      reuse_owners_.clear();
+      ForEachEdramOwner(
+          [this](RenderTargetKey owner) { reuse_owners_.push_back(owner); });
+    }
+    if (std::find(reuse_owners_.cbegin(), reuse_owners_.cend(), it->first) !=
+            reuse_owners_.cend() ||
+        !CanReuseRenderTarget(*render_target)) {
+      continue;
+    }
+    it_reuse = it;
+  }
+  if (it_reuse == render_targets_.end()) {
+    return nullptr;
+  }
+  RenderTarget* render_target = it_reuse->second;
+  RenderTargetKey old_key = it_reuse->first;
+  render_targets_.erase(it_reuse);
+  render_target->SetKey(key);
+  XELOGGPU("Reusing render target {} as {}", old_key.GetDebugName(),
+           key.GetDebugName());
+  RenderTargetReused(*render_target, old_key);
   return render_target;
 }
 

@@ -3064,6 +3064,13 @@ void VulkanCommandProcessor::DestroyScratchImageWhenIdle(
   }
 }
 
+void VulkanCommandProcessor::DestroyFramebufferWhenIdle(
+    VkFramebuffer framebuffer) {
+  if (framebuffer != VK_NULL_HANDLE) {
+    destroy_framebuffers_.emplace_back(GetCurrentSubmission(), framebuffer);
+  }
+}
+
 VkDescriptorSet VulkanCommandProcessor::AllocateSingleTransientDescriptor(
     SingleTransientDescriptorLayout transient_descriptor_layout) {
   assert_true(frame_open_);
@@ -5793,6 +5800,8 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     primitive_processor_->BeginFrame();
 
     texture_cache_->BeginFrame();
+
+    render_target_cache_->AdvanceRenderTargetUseFrame();
   }
 
   return true;

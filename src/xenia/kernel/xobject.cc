@@ -94,6 +94,15 @@ bool XObject::ReleaseHandle() {
 }
 
 void XObject::Retain() { ++pointer_ref_count_; }
+bool XObject::TryRetain() {
+  int32_t count = pointer_ref_count_.load();
+  while (count > 0) {
+    if (pointer_ref_count_.compare_exchange_weak(count, count + 1)) {
+      return true;
+    }
+  }
+  return false;
+}
 
 void XObject::Release() {
   if (--pointer_ref_count_ == 0) {
@@ -209,7 +218,11 @@ void XObject::SetAttributes(uint32_t obj_attributes_ptr) {
                     memory()->TranslateVirtual(obj_attributes_ptr + 4)));
   if (!name.empty()) {
     name_ = std::string(name);
-    kernel_state_->object_table()->AddNameMapping(name_, handles_[0]);
+    // A host object's own handle must never reach the guest.
+    auto guest_handle = std::ranges::find_if(
+        handles_, [](X_HANDLE h) { return !is_handle_host_object(h); });
+    kernel_state_->object_table()->AddNameMapping(
+        name_, guest_handle != handles_.end() ? *guest_handle : handles_[0]);
   }
 }
 

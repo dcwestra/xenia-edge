@@ -96,6 +96,11 @@ class Emulator {
   // Folder XeFu and its xbox.xex are in, shown to them as the system partition
   // Compatibility folder.
   std::filesystem::path xefu_path() const;
+  // Folder shown to XeFu as the user partition's Compatibility folder, where
+  // it keeps original Xbox saves and downloads under Xbox1.
+  std::filesystem::path compatibility_path() const {
+    return storage_root_ / "compatibility";
+  }
   // The file in xefu_path() an original Xbox game needed and didn't find, for
   // the UI to explain once. Empty when none is missing.
   std::string TakeMissingXeFuFile() {
@@ -112,6 +117,11 @@ class Emulator {
   const std::optional<vfs::XbeMetadata>& xbox_game() const {
     return xbox_game_;
   }
+  // The title id and version of the executable XeFu is running. A title
+  // update, or a game starting another executable, makes it differ from
+  // xbox_game(), which still names the release. Empty until the title starts.
+  std::optional<vfs::XbeMetadata> running_xbe() const;
+  void SetRunningXbe(vfs::XbeMetadata xbe);
   // Puts an original Xbox game in the drive for XeFu.
   void InsertXboxGame(const std::filesystem::path& path);
   // Whether the original Xbox game stays in the drive for a launch of path, as
@@ -523,6 +533,9 @@ class Emulator {
   // shown to XeFu as the disc. Persists across launches from xefu_path.
   std::filesystem::path xbox_disc_path_;
   std::optional<vfs::XbeMetadata> xbox_game_;
+  // Set by the UI, cleared by whichever thread launches.
+  mutable std::mutex running_xbe_mutex_;
+  std::optional<vfs::XbeMetadata> running_xbe_;
   std::string missing_xefu_file_;
   DiscProvider disc_provider_;
   DiscRecorder disc_recorder_;

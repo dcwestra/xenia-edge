@@ -59,7 +59,9 @@
 #include "xenia/ui/game_config_panel_wx.h"
 #include "xenia/ui/icon_decode.h"
 #include "xenia/ui/patches_panel_wx.h"
+#include "xenia/ui/wx_locale.h"
 #include "xenia/vfs/devices/xcontent_container_device.h"
+#include "xenia/vfs/xbox_original_data.h"
 
 namespace xe {
 namespace app {
@@ -103,10 +105,9 @@ wxBitmap MakeCloseBitmap(const wxWindow* win, int size_px, int lightness) {
   return wxBitmap(image);
 }
 
-struct ContentItem {
-  wxString name;
-  uint64_t size_bytes = 0;
-};
+constexpr char kXboxOriginalCompatUrl[] =
+    "https://consolemods.org/wiki/"
+    "Xbox_360:Original_Xbox_Games_Compatibility_List";
 
 kernel::xam::XamState* XamStateOf(EmulatorWindow* emulator_window) {
   auto* emulator = emulator_window ? emulator_window->emulator() : nullptr;
@@ -334,6 +335,7 @@ void GameInfoPanel::BuildPage(int page) {
 
   auto* window = pages_[page];
   auto* sizer = BeginPage(window);
+  const bool original_xbox = IsOriginalXbox();
   switch (page) {
     case kPageInfo:
       BuildDetailsSection(window, sizer);
@@ -341,6 +343,10 @@ void GameInfoPanel::BuildPage(int page) {
       break;
     case kPageContent:
       BuildDiscsSection(window, sizer);
+      if (original_xbox) {
+        BuildXboxOriginalContent(window, sizer);
+        break;
+      }
       BuildContentSection(window, sizer, _("Title Updates (%zu)"),
                           {{XContentType::kInstaller, 0}}, wxString(),
                           /*allow_import=*/true);
@@ -349,6 +355,10 @@ void GameInfoPanel::BuildPage(int page) {
                           /*allow_import=*/true);
       break;
     case kPageSaves: {
+      if (original_xbox) {
+        BuildXboxOriginalSaves(window, sizer);
+        break;
+      }
       // Saves live under the signed-in profile. Some titles write into the
       // shared profile's save folder instead, and a few put install data
       // there, but the folder is a save location whatever lands in it, so it
@@ -460,8 +470,28 @@ void GameInfoPanel::BuildDetailsSection(wxWindow* parent, wxBoxSizer* sizer) {
   status->SetForegroundColour(CompatColor(compat_));
 }
 
+bool GameInfoPanel::IsOriginalXbox() const {
+  auto* library = emulator_window_ ? emulator_window_->game_library() : nullptr;
+  const LibraryEntry* entry = library ? library->Find(key_) : nullptr;
+  return entry && entry->content_type == XContentType::kXboxTitle;
+}
+
 void GameInfoPanel::BuildCompatSection(wxWindow* parent, wxBoxSizer* sizer) {
   AddSectionHeader(parent, sizer, _("Compatibility"), {});
+
+  // The database only knows Xbox 360 titles, so an original Xbox game links
+  // to the list ConsoleMods keeps of them.
+  if (IsOriginalXbox()) {
+    AddNoteRow(parent, sizer,
+               _("ConsoleMods lists how original Xbox games run on an Xbox "
+                 "360."));
+    auto* button = new wxButton(parent, wxID_ANY, "ConsoleMods");
+    button->Bind(wxEVT_BUTTON, [](wxCommandEvent&) {
+      xe::LaunchWebBrowser(kXboxOriginalCompatUrl);
+    });
+    sizer->Add(button, 0, wxTOP, 4);
+    return;
+  }
 
   if (GetCompatState(key_.title_id) == CompatState::kUnknown) {
     AddNoteRow(parent, sizer,
@@ -650,6 +680,11 @@ void GameInfoPanel::BuildContentSection(wxWindow* parent, wxBoxSizer* sizer,
     AddNoteRow(parent, sizer, note);
     return;
   }
+  AddContentRows(parent, sizer, items);
+}
+
+void GameInfoPanel::AddContentRows(wxWindow* parent, wxBoxSizer* sizer,
+                                   const std::vector<ContentItem>& items) {
   if (items.empty()) {
     AddNoteRow(parent, sizer, _("Nothing installed."));
     return;
@@ -658,11 +693,89 @@ void GameInfoPanel::BuildContentSection(wxWindow* parent, wxBoxSizer* sizer,
   auto* grid = new wxFlexGridSizer(2, FromDIP(2), char_w_ * 2);
   grid->AddGrowableCol(0);
   for (const auto& item : items) {
-    grid->Add(MakeElidedLabel(parent, item.name), 0, wxEXPAND);
+    auto* label = MakeElidedLabel(parent, item.name);
+    if (!item.tooltip.empty()) {
+      label->SetToolTip(item.tooltip);
+    }
+    grid->Add(label, 0, wxEXPAND);
     grid->Add(new wxStaticText(parent, wxID_ANY, FormatSize(item.size_bytes)),
               0, wxALIGN_RIGHT);
   }
   sizer->Add(grid, 0, wxEXPAND);
+}
+
+std::filesystem::path GameInfoPanel::XboxOriginalTitleDir(
+    std::string_view area) const {
+  auto* emulator = emulator_window_ ? emulator_window_->emulator() : nullptr;
+  if (!emulator) {
+    return {};
+  }
+  // Each folder is matched in any case. A missing one leaves the rest empty.
+  auto dir = vfs::FindXboxOriginalPath(emulator->compatibility_path(), "Xbox1");
+  dir = vfs::FindXboxOriginalPath(dir, area);
+  return vfs::FindXboxOriginalPath(dir, fmt::format("{:08X}", key_.title_id));
+}
+
+void GameInfoPanel::BuildXboxOriginalSaves(wxWindow* parent,
+                                           wxBoxSizer* sizer) {
+  const auto title_dir = XboxOriginalTitleDir("UDATA");
+  std::vector<ContentItem> items;
+  for (const auto& save : vfs::ListXboxOriginalSaves(title_dir)) {
+    ContentItem item;
+    item.size_bytes = PathSize(save.path);
+    if (save.name.empty()) {
+      item.name = wxString::Format(
+          _("%s (no name)"),
+          wxString::FromUTF8(xe::path_to_utf8(save.path.filename())));
+      item.tooltip =
+          _("Without a name the game can't open this save or make a new one "
+            "in its place. Delete its folder to let the game save again.");
+    } else {
+      item.name = wxString::FromUTF8(save.name);
+    }
+    items.push_back(std::move(item));
+  }
+  // The folder is XeFu's to make, so it is offered only once it exists.
+  AddSectionHeader(parent, sizer,
+                   wxString::Format(_("Saves (%zu)"), items.size()), title_dir);
+  AddContentRows(parent, sizer, items);
+}
+
+void GameInfoPanel::BuildXboxOriginalContent(wxWindow* parent,
+                                             wxBoxSizer* sizer) {
+  const auto title_dir = XboxOriginalTitleDir("TDATA");
+  const auto update_dir = title_dir.empty()
+                              ? std::filesystem::path()
+                              : vfs::FindXboxOriginalPath(title_dir, "$u");
+  // The game looks for an update only through this file.
+  std::vector<ContentItem> updates;
+  if (!update_dir.empty() &&
+      !vfs::FindXboxOriginalPath(update_dir, "ContentMeta.xbx").empty()) {
+    updates.push_back({_("Title update"), PathSize(update_dir)});
+  }
+  AddSectionHeader(parent, sizer,
+                   wxString::Format(_("Title Updates (%zu)"), updates.size()),
+                   update_dir);
+  AddContentRows(parent, sizer, updates);
+
+  const auto content_dir = title_dir.empty()
+                               ? std::filesystem::path()
+                               : vfs::FindXboxOriginalPath(title_dir, "$c");
+  const XLanguage language =
+      XLanguageFromLocaleCode(ui::GetActiveLocaleCanonicalName());
+  std::vector<ContentItem> packages;
+  for (const auto& package :
+       vfs::ListXboxOriginalContent(content_dir, language)) {
+    const std::string name = package.name.empty()
+                                 ? xe::path_to_utf8(package.path.filename())
+                                 : package.name;
+    packages.push_back({wxString::FromUTF8(name), PathSize(package.path)});
+  }
+  AddSectionHeader(
+      parent, sizer,
+      wxString::Format(_("Installed Content (%zu)"), packages.size()),
+      content_dir);
+  AddContentRows(parent, sizer, packages);
 }
 
 void GameInfoPanel::BuildPatchesSection(wxWindow* parent, wxBoxSizer* sizer) {

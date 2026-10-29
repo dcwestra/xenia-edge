@@ -230,6 +230,9 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
   uint32_t GetMaxRenderTargetHeight() const override;
 
   RenderTarget* CreateRenderTarget(RenderTargetKey key) override;
+  bool CanReuseRenderTarget(const RenderTarget& render_target) const override;
+  void RenderTargetReused(RenderTarget& render_target,
+                          RenderTargetKey old_key) override;
 
   bool IsHostDepthEncodingDifferent(
       xenos::DepthRenderTargetFormat format) const override;

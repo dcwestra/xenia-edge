@@ -151,6 +151,8 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   }
 
   RenderTarget* CreateRenderTarget(RenderTargetKey key) override;
+  void RenderTargetReused(RenderTarget& render_target,
+                          RenderTargetKey old_key) override;
 
   bool IsHostDepthEncodingDifferent(
       xenos::DepthRenderTargetFormat format) const override;

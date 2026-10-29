@@ -596,6 +596,8 @@ std::unique_ptr<EmulatorWindow> EmulatorWindow::Create(
 }
 
 EmulatorWindow::~EmulatorWindow() {
+  library_fill_alive_->store(false);
+
   // The burst thread captures through the UI thread, which is this one, so
   // keep running its calls until it notices the stop.
   screenshot_burst_stop_ = true;
@@ -679,6 +681,30 @@ void EmulatorWindow::InitializeGameLibrary() {
 
   game_library_ = std::make_unique<GameLibrary>(library_root);
   game_library_->Load();
+
+  // The files are read off the UI thread, and each result is recorded back on
+  // it so the library is only ever changed from there.
+  if (auto missing = game_library_->FindMissingFields(); !missing.empty()) {
+    std::thread([missing = std::move(missing), alive = library_fill_alive_,
+                 app_context = &app_context_, this]() {
+      for (const auto& release : missing) {
+        if (!alive->load(std::memory_order_relaxed)) {
+          return;
+        }
+        auto info = GameLibrary::ReadMissingFields(release);
+        if (!info) {
+          continue;
+        }
+        app_context->CallInUIThread([alive, this, key = release.key,
+                                     info = std::move(*info)]() {
+          if (alive->load(std::memory_order_relaxed) &&
+              game_library_->FillMissingFields(key, info) && game_list_panel_) {
+            game_list_panel_->RefreshEntry(key);
+          }
+        });
+      }
+    }).detach();
+  }
 
   // Load() identifies releases the library recorded before media ids were
   // kept, which separates any title that turned out to hold more than one.
@@ -3273,11 +3299,20 @@ void EmulatorWindow::UpdateTitle() {
   if (emulator()->is_title_open()) {
     uint32_t title_id = emulator()->title_id();
     std::string title_version = emulator()->title_version();
-    // XeFu shows the original Xbox game it runs, its build as the module.
-    if (const auto& game = emulator()->xbox_game();
-        title_id == kXeFuTitleId && game) {
-      title_id = game->title_id;
-      title_version = game->version ? VersionToString(game->version) : "";
+    // XeFu shows the original Xbox game it runs, its build as the module. A
+    // title update of the game shows its own version. Another executable keeps
+    // the game's title id, which its per-game config is kept under.
+    if (title_id == kXeFuTitleId) {
+      const auto& game = emulator()->xbox_game();
+      const auto running = emulator()->running_xbe();
+      const vfs::XbeMetadata* shown = game ? &*game : nullptr;
+      if (running && (!game || running->title_id == game->title_id)) {
+        shown = &*running;
+      }
+      if (shown) {
+        title_id = shown->title_id;
+        title_version = shown->version ? VersionToString(shown->version) : "";
+      }
     }
     sb.AppendFormat(" | [{:08X}", title_id);
     if (!title_version.empty()) {

@@ -43,13 +43,19 @@ class HostPathEntry : public Entry {
   bool has_open_files() const override;
   void RetainFile() override { open_files_.fetch_add(1); }
   void ReleaseFile() override;
+  bool Overwrite() override;
 
-  bool SetCreateTimestamp(uint64_t timestamp) override;
-  bool SetAccessTimestamp(uint64_t timestamp) override;
-  bool SetWriteTimestamp(uint64_t timestamp) override;
+  // Sets the FILETIMEs that aren't 0 through |file_handle|, one of this
+  // entry's.
+  bool SetTimes(xe::filesystem::FileHandle& file_handle,
+                uint64_t create_timestamp, uint64_t access_timestamp,
+                uint64_t write_timestamp);
 
  private:
   friend class HostPathDevice;
+  friend class HostPathFile;
+
+  void SetOverwrittenSize(size_t size);
 
   std::unique_ptr<Entry> CreateEntryInternal(const std::string_view name,
                                              uint32_t attributes) override;
@@ -63,6 +69,9 @@ class HostPathEntry : public Entry {
   // collapsed content package) and update() must not overwrite it with the
   // backing file's real size.
   bool reported_size_fixed_ = false;
+  // Set by Overwrite until the last handle closes. The host file still holds
+  // the old bytes past size_, which growing the file brings back.
+  bool overwritten_ = false;
 };
 
 }  // namespace vfs

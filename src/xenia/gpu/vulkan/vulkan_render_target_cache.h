@@ -248,6 +248,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   uint32_t GetMaxRenderTargetHeight() const override;
 
   RenderTarget* CreateRenderTarget(RenderTargetKey key) override;
+  void RenderTargetReused(RenderTarget& render_target,
+                          RenderTargetKey old_key) override;
 
   bool IsHostDepthEncodingDifferent(
       xenos::DepthRenderTargetFormat format) const override;

@@ -903,14 +903,17 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kExp,
     kLog,
   };
-  // The scalar op of a float, the same as xenos::Rcp, Rsq, Sqrt, Exp or Log in
-  // vertex shaders, and the host's in pixel shaders where the extra
-  // instructions cost too much.
+  // The scalar op of a float, the same as xenos::Rcp, Rsq, Sqrt, Exp or Log for
+  // rounding-sensitive vertex shader results, and the host's elsewhere where
+  // the extra instructions cost too much.
   spv::Id ScalarEstimate(ScalarEstimateOp op, spv::Id value);
-  // Whether alu_round_toward_zero applies, only to vertex shaders since the
-  // extra instructions per operation are too slow per pixel.
+  // Whether alu_round_toward_zero applies to the ALU operation being
+  // translated. Only in vertex shaders since the extra instructions per
+  // operation are too slow per pixel, and unless the rounding mode does it,
+  // only to rounding-sensitive results since they're too slow for all.
   bool RoundsTowardZero() const;
-  // Whether the shader's rounding mode does it, with no extra instructions.
+  // Whether the shader's rounding mode does it for the whole vertex shader,
+  // with no extra instructions.
   bool RoundsTowardZeroInHardware() const;
   // Guest ALU sums and products of floats or float vectors, rounded toward
   // zero if RoundsTowardZero.
@@ -1557,6 +1560,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // the exec-level predicate value, and can't merge two execs with the same
   // predicate condition anymore.
   bool cf_exec_predicate_written_;
+
+  // Whether the result of the ALU operation being translated is
+  // rounding-sensitive (see Shader::IsAluVectorResultRoundingSensitive).
+  bool alu_op_result_rounding_sensitive_ = false;
 };
 
 }  // namespace gpu

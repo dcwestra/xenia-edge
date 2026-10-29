@@ -992,14 +992,25 @@ static void EmitTryAcquireReservation(A64Emitter& e,
   EmitGranuleAddress(e, guest_address, e.x8, e.w9);
   // snapshot the generation first, the acquire pins the value read after
   e.ldar(e.w10, ptr(e.x8));
-  e.str(e.w10, ptr(bctx, BackendCtxOffset(
-                             offsetof(A64BackendContext, reserve_generation))));
   e.str(guest_address, ptr(bctx, BackendCtxOffset(offsetof(A64BackendContext,
                                                            reserve_address))));
   // lwarx replaces any reservation this thread already held
   e.ldr(e.w11, ptr(bctx, BackendCtxOffset(offsetof(A64BackendContext, flags))));
   e.orr(e.w11, e.w11, kReserveFlagBit);
   e.str(e.w11, ptr(bctx, BackendCtxOffset(offsetof(A64BackendContext, flags))));
+
+  // a stwcx. has the granule claimed, AwaitReservation takes the generation
+  // once it publishes
+  auto& unclaimed = e.NewCachedLabel();
+  auto& acquired = e.NewCachedLabel();
+  e.tbz(e.w10, 0, unclaimed);
+  e.mov(e.w1, guest_address);
+  e.CallNativeSafe(reinterpret_cast<void*>(A64Backend::AwaitReservation));
+  e.b(acquired);
+  e.L(unclaimed);
+  e.str(e.w10, ptr(bctx, BackendCtxOffset(
+                             offsetof(A64BackendContext, reserve_generation))));
+  e.L(acquired);
 }
 
 struct RESERVED_LOAD_I32
@@ -1011,9 +1022,9 @@ struct RESERVED_LOAD_I32
       EmitGuestMemAccess(e, i.src1, 4, false,
                          [&](const auto& adr) { e.ldr(i.dest, adr); });
     } else {
-      auto addr = ComputeMemoryAddress(e, i.src1);
+      // after the acquire, whose wait clobbers the address registers
       EmitTryAcquireReservation(e, guest_address);
-      e.ldr(i.dest, ptr(e.GetMembaseReg(), addr));
+      e.ldr(i.dest, ptr(e.GetMembaseReg(), ComputeMemoryAddress(e, i.src1)));
     }
     e.mov(e.w0, i.dest);
     e.str(e.x0, ptr(e.GetBackendCtxReg(),
@@ -1030,9 +1041,9 @@ struct RESERVED_LOAD_I64
       EmitGuestMemAccess(e, i.src1, 8, false,
                          [&](const auto& adr) { e.ldr(i.dest, adr); });
     } else {
-      auto addr = ComputeMemoryAddress(e, i.src1);
+      // after the acquire, whose wait clobbers the address registers
       EmitTryAcquireReservation(e, guest_address);
-      e.ldr(i.dest, ptr(e.GetMembaseReg(), addr));
+      e.ldr(i.dest, ptr(e.GetMembaseReg(), ComputeMemoryAddress(e, i.src1)));
     }
     e.str(i.dest, ptr(e.GetBackendCtxReg(),
                       BackendCtxOffset(
@@ -1046,93 +1057,16 @@ EMITTER_OPCODE_TABLE(OPCODE_RESERVED_LOAD, RESERVED_LOAD_I32,
 // Writes 1 to dest if the store landed, 0 otherwise.
 static void EmitReservedStore(A64Emitter& e, const I8Op& dest,
                               const WReg& guest_address, bool bit64) {
-  using namespace Xbyak_aarch64;
-  const auto bctx = e.GetBackendCtxReg();
-  const uint32_t flags_offset =
-      BackendCtxOffset(offsetof(A64BackendContext, flags));
-  const uint32_t dest_idx = dest.reg().getIdx();
-
-  auto& done = e.NewCachedLabel();
-  auto& fail =
-      e.AddToTail([dest_idx, &done](A64Emitter& e, Xbyak_aarch64::Label&) {
-        e.mov(WReg(dest_idx), 0);
-        e.b(done);
-      });
-
-  // stwcx. always clears the reservation, stored or not
-  e.ldr(e.w8, ptr(bctx, flags_offset));
-  e.and_(e.w9, e.w8, static_cast<uint64_t>(~kReserveFlagBit));
-  e.str(e.w9, ptr(bctx, flags_offset));
-  e.tst(e.w8, static_cast<uint64_t>(kReserveFlagBit));
-  e.b(EQ, fail);
-
-  // the reservation must be for the address we're storing to
-  e.ldr(e.w10, ptr(bctx, BackendCtxOffset(
-                             offsetof(A64BackendContext, reserve_address))));
-  e.cmp(e.w10, guest_address);
-  e.b(NE, fail);
-
-  EmitGranuleAddress(e, guest_address, e.x11, e.w13);
-  // a store to this granule since our lwarx kills the reservation
-  e.ldar(e.w14, ptr(e.x11));
-  e.ldr(e.w15, ptr(bctx, BackendCtxOffset(
-                             offsetof(A64BackendContext, reserve_generation))));
-  e.cmp(e.w14, e.w15);
-  e.b(NE, fail);
-
-  e.ldr(e.x16, ptr(bctx, BackendCtxOffset(offsetof(A64BackendContext,
-                                                   cached_reserve_value_))));
-
-  if (e.IsFeatureEnabled(kA64EmitLSE)) {
-    // casal returns the old value in the compare register, so keep a copy
-    e.mov(e.x3, e.x16);
-    if (bit64) {
-      e.casal(e.x16, e.x2, ptr(e.x1));
-      e.cmp(e.x16, e.x3);
-    } else {
-      e.casal(e.w16, e.w2, ptr(e.x1));
-      e.cmp(e.w16, e.w3);
-    }
-    e.b(NE, fail);
-    // the store landed, so kill other reservations on this granule
-    e.mov(e.w17, 1);
-    e.staddl(e.w17, ptr(e.x11));
-  } else {
-    // The exclusive monitor is still held when the compare fails, so that
-    // path has to clear it before joining the common failure tail.
-    auto& cas_mismatch =
-        e.AddToTail([dest_idx, &done](A64Emitter& e, Xbyak_aarch64::Label&) {
-          e.clrex(15);
-          e.mov(WReg(dest_idx), 0);
-          e.b(done);
-        });
-    auto& cas_retry = e.NewCachedLabel();
-    auto& bump_retry = e.NewCachedLabel();
-
-    e.L(cas_retry);
-    if (bit64) {
-      e.ldaxr(e.x14, ptr(e.x1));
-      e.cmp(e.x14, e.x16);
-      e.b(NE, cas_mismatch);
-      e.stlxr(e.w15, e.x2, ptr(e.x1));
-    } else {
-      e.ldaxr(e.w14, ptr(e.x1));
-      e.cmp(e.w14, e.w16);
-      e.b(NE, cas_mismatch);
-      e.stlxr(e.w15, e.w2, ptr(e.x1));
-    }
-    e.cbnz(e.w15, cas_retry);
-
-    // the store landed, so kill other reservations on this granule
-    e.L(bump_retry);
-    e.ldxr(e.w14, ptr(e.x11));
-    e.add(e.w14, e.w14, 1);
-    e.stlxr(e.w15, e.w14, ptr(e.x11));
-    e.cbnz(e.w15, bump_retry);
+  if (guest_address.getIdx() != e.w12.getIdx()) {
+    e.mov(e.w12, guest_address);
   }
-
-  e.mov(dest, 1);
-  e.L(done);
+  e.ldr(e.x9,
+        e.BackendCtxPtr(bit64 ? offsetof(A64BackendContext,
+                                         reserved_store_64_helper_address)
+                              : offsetof(A64BackendContext,
+                                         reserved_store_32_helper_address)));
+  e.blr(e.x9);
+  e.mov(WReg(dest.reg().getIdx()), e.w0);
 }
 
 struct RESERVED_STORE_I32

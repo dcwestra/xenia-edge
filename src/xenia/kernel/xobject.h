@@ -206,6 +206,8 @@ class XObject {
   const std::string& name() const { return name_; }
   uint32_t guest_object() const { return guest_object_ptr_; }
   uint32_t guest_object_type() const { return guest_object_type_ptr_.load(); }
+  // Whether CreateNative allocated the guest object.
+  bool allocated_guest_object() const { return allocated_guest_object_; }
 
   // Has this object been created for use by the host?
   // Host objects are persisted through reloads/etc.
@@ -220,6 +222,9 @@ class XObject {
   void RetainHandle();
   bool ReleaseHandle();
   void Retain();
+  // Retains unless the last reference is already gone, for a lookup that can
+  // race the object's destruction.
+  bool TryRetain();
   void Release();
   X_STATUS Delete();
 

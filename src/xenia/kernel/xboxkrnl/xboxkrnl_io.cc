@@ -174,7 +174,7 @@ struct CreateOptions {
 // XeFu, the original Xbox emulator, opens the running Xbox title's data
 // directory, Xbox1\TDATA\<title id> in the HDD's Compatibility directory, as
 // the title starts. The certificate of the XBE it loaded, at 0x10000 in user
-// mode, names the title.
+// mode, names the title and its version.
 static void NoteXeFuTitle(std::string_view path) {
   constexpr std::string_view kTitleData = "\\xbox1\\tdata\\";
   const std::string lower = xe::utf8::lower_ascii(path);
@@ -208,6 +208,8 @@ static void NoteXeFuTitle(std::string_view path) {
     return true;
   };
   std::string name;
+  // Its version tells a title update apart from the disc's executable.
+  std::optional<vfs::XbeMetadata> running;
   uint32_t magic = 0, certificate = 0, certificate_title_id = 0;
   // XBEH.
   if (read_user(0x10000, &magic) && magic == 0x48454258 &&
@@ -223,21 +225,29 @@ static void NoteXeFuTitle(std::string_view path) {
       title_name.push_back(char16_t(c));
     }
     name = xe::to_utf8(title_name);
+    vfs::XbeMetadata xbe;
+    if (read_user(certificate + 0xAC, &xbe.version)) {
+      xbe.title_id = title_id;
+      running = std::move(xbe);
+    }
   }
   if (name.empty()) {
     name = fmt::format("{:08X}", title_id);
   }
-  // On the UI thread, which reads the name.
+  // On the UI thread, which reads both.
   auto emulator = kernel_state()->emulator();
-  auto set_name = [emulator, name]() {
+  auto set_title = [emulator, name, running]() {
+    if (running) {
+      emulator->SetRunningXbe(*running);
+    }
     if (emulator->title_name() != name) {
       emulator->SetTitleName(name);
     }
   };
   if (auto window = emulator->display_window()) {
-    window->app_context().CallInUIThread(set_name);
+    window->app_context().CallInUIThread(set_title);
   } else {
-    set_name();
+    set_title();
   }
 }
 

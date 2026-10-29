@@ -43,7 +43,7 @@ spv::Id SpirvShaderTranslator::ScalarEstimate(ScalarEstimateOp op,
                                               spv::Id value) {
   EnsureBuildPointAvailable();
 
-  if (is_pixel_shader()) {
+  if (!alu_op_result_rounding_sensitive_) {
     switch (op) {
       case ScalarEstimateOp::kRcp:
         return builder_->createNoContractionBinOp(spv::OpFDiv, type_float_,
@@ -532,11 +532,14 @@ spv::Id SpirvShaderTranslator::RoundTowardZero(spv::Id rounded, spv::Id error,
 }
 
 bool SpirvShaderTranslator::RoundsTowardZero() const {
-  return cvars::alu_round_toward_zero && is_vertex_shader();
+  return cvars::alu_round_toward_zero && is_vertex_shader() &&
+         (features_.rounding_mode_rtz_float32 ||
+          alu_op_result_rounding_sensitive_);
 }
 
 bool SpirvShaderTranslator::RoundsTowardZeroInHardware() const {
-  return RoundsTowardZero() && features_.rounding_mode_rtz_float32;
+  return cvars::alu_round_toward_zero && is_vertex_shader() &&
+         features_.rounding_mode_rtz_float32;
 }
 
 spv::Id SpirvShaderTranslator::AluAdd(spv::Id a, spv::Id b) {
@@ -649,13 +652,20 @@ void SpirvShaderTranslator::ProcessAluInstruction(
   // allow for multipass rendering (in addition to the Invariant decoration on
   // outputs).
 
+  const Shader& shader = current_shader();
+  uint32_t instruction_address = current_instruction_address();
+
   // Whether the instruction has changed the predicate, and it needs to be
   // checked again later.
   bool predicate_written_vector = false;
+  alu_op_result_rounding_sensitive_ =
+      shader.IsAluVectorResultRoundingSensitive(instruction_address);
   spv::Id vector_result = ProcessVectorAluOperation(
       instr, memexport_eM_potentially_written_before, predicate_written_vector);
 
   bool predicate_written_scalar = false;
+  alu_op_result_rounding_sensitive_ =
+      shader.IsAluScalarResultRoundingSensitive(instruction_address);
   spv::Id scalar_result = ProcessScalarAluOperation(
       instr, memexport_eM_potentially_written_before, predicate_written_scalar);
   if (scalar_result != spv::NoResult) {
