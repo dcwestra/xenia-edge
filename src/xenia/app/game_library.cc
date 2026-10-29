@@ -560,16 +560,16 @@ std::optional<GameFileInfo> GameLibrary::ReadMissingFields(
   return std::nullopt;
 }
 
-void GameLibrary::FillMissingFields(const LibraryKey& key,
+bool GameLibrary::FillMissingFields(const LibraryKey& key,
                                     const GameFileInfo& info) {
   const auto* existing = Find(key);
   if (!existing || existing->content_type != XContentType::kInvalid ||
       info.content_type == XContentType::kInvalid) {
-    return;
+    return false;
   }
   LibraryEntry entry = *existing;
   entry.content_type = info.content_type;
-  Upsert(std::move(entry));
+  return Upsert(std::move(entry));
 }
 
 bool GameLibrary::WriteEntryAtomic(const LibraryEntry& entry,

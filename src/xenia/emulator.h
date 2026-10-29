@@ -96,6 +96,11 @@ class Emulator {
   // Folder XeFu and its xbox.xex are in, shown to them as the system partition
   // Compatibility folder.
   std::filesystem::path xefu_path() const;
+  // Folder shown to XeFu as the user partition's Compatibility folder, where
+  // it keeps original Xbox saves and downloads under Xbox1.
+  std::filesystem::path compatibility_path() const {
+    return storage_root_ / "compatibility";
+  }
   // The file in xefu_path() an original Xbox game needed and didn't find, for
   // the UI to explain once. Empty when none is missing.
   std::string TakeMissingXeFuFile() {

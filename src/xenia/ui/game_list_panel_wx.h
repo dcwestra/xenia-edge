@@ -48,6 +48,8 @@ class GameListPanel : public wxPanel {
   ~GameListPanel() override = default;
 
   void Reload();
+  // Shows what changed in one release since the list read it.
+  void RefreshEntry(const LibraryKey& key);
   void SetLaunchCallback(LaunchCallback cb) { launch_cb_ = std::move(cb); }
   // Returns the selected title's path, or empty if nothing selected.
   std::filesystem::path GetSelectedPath() const;

@@ -2341,8 +2341,8 @@ X_STATUS Emulator::PrepareLaunch(const std::filesystem::path& path,
 
   if (title_id_ == kXeFuTitleId) {
     auto compatibility_device = std::make_unique<vfs::HostPathDevice>(
-        "\\Device\\Harddisk0\\Partition1\\Compatibility",
-        storage_root_ / "compatibility", false);
+        "\\Device\\Harddisk0\\Partition1\\Compatibility", compatibility_path(),
+        false);
     if (compatibility_device->Initialize()) {
       file_system_->RegisterDevice(std::move(compatibility_device));
     }

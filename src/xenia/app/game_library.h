@@ -129,8 +129,9 @@ class GameLibrary {
   // What the release's own files say. Empty while none of them can be read.
   static std::optional<GameFileInfo> ReadMissingFields(
       const MissingFields& missing);
-  // Fills in what the release still lacks from `info` and persists it.
-  void FillMissingFields(const LibraryKey& key, const GameFileInfo& info);
+  // Fills in what the release still lacks from `info` and persists it. False
+  // when nothing changed.
+  bool FillMissingFields(const LibraryKey& key, const GameFileInfo& info);
 
   // Titles that Load() separated into several releases, for telling the user
   // once. Cleared by the next Load().

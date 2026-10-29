@@ -670,12 +670,13 @@ void EmulatorWindow::InitializeGameLibrary() {
         if (!info) {
           continue;
         }
-        app_context->CallInUIThread(
-            [alive, this, key = release.key, info = std::move(*info)]() {
-              if (alive->load(std::memory_order_relaxed)) {
-                game_library_->FillMissingFields(key, info);
-              }
-            });
+        app_context->CallInUIThread([alive, this, key = release.key,
+                                     info = std::move(*info)]() {
+          if (alive->load(std::memory_order_relaxed) &&
+              game_library_->FillMissingFields(key, info) && game_list_panel_) {
+            game_list_panel_->RefreshEntry(key);
+          }
+        });
       }
     }).detach();
   }

@@ -15,6 +15,7 @@
 #include <ctime>
 #include <filesystem>
 #include <functional>
+#include <string_view>
 #include <vector>
 
 #include <wx/panel.h>
@@ -52,6 +53,14 @@ class EmulatorWindow;
 struct ContentLocation {
   XContentType content_type = XContentType::kInvalid;
   uint64_t xuid = 0;
+};
+
+// One row of a content section.
+struct ContentItem {
+  wxString name;
+  uint64_t size_bytes = 0;
+  // Replaces the full name as the row's tooltip when set.
+  wxString tooltip;
 };
 
 // Everything known about one title: art, name and play progress in a header,
@@ -109,6 +118,8 @@ class GameInfoPanel : public wxPanel {
   void BuildHeader(wxWindow* parent, wxBoxSizer* sizer);
   void BuildDetailsSection(wxWindow* parent, wxBoxSizer* sizer);
   void BuildCompatSection(wxWindow* parent, wxBoxSizer* sizer);
+  // Whether the release is an original Xbox game, which XeFu runs.
+  bool IsOriginalXbox() const;
   void BuildDiscsSection(wxWindow* parent, wxBoxSizer* sizer);
   // The content folders one section covers, listed together. `header_format`
   // is a complete translatable phrase holding a single %zu for the item count.
@@ -124,6 +135,15 @@ class GameInfoPanel : public wxPanel {
   // Vets picked packages against this title and moves each good one into the
   // location its own content type names. Rejects are reported together.
   void ImportContent(const std::vector<ContentLocation>& locations);
+  // An original Xbox game keeps its saves and downloads where XeFu puts them,
+  // not in a profile.
+  void BuildXboxOriginalSaves(wxWindow* parent, wxBoxSizer* sizer);
+  void BuildXboxOriginalContent(wxWindow* parent, wxBoxSizer* sizer);
+  // This title's folder under XeFu's Xbox1\<area>, empty when it has none.
+  std::filesystem::path XboxOriginalTitleDir(std::string_view area) const;
+  // Name and size rows, or a note when there are none.
+  void AddContentRows(wxWindow* parent, wxBoxSizer* sizer,
+                      const std::vector<ContentItem>& items);
   void BuildPatchesSection(wxWindow* parent, wxBoxSizer* sizer);
   void BuildConfigSection(wxWindow* parent, wxBoxSizer* sizer);
 
