@@ -3137,11 +3137,20 @@ void EmulatorWindow::UpdateTitle() {
   if (emulator()->is_title_open()) {
     uint32_t title_id = emulator()->title_id();
     std::string title_version = emulator()->title_version();
-    // XeFu shows the original Xbox game it runs, its build as the module.
-    if (const auto& game = emulator()->xbox_game();
-        title_id == kXeFuTitleId && game) {
-      title_id = game->title_id;
-      title_version = game->version ? VersionToString(game->version) : "";
+    // XeFu shows the original Xbox game it runs, its build as the module. A
+    // title update of the game shows its own version. Another executable keeps
+    // the game's title id, which its per-game config is kept under.
+    if (title_id == kXeFuTitleId) {
+      const auto& game = emulator()->xbox_game();
+      const auto running = emulator()->running_xbe();
+      const vfs::XbeMetadata* shown = game ? &*game : nullptr;
+      if (running && (!game || running->title_id == game->title_id)) {
+        shown = &*running;
+      }
+      if (shown) {
+        title_id = shown->title_id;
+        title_version = shown->version ? VersionToString(shown->version) : "";
+      }
     }
     sb.AppendFormat(" | [{:08X}", title_id);
     if (!title_version.empty()) {

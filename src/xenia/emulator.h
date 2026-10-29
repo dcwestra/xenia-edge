@@ -117,6 +117,11 @@ class Emulator {
   const std::optional<vfs::XbeMetadata>& xbox_game() const {
     return xbox_game_;
   }
+  // The title id and version of the executable XeFu is running. A title
+  // update, or a game starting another executable, makes it differ from
+  // xbox_game(), which still names the release. Empty until the title starts.
+  std::optional<vfs::XbeMetadata> running_xbe() const;
+  void SetRunningXbe(vfs::XbeMetadata xbe);
   // Puts an original Xbox game in the drive for XeFu.
   void InsertXboxGame(const std::filesystem::path& path);
   // Whether the original Xbox game stays in the drive for a launch of path, as
@@ -528,6 +533,9 @@ class Emulator {
   // shown to XeFu as the disc. Persists across launches from xefu_path.
   std::filesystem::path xbox_disc_path_;
   std::optional<vfs::XbeMetadata> xbox_game_;
+  // Set by the UI, cleared by whichever thread launches.
+  mutable std::mutex running_xbe_mutex_;
+  std::optional<vfs::XbeMetadata> running_xbe_;
   std::string missing_xefu_file_;
   DiscProvider disc_provider_;
   DiscRecorder disc_recorder_;
