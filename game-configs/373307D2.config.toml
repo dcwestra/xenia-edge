@@ -1,0 +1,9 @@
+# Dance Central 2 (373307D2) - recommended per-game settings for the
+# edge-linux fork. Copy to <Xenia storage root>/config/373307D2.config.toml.
+# Doesn't play yet: it shuts itself down after its intro movie, with or
+# without the Kinect.
+
+[Console]
+# A Kinect game: lets its Kinect (NUI) runtime start. Needs a Kinect for Xbox
+# 360 on Linux (see tools/kinect/).
+allow_nui_initialization = true

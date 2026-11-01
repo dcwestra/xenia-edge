@@ -1,0 +1,12 @@
+# Kinect Adventures! (4D5308ED) - recommended per-game settings for the
+# edge-linux fork. Copy to <Xenia storage root>/config/4D5308ED.config.toml.
+
+[Console]
+# A Kinect game: lets its Kinect (NUI) runtime start. Needs a Kinect for Xbox
+# 360 on Linux (see tools/kinect/).
+allow_nui_initialization = true
+
+[Kernel]
+# Lets its avatar system start. River Rush steers the raft from the player's
+# avatar, so without it the raft doesn't steer.
+allow_avatar_initialization = true

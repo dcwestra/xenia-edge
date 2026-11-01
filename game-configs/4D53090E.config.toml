@@ -1,0 +1,7 @@
+# Kinect Star Wars (4D53090E) - recommended per-game settings for the
+# edge-linux fork. Copy to <Xenia storage root>/config/4D53090E.config.toml.
+
+[Console]
+# A Kinect game: lets its Kinect (NUI) runtime start. Needs a Kinect for Xbox
+# 360 on Linux (see tools/kinect/).
+allow_nui_initialization = true

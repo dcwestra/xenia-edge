@@ -27,7 +27,7 @@ What that means for you:
 
 - **Expect mistakes.** The changes compile, pass the existing unit tests and fixed the problems they were aimed at in the games that were tested. They have not had the scrutiny upstream changes get.
 - **Commits are marked.** Every commit made with the AI carries a `Co-Authored-By: Claude` trailer, so you can always tell what it touched.
-- **Testing covered a small set.** Five games: *Fable II*, *Fable III*, *Red Dead Redemption*, and the Kinect games *Fable: The Journey* and *Kinect Sports*. Two machines:
+- **Testing covered a small set.** *Fable II*, *Fable III*, *Red Dead Redemption*, and the Kinect games *Fable: The Journey*, *Kinect Sports*, *Kinect Adventures!* and *Kinect Star Wars*. Two machines:
   - Fedora 44 on an NVIDIA Quadro T2000 laptop, with a Kinect for Xbox 360 (model 1414).
   - Batocera 43 on an AMD Radeon RX 5700 with an Intel i7-9700.
 
@@ -42,6 +42,9 @@ Tested by the owner with a Kinect for Xbox 360 (model 1414) on Fedora 44:
 
 - ***Fable: The Journey*** is playable. Getting the game's attention, Kinect ID sign-in and saving, horse brushing, reins and steering all work.
 - ***Kinect Sports*** is playable. The hand-cursor menus, signing in, bowling and the stadium crowd area all work, and **players appear as their Xbox avatars**, fully dressed and with animated faces.
+- ***Kinect Adventures!*** plays River Rush: jumping and steering the raft by side-stepping both work, and **players appear as their Xbox avatars**.
+- ***Kinect Star Wars*** plays.
+- ***Dance Central 2*** doesn't play yet. It shuts itself down after its intro movie, with or without the Kinect.
 
 ### How it works
 
@@ -62,7 +65,7 @@ Kinect games do their own skeletal tracking and Kinect ID face matching, in code
 
 1. Plug the Kinect in with its power and USB adapter. `libusb-1.0` must be installed; most distributions have it.
 2. Give your user access to the sensor with the udev rule in [`tools/kinect/`](tools/kinect/). The file explains how to install it. Then replug the Kinect.
-3. Copy the game configs from [`game-configs/`](game-configs/) (`4D530A1A` for *Fable: The Journey*, `4D5308C9` for *Kinect Sports*) into your Xenia `config/` folder. They turn on `allow_nui_initialization`, plus `allow_avatar_initialization` for *Kinect Sports*.
+3. Copy the game configs from [`game-configs/`](game-configs/) (`4D530A1A` for *Fable: The Journey*, `4D5308C9` for *Kinect Sports*, `4D5308ED` for *Kinect Adventures!*, `4D53090E` for *Kinect Star Wars*) into your Xenia `config/` folder. They turn on `allow_nui_initialization`, plus `allow_avatar_initialization` for *Kinect Sports* and *Kinect Adventures!*.
 4. Stand about 2-3 m in front of the sensor. *Kinect Sports* doesn't track seated players.
 
 Related settings:
@@ -75,7 +78,7 @@ Related settings:
 ### Limits
 
 - **Linux only**, and only the original **Kinect for Xbox 360 (model 1414)**. The Xbox One Kinect isn't supported.
-- **Two games tested.** Other Kinect games may reach parts that aren't implemented yet.
+- **Five games tried, four playable.** Other Kinect games may reach parts that aren't implemented yet.
 - **No Kinect audio.** The microphone array and voice commands aren't implemented.
 - **Avatars are still missing some details.** Height and weight aren't applied yet. The editor only offers the items in the avatar pack, not marketplace or award items.
 - **Not yet tried with Kinect on Batocera.**
@@ -136,13 +139,14 @@ These are separate from the code, and every patch is **off by default**. Copy wh
   - A working *Fable II* Collector's Edition unlock. The community version crashes this game version when the Guild Cave loads.
   - A *Fable III* Limited Collector's Edition unlock. It is new, and its in-game result is not yet confirmed.
   - The *Fable II* Realtime Texture Morphing patch, from himdo's research. In this fork it is only needed if `readback_resolve` is off.
-- [`game-configs/`](game-configs/) holds recommended per-game settings for *Fable II*, *Fable: The Journey* and *Kinect Sports*.
+- [`game-configs/`](game-configs/) holds recommended per-game settings for *Fable II* and the Kinect games.
 
 ## Known issues
 
-- On NVIDIA, *Fable II* can still show an occasional single-frame white or blue flash on an object. `occlusion_query = "strict"` (in the recommended config) reduces it. It has not been seen on AMD with the game's own texture morphing, but testing there is still short.
+- *Fable II* can still flash a patch of grass or brush white for a frame, rarely, on NVIDIA and AMD alike. The flashing characters seen on NVIDIA are fixed.
+- In *Fable II*, the moon's glow can show through hills and buildings.
 - AMD/RADV can't map the emulator's guest memory directly (`VK_EXT_external_memory_host` rejects shared memory). Readback therefore goes through an extra copy, which is safe but slower than on NVIDIA.
-- These changes were tested on five games only. Everything else is as upstream left it, for better or worse.
+- These changes were tested on the games listed above only. Everything else is as upstream left it, for better or worse.
 
 ## Building
 
