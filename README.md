@@ -27,7 +27,7 @@ What that means for you:
 
 - **Expect mistakes.** The changes compile, pass the existing unit tests and fixed the problems they were aimed at in the games that were tested. They have not had the scrutiny upstream changes get.
 - **Commits are marked.** Every commit made with the AI carries a `Co-Authored-By: Claude` trailer, so you can always tell what it touched.
-- **Testing covered a small set.** *Fable II*, *Fable III*, *Red Dead Redemption*, and the Kinect games *Fable: The Journey*, *Kinect Sports*, *Kinect Adventures!* and *Kinect Star Wars*. Two machines:
+- **Testing covered a small set.** *Fable II*, *Fable III*, *Red Dead Redemption*, and the Kinect games *Fable: The Journey*, *Kinect Sports*, *Kinect Adventures!*, *Kinect Star Wars* and *Dance Central 2*. Two machines:
   - Fedora 44 on an NVIDIA Quadro T2000 laptop, with a Kinect for Xbox 360 (model 1414).
   - Batocera 43 on an AMD Radeon RX 5700 with an Intel i7-9700.
 
@@ -44,7 +44,7 @@ Tested by the owner with a Kinect for Xbox 360 (model 1414) on Fedora 44:
 - ***Kinect Sports*** is playable. The hand-cursor menus, signing in, bowling and the stadium crowd area all work, and **players appear as their Xbox avatars**, fully dressed and with animated faces.
 - ***Kinect Adventures!*** plays River Rush: jumping and steering the raft by side-stepping both work, and **players appear as their Xbox avatars**.
 - ***Kinect Star Wars*** plays.
-- ***Dance Central 2*** doesn't play yet. It shuts itself down after its intro movie, with or without the Kinect.
+- ***Dance Central 2*** is playable: menus, songs and scoring all work. Voice commands don't, see Limits.
 
 ### How it works
 
@@ -65,7 +65,7 @@ Kinect games do their own skeletal tracking and Kinect ID face matching, in code
 
 1. Plug the Kinect in with its power and USB adapter. `libusb-1.0` must be installed; most distributions have it.
 2. Give your user access to the sensor with the udev rule in [`tools/kinect/`](tools/kinect/). The file explains how to install it. Then replug the Kinect.
-3. Copy the game configs from [`game-configs/`](game-configs/) (`4D530A1A` for *Fable: The Journey*, `4D5308C9` for *Kinect Sports*, `4D5308ED` for *Kinect Adventures!*, `4D53090E` for *Kinect Star Wars*) into your Xenia `config/` folder. They turn on `allow_nui_initialization`, plus `allow_avatar_initialization` for *Kinect Sports* and *Kinect Adventures!*.
+3. Copy the game configs from [`game-configs/`](game-configs/) (`4D530A1A` for *Fable: The Journey*, `4D5308C9` for *Kinect Sports*, `4D5308ED` for *Kinect Adventures!*, `4D53090E` for *Kinect Star Wars*, `373307D2` for *Dance Central 2*) into your Xenia `config/` folder. They turn on `allow_nui_initialization`, plus `allow_avatar_initialization` for *Kinect Sports* and *Kinect Adventures!*.
 4. Stand about 2-3 m in front of the sensor. *Kinect Sports* doesn't track seated players.
 
 Related settings:
@@ -78,7 +78,7 @@ Related settings:
 ### Limits
 
 - **Linux only**, and only the original **Kinect for Xbox 360 (model 1414)**. The Xbox One Kinect isn't supported.
-- **Five games tried, four playable.** Other Kinect games may reach parts that aren't implemented yet.
+- **Five games tested, all playable.** Other Kinect games may reach parts that aren't implemented yet.
 - **No Kinect audio.** The microphone array and voice commands aren't implemented.
 - **Avatars are still missing some details.** Height and weight aren't applied yet. The editor only offers the items in the avatar pack, not marketplace or award items.
 - **Not yet tried with Kinect on Batocera.**
@@ -106,6 +106,11 @@ Unless noted, every new behavior is controlled by a configuration option (cvar),
   - This saves about 0.6 ms per frame in *Fable II*.
 - **A lock-free guest clock.** Upstream's guest clock dropped the fractional tick on every read, so games that poll the timebase saw guest time run slow: **7.8% slow** in the new `clock_test`. Reading the clock also took a lock on a hot path.
 - **Scheduling fixes:** sub-millisecond guest waits and absolute timeouts are handled correctly, multi-object waits use a futex, and spinning guest threads re-check their timeouts without extra system calls.
+
+### Compatibility
+
+- **Games' own error handlers** (`guest_exception_dispatch`, on). A memory access fault in a game goes to the `__try` block the game wrapped around it, as on the console, instead of always crashing. *Dance Central 2* faults on purpose to start its game loop this way. A fault no handler takes still crashes as before.
+- **Title keys.** Games can decrypt with keys they hand the console (`XeKeysSetKey`, `XeKeysAesCbc`). The console's hypervisor turns Harmonix's song keys into different ones before using them, in a way that isn't known, so the four *Dance Central 2* hands over are translated to the keys their songs decrypt with. The songs then play from an unmodified disc.
 
 ### Linux and Batocera
 
