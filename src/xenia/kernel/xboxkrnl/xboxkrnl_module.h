@@ -19,15 +19,8 @@
 #include "xenia/kernel/xboxkrnl/xboxkrnl_rtl.h"
 
 namespace xe {
-class Exception;
-
 namespace kernel {
 namespace xboxkrnl {
-
-// Hands an access violation in guest code at pc to a __try around it, by
-// diverting the thread to the guest's filter. False if no guest handler can
-// take it, and once the guest's handlers have all declined it.
-bool DivertGuestAccessViolation(Exception* ex, uint32_t pc);
 
 class XboxkrnlModule : public KernelModule {
  public:

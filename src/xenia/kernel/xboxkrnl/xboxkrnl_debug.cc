@@ -9,13 +9,7 @@
 
 #include <cstring>
 
-#if XE_ARCH_AMD64
-#include <xmmintrin.h>
-#endif  // XE_ARCH_AMD64
-
-#include "xenia/base/cvar.h"
 #include "xenia/base/debugging.h"
-#include "xenia/base/exception_handler.h"
 #include "xenia/base/logging.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/cpu/xex_module.h"
@@ -28,13 +22,6 @@
 #include "xenia/ui/imgui_drawer.h"
 #include "xenia/ui/window.h"
 #include "xenia/ui/windowed_app_context.h"
-
-DEFINE_bool(guest_exception_dispatch, true,
-            "Hand an access violation in guest code to the guest's own "
-            "exception handling, a __try around it, as the console does. "
-            "Faults no guest handler takes still crash. Dance Central 2 "
-            "runs its game loop from such a handler.",
-            "Kernel");
 
 namespace xe {
 namespace kernel {
@@ -427,11 +414,12 @@ struct GuestFrame {
   uint32_t packed;
 };
 
-// Walks the back chain from a frame suspended at the call before pc. False
-// means it ran out of readable stack, leaving the last frame with no entry_sp
-// and no way to unwind through it.
-static bool WalkGuestFramesFrom(uint32_t pc, uint32_t sp,
-                                std::vector<GuestFrame>* out_frames) {
+// Walks the back chain. False means it ran out of readable stack, leaving the
+// last frame with no entry_sp and no way to unwind through it.
+static bool WalkGuestFrames(PPCContext* context,
+                            std::vector<GuestFrame>* out_frames) {
+  uint32_t sp = static_cast<uint32_t>(context->r[1]);
+  uint32_t pc = static_cast<uint32_t>(context->lr);
   for (int i = 0; i < 24; ++i) {
     GuestFrame frame = {};
     frame.pc = pc;
@@ -453,12 +441,6 @@ static bool WalkGuestFramesFrom(uint32_t pc, uint32_t sp,
     sp = caller_sp;
   }
   return true;
-}
-
-static bool WalkGuestFrames(PPCContext* context,
-                            std::vector<GuestFrame>* out_frames) {
-  return WalkGuestFramesFrom(static_cast<uint32_t>(context->lr),
-                             static_cast<uint32_t>(context->r[1]), out_frames);
 }
 
 // Undoes one frame's prolog, reloading the registers it saved on entry.
@@ -493,9 +475,6 @@ static bool UnwindGuestFrame(const GuestFrame& frame, PPCContext* context) {
     }
     if (ra != 1) {
       return false;
-    }
-    if (opcode == 14) {  // addi rD, r1, d, a frame pointer, nothing saved
-      continue;
     }
     if (opcode == 36) {  // stw rS, d(r1)
       const uint32_t at = sp + displacement;
@@ -874,376 +853,6 @@ void HandleCppException(pointer_t<X_EXCEPTION_RECORD> record,
   if (dispatch) {
     ApplyCppDispatch(context, plan);
   }
-}
-
-// Faults reach the guest's __try blocks the way the console's dispatcher hands
-// them out: to the first frame whose __C_specific_handler scope covers the
-// fault and whose filter accepts it. Only the kernel's __C_specific_handler is
-// understood. Frames with other handlers are passed over, which is what the
-// C++ ones do with a fault.
-
-// __C_specific_handler's scope table: a count, then these.
-typedef struct {
-  xe::be<uint32_t> begin_address;
-  xe::be<uint32_t> end_address;
-  // The filter, 1 for a constant EXCEPTION_EXECUTE_HANDLER.
-  xe::be<uint32_t> handler_address;
-  // The __except block, 0 for a __finally.
-  xe::be<uint32_t> jump_target;
-} x_ScopeTableEntry;
-
-// CONTEXT fields.
-constexpr uint32_t kContextFlags = 0x0;
-constexpr uint32_t kContextIar = 0x8;
-constexpr uint32_t kContextLr = 0xC;
-constexpr uint32_t kContextCtr = 0x10;
-constexpr uint32_t kContextGpr = 0x18;
-constexpr uint32_t kContextCr = 0x118;
-constexpr uint32_t kContextXer = 0x11C;
-constexpr uint32_t kContextFpr = 0x128;
-// Through the 128 vector registers.
-constexpr uint32_t kContextSize = 0xA40;
-// CONTEXT_CONTROL | CONTEXT_FLOATING_POINT | CONTEXT_INTEGER.
-constexpr uint32_t kContextFullFlags = 0x7;
-
-constexpr uint32_t kExceptionContinueExecution = 0xFFFFFFFF;
-constexpr uint32_t kExceptionContinueSearch = 0;
-
-// The records go this far below the faulting sp, past anything the function
-// may keep under it, and the filter's frames below them.
-constexpr uint32_t kFaultStackGap = 0x400;
-constexpr uint32_t kFaultPointers = 0x0;
-constexpr uint32_t kFaultRecord = 0x10;
-constexpr uint32_t kFaultContext = 0x60;
-constexpr uint32_t kFaultRecordsSize = kFaultContext + kContextSize;
-constexpr uint32_t kFilterStackGap = 0x100;
-
-// Whether handler is an import of the kernel's __C_specific_handler.
-static bool IsCSpecificHandler(uint32_t handler) {
-  auto* function = kernel_state()->processor()->LookupFunction(handler);
-  if (!function || function->behavior() != cpu::Function::Behavior::kExtern) {
-    return false;
-  }
-  auto* export_data = static_cast<cpu::GuestFunction*>(function)->export_data();
-  return export_data &&
-         std::strcmp(export_data->name, "__C_specific_handler") == 0;
-}
-
-// Walks the frames from a fault at pc. The faulting function may not have
-// built its frame yet, or be a leaf that never does, and then its sp is its
-// caller's and its return address is still in lr.
-static void WalkGuestFaultFrames(PPCContext* context, uint32_t pc,
-                                 std::vector<GuestFrame>* out_frames,
-                                 bool* out_fault_frame_built) {
-  GuestFrame frame = {};
-  frame.pc = pc;
-  frame.sp = static_cast<uint32_t>(context->r[1]);
-  LookupGuestRuntimeFunction(pc, &frame.function, &frame.packed);
-  bool built = false;
-  bool saves_lr = false;
-  for (uint32_t i = 0; frame.function && i < (frame.packed & 0xFF); ++i) {
-    const uint32_t address = frame.function + i * 4;
-    if (address >= pc || !IsGuestRangeReadable(address, 4)) {
-      break;
-    }
-    const uint32_t instruction = ReadGuestWord(address);
-    if (instruction == 0x7D8802A6) {  // mflr r12
-      saves_lr = true;
-    } else if ((instruction & 0xFFFF0000) == 0x94210000) {  // stwu r1, d(r1)
-      built = true;
-    }
-  }
-  *out_fault_frame_built = built;
-  uint32_t return_address = static_cast<uint32_t>(context->lr);
-  frame.entry_sp = frame.sp;
-  if (built) {
-    if (!IsGuestRangeReadable(frame.sp, 4)) {
-      out_frames->push_back(frame);
-      return;
-    }
-    frame.entry_sp = ReadGuestWord(frame.sp);
-    if (saves_lr) {
-      if (!IsGuestRangeReadable(frame.entry_sp - 8, 4)) {
-        out_frames->push_back(frame);
-        return;
-      }
-      return_address = ReadGuestWord(frame.entry_sp - 8);
-    }
-  }
-  out_frames->push_back(frame);
-  WalkGuestFramesFrom(return_address, frame.entry_sp, out_frames);
-}
-
-// The __except scope of a frame covering its pc, for which a filter has to be
-// asked, or none.
-struct GuestScope {
-  size_t frame;
-  uint32_t filter;
-  uint32_t target;
-};
-
-// Every __except scope covering the fault, innermost first. The faulting frame
-// is at the fault, the others at the call before their return address.
-static std::vector<GuestScope> FindGuestScopes(
-    const std::vector<GuestFrame>& frames) {
-  std::vector<GuestScope> scopes;
-  for (size_t i = 0; i < frames.size(); ++i) {
-    const GuestFrame& frame = frames[i];
-    if (!frame.function || !(frame.packed >> 31) ||
-        !IsGuestRangeReadable(frame.function - 8, 8) ||
-        !IsCSpecificHandler(ReadGuestWord(frame.function - 8))) {
-      continue;
-    }
-    const uint32_t table = ReadGuestWord(frame.function - 4);
-    if (!IsGuestRangeReadable(table, 4)) {
-      continue;
-    }
-    const uint32_t pc = i ? frame.pc - 4 : frame.pc;
-    const uint32_t count = std::min<uint32_t>(ReadGuestWord(table), 64);
-    for (uint32_t j = 0; j < count; ++j) {
-      const uint32_t entry_ptr = table + 4 + j * sizeof(x_ScopeTableEntry);
-      if (!IsGuestRangeReadable(entry_ptr, sizeof(x_ScopeTableEntry))) {
-        break;
-      }
-      auto* entry =
-          kernel_memory()->TranslateVirtual<x_ScopeTableEntry*>(entry_ptr);
-      if (pc >= entry->begin_address && pc < entry->end_address &&
-          entry->jump_target) {
-        scopes.push_back({i, entry->handler_address, entry->jump_target});
-      }
-    }
-  }
-  return scopes;
-}
-
-// Fills the exception record, the CONTEXT and the EXCEPTION_POINTERS at base.
-static void WriteGuestFaultRecords(PPCContext* context, uint32_t base,
-                                   uint32_t pc, uint32_t address,
-                                   bool is_write) {
-  auto* memory = kernel_memory();
-  std::memset(memory->TranslateVirtual(base), 0, kFaultRecordsSize);
-  auto* record =
-      memory->TranslateVirtual<X_EXCEPTION_RECORD*>(base + kFaultRecord);
-  record->code = X_STATUS_ACCESS_VIOLATION;
-  record->exception_address = pc;
-  record->number_parameters = 2;
-  record->exception_information[0] = is_write ? 1 : 0;
-  record->exception_information[1] = address;
-  auto* p = memory->TranslateVirtual<uint8_t*>(base + kFaultContext);
-  xe::store_and_swap<uint32_t>(p + kContextFlags, kContextFullFlags);
-  xe::store_and_swap<uint32_t>(p + kContextIar, pc);
-  xe::store_and_swap<uint32_t>(p + kContextLr, uint32_t(context->lr));
-  xe::store_and_swap<uint64_t>(p + kContextCtr, context->ctr);
-  for (uint32_t i = 0; i < 32; ++i) {
-    xe::store_and_swap<uint64_t>(p + kContextGpr + i * 8, context->r[i]);
-    xe::store_and_swap<double>(p + kContextFpr + i * 8, context->f[i]);
-  }
-  xe::store_and_swap<uint32_t>(p + kContextCr, uint32_t(context->cr()));
-  xe::store_and_swap<uint32_t>(p + kContextXer, context->xer());
-  auto* pointers =
-      memory->TranslateVirtual<xe::be<uint32_t>*>(base + kFaultPointers);
-  pointers[0] = base + kFaultRecord;
-  pointers[1] = base + kFaultContext;
-}
-
-// Runs the guest from address until the thread's entry function returns, then
-// ends the thread with its result, as XThread::Execute does.
-[[noreturn]] static void RunGuestToThreadExit(XThread* thread,
-                                              uint32_t address) {
-  PPCContext* context = thread->thread_state()->context();
-  context->lr = 0xBCBCBCBC;
-  if (!kernel_state()->processor()->ExecuteRaw(thread->thread_state(),
-                                               address)) {
-    XELOGE("Guest exception dispatch: no code at 0x{:08X}", address);
-  }
-  thread->Exit(static_cast<int>(context->r[3]));
-  // Exit doesn't return on the thread itself.
-  while (true) {
-    xe::threading::NanoSleep(int64_t(1'000'000'000));
-  }
-}
-
-// Asks the filters, innermost first, and acts on the first that takes the
-// fault. Returns only if none does.
-static void DispatchGuestFault(XThread* thread, uint32_t pc, uint32_t address,
-                               bool is_write) {
-  PPCContext* context = thread->thread_state()->context();
-  std::vector<GuestFrame> frames;
-  bool fault_frame_built = false;
-  WalkGuestFaultFrames(context, pc, &frames, &fault_frame_built);
-  const std::vector<GuestScope> scopes = FindGuestScopes(frames);
-  const uint32_t sp = static_cast<uint32_t>(context->r[1]);
-  const uint32_t base =
-      (sp - kFaultStackGap - kFaultRecordsSize) & ~uint32_t(15);
-  const uint32_t filter_sp = base - kFilterStackGap;
-  if (scopes.empty() || !IsGuestRangeReadable(filter_sp, sp - filter_sp)) {
-    return;
-  }
-  WriteGuestFaultRecords(context, base, pc, address, is_write);
-  for (const GuestScope& scope : scopes) {
-    const GuestFrame& frame = frames[scope.frame];
-    uint32_t verdict = 1;
-    if (scope.filter != 1) {
-      XELOGI(
-          "Guest exception dispatch: access violation at 0x{:08X} (0x{:08X}), "
-          "asking the filter 0x{:08X} of frame #{} fn=0x{:08X}",
-          pc, address, scope.filter, scope.frame, frame.function);
-      // Like a catch funclet, a filter finds its function's frame from r12.
-      context->r[1] = filter_sp;
-      *kernel_memory()->TranslateVirtual<xe::be<uint32_t>*>(filter_sp) = sp;
-      context->r[3] = base + kFaultPointers;
-      context->r[4] = frame.entry_sp;
-      context->r[12] = frame.entry_sp;
-      context->lr = 0xBCBCBCBC;
-      if (!kernel_state()->processor()->ExecuteRaw(thread->thread_state(),
-                                                   scope.filter)) {
-        XELOGE("Guest exception dispatch: no code at the filter 0x{:08X}",
-               scope.filter);
-        continue;
-      }
-      verdict = static_cast<uint32_t>(context->r[3]);
-    }
-    if (verdict == kExceptionContinueSearch) {
-      continue;
-    }
-    if (verdict == kExceptionContinueExecution) {
-      // The filter may have changed the CONTEXT, the fault resumes from it.
-      auto* p =
-          kernel_memory()->TranslateVirtual<uint8_t*>(base + kFaultContext);
-      for (uint32_t i = 0; i < 32; ++i) {
-        context->r[i] = xe::load_and_swap<uint64_t>(p + kContextGpr + i * 8);
-        context->f[i] = xe::load_and_swap<double>(p + kContextFpr + i * 8);
-      }
-      context->ctr = xe::load_and_swap<uint64_t>(p + kContextCtr);
-      context->set_cr(xe::load_and_swap<uint32_t>(p + kContextCr));
-      context->set_xer(xe::load_and_swap<uint32_t>(p + kContextXer));
-      const uint32_t resume = xe::load_and_swap<uint32_t>(p + kContextIar);
-      const uint32_t lr = xe::load_and_swap<uint32_t>(p + kContextLr);
-      XELOGI("Guest exception dispatch: the filter resumes at 0x{:08X}",
-             resume);
-      context->lr = lr;
-      RunGuestToThreadExit(thread, resume);
-    }
-    // The __except block runs in its function's frame, so undo the frames
-    // inside it. Their own handlers (__finally blocks, destructors) don't run.
-    for (size_t i = (fault_frame_built ? 0 : 1); i < scope.frame; ++i) {
-      if (!UnwindGuestFrame(frames[i], nullptr)) {
-        XELOGE(
-            "Guest exception dispatch: frame #{} fn=0x{:08X} has a prolog we "
-            "cannot undo, so the __except block at 0x{:08X} can't run",
-            i, frames[i].function, scope.target);
-        return;
-      }
-    }
-    for (size_t i = (fault_frame_built ? 0 : 1); i < scope.frame; ++i) {
-      UnwindGuestFrame(frames[i], context);
-    }
-    XELOGI(
-        "Guest exception dispatch: access violation at 0x{:08X} (0x{:08X}) "
-        "handled by the __except block at 0x{:08X} of frame #{} fn=0x{:08X}",
-        pc, address, scope.target, scope.frame, frame.function);
-    context->r[1] = frame.sp;
-    // The handler finds the exception code in r3.
-    context->r[3] = X_STATUS_ACCESS_VIOLATION;
-    RunGuestToThreadExit(thread, scope.target);
-  }
-}
-
-#if !XE_PLATFORM_WIN32
-// Guest code can't run on the signal stack, so the fault diverts to the thunk
-// below, on the faulting fiber's own stack.
-struct PendingGuestFault {
-  HostThreadContext host_context;
-  uint32_t pc;
-  uint32_t address;
-  bool is_write;
-};
-thread_local PendingGuestFault pending_guest_fault;
-// A fault no guest handler took runs again to reach the crash path.
-thread_local bool guest_fault_declined = false;
-thread_local uint32_t guest_fault_declined_pc = 0;
-
-[[noreturn]] static void GuestFaultDispatchThunk() {
-  const PendingGuestFault fault = pending_guest_fault;
-#if XE_ARCH_AMD64
-  // The signal return put back the MXCSR the fault ran with, which the context
-  // doesn't carry and the filters' guest code changes.
-  const uint32_t mxcsr = _mm_getcsr();
-#endif  // XE_ARCH_AMD64
-  XThread* thread = XThread::GetCurrentThread();
-  PPCContext* context = thread->thread_state()->context();
-  // The filters ran guest code, the crash dump wants the fault's registers.
-  struct {
-    uint64_t r[32];
-    double f[32];
-    vec128_t v[128];
-    uint64_t lr;
-    uint64_t ctr;
-    uint64_t cr;
-    uint32_t xer;
-  } saved;
-  std::memcpy(saved.r, context->r, sizeof(saved.r));
-  std::memcpy(saved.f, context->f, sizeof(saved.f));
-  std::memcpy(saved.v, context->v, sizeof(saved.v));
-  saved.lr = context->lr;
-  saved.ctr = context->ctr;
-  saved.cr = context->cr();
-  saved.xer = context->xer();
-  DispatchGuestFault(thread, fault.pc, fault.address, fault.is_write);
-  std::memcpy(context->r, saved.r, sizeof(saved.r));
-  std::memcpy(context->f, saved.f, sizeof(saved.f));
-  std::memcpy(context->v, saved.v, sizeof(saved.v));
-  context->lr = saved.lr;
-  context->ctr = saved.ctr;
-  context->set_cr(saved.cr);
-  context->set_xer(saved.xer);
-  guest_fault_declined = true;
-  guest_fault_declined_pc = fault.pc;
-#if XE_ARCH_AMD64
-  _mm_setcsr(mxcsr);
-#endif  // XE_ARCH_AMD64
-  ResumeHostContext(&fault.host_context);
-}
-#endif  // !XE_PLATFORM_WIN32
-
-bool DivertGuestAccessViolation(Exception* ex, uint32_t pc) {
-#if XE_PLATFORM_WIN32
-  return false;
-#else
-  if (guest_fault_declined) {
-    guest_fault_declined = false;
-    if (guest_fault_declined_pc == pc) {
-      return false;
-    }
-  }
-  XThread* thread = XThread::GetCurrentThread();
-  if (!cvars::guest_exception_dispatch || !thread ||
-      ex->code() != Exception::Code::kAccessViolation) {
-    return false;
-  }
-  std::vector<GuestFrame> frames;
-  bool fault_frame_built = false;
-  WalkGuestFaultFrames(thread->thread_state()->context(), pc, &frames,
-                       &fault_frame_built);
-  if (FindGuestScopes(frames).empty()) {
-    return false;
-  }
-  auto* memory = kernel_memory();
-  const auto* host_address =
-      reinterpret_cast<const uint8_t*>(ex->fault_address());
-  uint32_t address = 0xFFFFFFFF;
-  if (host_address >= memory->virtual_membase() &&
-      host_address < memory->virtual_membase() + 0x100000000ull) {
-    address = uint32_t(host_address - memory->virtual_membase());
-  }
-  pending_guest_fault.host_context = *ex->thread_context();
-  pending_guest_fault.pc = pc;
-  pending_guest_fault.address = address;
-  pending_guest_fault.is_write = ex->access_violation_operation() ==
-                                 Exception::AccessViolationOperation::kWrite;
-  DivertToThunk(ex, &GuestFaultDispatchThunk);
-  return true;
-#endif  // XE_PLATFORM_WIN32
 }
 
 void RtlRaiseException_entry(pointer_t<X_EXCEPTION_RECORD> record,
