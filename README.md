@@ -109,7 +109,7 @@ Unless noted, every new behavior is controlled by a configuration option (cvar),
 
 ### Compatibility
 
-- **Games' own error handlers** (`guest_exception_dispatch`, on). A memory access fault in a game goes to the `__try` block the game wrapped around it, as on the console, instead of always crashing. *Dance Central 2* faults on purpose to start its game loop this way. A fault no handler takes still crashes as before.
+- **Games' own error handlers.** A memory access fault in a game goes to the game's own exception handlers, as on the console, instead of always crashing. This is upstream pull request #332 (by jessenic), with the kernel's `__C_specific_handler` added on top, which *Dance Central 2* needs: it faults on purpose to start its game loop. A fault no handler takes still crashes as before.
 - **Title keys.** Games can decrypt with keys they hand the console (`XeKeysSetKey`, `XeKeysAesCbc`). The console's hypervisor turns Harmonix's song keys into different ones before using them, in a way that isn't known, so the four *Dance Central 2* hands over are translated to the keys their songs decrypt with. The songs then play from an unmodified disc.
 
 ### Linux and Batocera
