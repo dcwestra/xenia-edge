@@ -2191,7 +2191,8 @@ bool Emulator::ExceptionCallback(Exception* ex) {
   // and the CLR, for one, turns a read through a null reference into a
   // NullReferenceException there.
   const uint64_t fault_offset =
-      ex->fault_address() - reinterpret_cast<uint64_t>(memory()->virtual_membase());
+      ex->fault_address() -
+      reinterpret_cast<uint64_t>(memory()->virtual_membase());
   if (ex->code() == Exception::Code::kAccessViolation && guest_function &&
       processor()->data_fault_hook() && fault_offset <= UINT32_MAX) {
     const uint32_t pc = guest_function->MapMachineCodeToGuestAddress(ex->pc());
@@ -2240,8 +2241,9 @@ void Emulator::ReportGuestCrash(const std::string& crash_msg) {
   // thread gets its own, and ImGui takes a window's title as its ID, so the
   // thread's handle goes after "##", where ImGui doesn't show it.
   if (display_window_ && imgui_drawer_) {
-    const std::string crash_title =
-        fmt::format("Uh-oh!##{:08X}", current_thread->handle());
+    auto* current_thread = kernel::XThread::GetCurrentThread();
+    const std::string crash_title = fmt::format(
+        "Uh-oh!##{:08X}", current_thread ? current_thread->handle() : 0);
     display_window_->app_context().CallInUIThreadSynchronous(
         [this, &crash_dlg, &crash_title]() {
           xe::ui::ImGuiDialog::ShowMessageBox(imgui_drawer_, crash_title,
