@@ -228,7 +228,7 @@ bool RenderAvatarPreview(const AvatarAssets& assets, uint32_t width,
       for (size_t r = 1; r + 6 <= 120; r += 6) {
         const uint32_t type = word(r);
         if (type == 1) {
-          const uint32_t index = word(r + 2) & 0xFFFF;
+          const uint32_t index = word(r + 2) >> 16;
           mesh.textures.push_back(
               index < textures[m].size() ? &textures[m][index] : nullptr);
         } else if (type == 3) {

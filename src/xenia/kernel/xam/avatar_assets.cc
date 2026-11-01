@@ -392,8 +392,9 @@ struct ModelMesh {
   uint32_t ib_offset = 0;
   // Its positions' minimum z (shape overrides are relative to it).
   float minimum_z = 0.0f;
-  // 24-byte draw records (6 words): type 1 binds a texture, type 3 is a
-  // color parameter {3, id, r, g, b, a}.
+  // 24-byte draw records (6 words): type 1 binds a texture {1, slot, then
+  // two halfwords: the texture's index and another}, type 3 is a color
+  // parameter {3, id, r, g, b, a}.
   std::vector<uint32_t> records;
 };
 
@@ -1275,7 +1276,11 @@ bool BuildAvatarAssets(std::span<const uint8_t> manifest,
       for (size_t r = 0; r + 6 <= mesh.records.size(); r += 6) {
         uint32_t record[6];
         std::copy_n(&mesh.records[r], 6, record);
-        if (record[0] == 3) {
+        if (record[0] == 1) {
+          // Halfwords, so the texture's index stays first (titles read it
+          // as one; Kinect Adventures crashed on the other's 0xFFFF).
+          record[2] = (record[2] << 16) | (record[2] >> 16);
+        } else if (record[0] == 3) {
           if (record[1] >= 0xD && record[1] <= 0x15) {
             SetColorRecord(record, parsed.colors[record[1] - 0xD]);
           } else if (record[1] >= 0x16 && record[1] <= 0x18) {
