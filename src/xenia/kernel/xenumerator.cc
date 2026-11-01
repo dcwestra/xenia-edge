@@ -9,6 +9,9 @@
 
 #include "xenia/kernel/xenumerator.h"
 
+#include "xenia/kernel/kernel_state.h"
+#include "xenia/vfs/devices/stfs_xbox.h"
+
 namespace xe {
 namespace kernel {
 
@@ -292,6 +295,66 @@ uint32_t ContentEnumerator::WriteItems(uint8_t* buffer_data,
 
   if (written_count) {
     *written_count = static_cast<uint32_t>(actual_count);
+  }
+
+  return X_ERROR_SUCCESS;
+}
+
+// Reads the package's header, so only for items being written.
+static xam::XCONTENT_DATA_INTERNAL InternalContentData(
+    KernelState* kernel_state, const xam::XCONTENT_AGGREGATE_DATA& data) {
+  xam::XCONTENT_DATA_INTERNAL item = {};
+  item.device_id = data.device_id;
+  item.content_type = data.content_type;
+  item.display_name_raw = data.display_name_raw;
+  std::memcpy(item.file_name_raw, data.file_name_raw,
+              sizeof(data.file_name_raw));
+  item.xuid = data.xuid;
+  item.title_id = data.title_id;
+
+  std::vector<uint8_t> metadata;
+  if (!kernel_state->content_manager()->GetContentMetadata(data.xuid, data,
+                                                           &metadata)) {
+    const auto* header =
+        reinterpret_cast<const vfs::XContentMetadata*>(metadata.data());
+    item.content_size = header->content_size;
+    xe::string_util::copy_and_swap_truncating(
+        item.title_name, header->title_name(), xe::countof(item.title_name));
+  }
+  return item;
+}
+
+uint32_t ContentAggregateEnumerator::WriteItems(uint8_t* buffer_data,
+                                                uint32_t buffer_size,
+                                                uint32_t* written_count) {
+  return WriteItems(buffer_data, buffer_size, written_count, 0);
+}
+
+uint32_t ContentAggregateEnumerator::WriteItems(uint8_t* buffer_data,
+                                                uint32_t buffer_size,
+                                                uint32_t* written_count,
+                                                uint32_t flags) {
+  assert_false(buffer_size < item_size());
+  const size_t available_count =
+      std::min(items_per_enumerate(), buffer_size / item_size());
+  size_t count = 0;
+  for (; current_item_ < items_.size() && count < available_count;
+       ++current_item_) {
+    const Item& item = items_[current_item_];
+    if (item.other_title && !(flags & kAllTitlesFlag)) {
+      continue;
+    }
+    const xam::XCONTENT_DATA_INTERNAL data =
+        InternalContentData(kernel_state(), item.data);
+    std::memcpy(buffer_data + count * item_size(), &data, item_size());
+    ++count;
+  }
+  if (!count) {
+    return X_ERROR_NO_MORE_FILES;
+  }
+
+  if (written_count) {
+    *written_count = static_cast<uint32_t>(count);
   }
 
   return X_ERROR_SUCCESS;

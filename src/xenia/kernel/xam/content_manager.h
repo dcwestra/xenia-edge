@@ -11,6 +11,7 @@
 #define XENIA_KERNEL_XAM_CONTENT_MANAGER_H_
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -27,6 +28,9 @@ namespace xe {
 namespace kernel {
 class KernelState;
 }  // namespace kernel
+namespace vfs {
+class XContentContainerDevice;
+}  // namespace vfs
 }  // namespace xe
 
 namespace xe {
@@ -123,12 +127,6 @@ struct XCONTENT_AGGREGATE_DATA : XCONTENT_DATA {
 };
 static_assert_size(XCONTENT_AGGREGATE_DATA, 0x148);
 
-struct XCONTENT_CROSS_TITLE_DATA {
-  XCONTENT_DATA content_data;
-  xe::be<uint32_t> title_id;
-};
-static_assert_size(XCONTENT_CROSS_TITLE_DATA, 0x138);
-
 struct XCONTENT_DATA_MEDIA {
   be<uint8_t> series_id[0x10];  // 0x0 sz:0x10
   be<uint8_t> seasonid[0x10];   // 0x10 sz:0x10
@@ -206,6 +204,10 @@ class ContentPackage {
                  const XCONTENT_AGGREGATE_DATA& data,
                  const std::filesystem::path& package_path,
                  const std::string_view root_path = "");
+  // A package stored on another device, such as the disc.
+  ContentPackage(KernelState* kernel_state, const std::string_view root_name,
+                 const XCONTENT_AGGREGATE_DATA& data,
+                 vfs::Entry* package_entry);
   ~ContentPackage();
 
   void LoadPackageLicenseMask(const std::filesystem::path header_path);
@@ -224,6 +226,14 @@ class ContentPackage {
   const std::filesystem::path& package_path() const { return package_path_; }
 
  private:
+  ContentPackage(KernelState* kernel_state, const std::string_view root_name,
+                 const XCONTENT_AGGREGATE_DATA& data,
+                 const std::string_view root_path);
+
+  void MountHostPath(const std::filesystem::path& package_path, bool read_only);
+  void MountContainer(std::unique_ptr<vfs::XContentContainerDevice> device,
+                      const std::string_view name);
+
   KernelState* kernel_state_;
   std::string root_name_;
   std::string device_path_;
@@ -242,6 +252,14 @@ class ContentManager {
   std::vector<XCONTENT_AGGREGATE_DATA> ListContent(
       const uint32_t device_id, const uint64_t xuid, const uint32_t title_id,
       const XContentType content_type) const;
+
+  // The titles with content stored on the device for the user, and the content
+  // types a title has there, for listing content across titles.
+  std::vector<uint32_t> ListContentTitleIds(const uint32_t device_id,
+                                            const uint64_t xuid) const;
+  std::vector<XContentType> ListContentTypes(const uint32_t device_id,
+                                             const uint64_t xuid,
+                                             const uint32_t title_id) const;
 
   std::vector<XCONTENT_AGGREGATE_DATA> ListContentODD(
       const uint32_t device_id, const uint64_t xuid, const uint32_t title_id,
@@ -273,15 +291,20 @@ class ContentManager {
                        const XCONTENT_AGGREGATE_DATA& data,
                        uint32_t& content_license,
                        const uint32_t disc_number = -1);
-  X_RESULT CloseContent(const std::string_view root_name);
-  // Mounts a package file named by the title rather than found by content
-  // data, for XamContentOpenFile.
+  // Mounts the package stored in a file under root_name, on the host or inside
+  // another device such as the disc.
   X_RESULT OpenContentFile(const std::string_view root_name,
-                           const std::filesystem::path& package_path,
-                           uint32_t& content_license);
+                           vfs::Entry* package_entry);
+  X_RESULT CloseContent(const std::string_view root_name);
+  // Closes the packages mounted from files on |device| before it goes away.
+  void ClosePackagesMountedFrom(const vfs::Device* device);
   X_RESULT GetContentThumbnail(const uint64_t xuid,
                                const XCONTENT_AGGREGATE_DATA& data,
                                std::vector<uint8_t>* buffer);
+  // The package header's metadata, an XContentMetadata.
+  X_RESULT GetContentMetadata(const uint64_t xuid,
+                              const XCONTENT_AGGREGATE_DATA& data,
+                              std::vector<uint8_t>* buffer);
   X_RESULT SetContentThumbnail(const uint64_t xuid,
                                const XCONTENT_AGGREGATE_DATA& data,
                                std::vector<uint8_t> buffer);
@@ -303,6 +326,17 @@ class ContentManager {
   X_RESULT ResolvePackagePath(const uint64_t xuid,
                               const XCONTENT_AGGREGATE_DATA& data,
                               std::filesystem::path& path);
+  std::string ResolveDiscPackageRoot(const uint64_t xuid, uint32_t title_id,
+                                     const XContentType content_type) const;
+  vfs::Entry* ResolveDiscPackage(const XCONTENT_AGGREGATE_DATA& data) const;
+  // The folders named by 8 hex digits in the user's content folder on the
+  // device, or in its folder for |title_id|, as title IDs and content types
+  // are.
+  std::vector<uint32_t> ListHexFolders(
+      const uint32_t device_id, const uint64_t xuid,
+      const std::optional<uint32_t> title_id) const;
+  // Closes |package| and the packages mounted from files in it.
+  void ClosePackage(ContentPackage* package);
 
   std::unordered_set<uint32_t> FindPublisherTitleIds(
       const uint64_t xuid,

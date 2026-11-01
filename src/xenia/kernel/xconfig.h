@@ -14,6 +14,8 @@
 #include <concepts>
 #include <cstdint>
 #include <map>
+#include <mutex>
+#include <string_view>
 
 #include "xenia/base/byte_order.h"
 
@@ -151,7 +153,9 @@ enum XCONFIG_CONSOLE_CATEGORY_ENTRIES : uint8_t {
   XCONFIG_CONSOLE_TV_DIAGONAL_SIZE_IN_CM = 0x0D,
   XCONFIG_CONSOLE_NETWORKSTORAGEDEVICE_SERIALNUMBER = 0x0E,
   XCONFIG_CONSOLE_DISCOVERABLE = 0x0F,
-  XCONFIG_CONSOLE_LIVE_TV_PROVIDER = 0x10
+  XCONFIG_CONSOLE_LIVE_TV_PROVIDER = 0x10,
+  XCONFIG_CONSOLE_CLOSED_CAPTIONING = 0x12,
+  XCONFIG_CONSOLE_CLOSED_CAPTIONING_SETTINGS = 0x13
 };
 
 enum XCONFIG_DVD_CATEGORY_ENTRIES : uint8_t {
@@ -401,13 +405,21 @@ concept XConfigValidValueType =
     std::same_as<T, uint32_t> || std::same_as<T, uint64_t> ||
     std::same_as<T, float>;
 
+// The MAC address of the console |identity| names.
+std::array<uint8_t, 6> ConsoleMacAddress(std::string_view identity);
+
 class XConfig {
  public:
-  XConfig();
+  XConfig() = default;
   ~XConfig() = default;
 
+  // The profile signed in to the lowest slot when first asked, 0 when none is.
+  // The console's MAC address and, under XeFu, the original Xbox saves follow
+  // it.
+  uint64_t owner_xuid();
+
   // The console's network adapter.
-  const std::array<uint8_t, 6>& mac_address() const { return mac_address_; }
+  const std::array<uint8_t, 6>& mac_address();
 
   // Reads a setting's raw (guest big-endian) bytes into |buffer|.
   void ReadSetting(const X_CONFIG_CATEGORY category, const uint16_t setting_id,
@@ -434,7 +446,11 @@ class XConfig {
                           const uint16_t setting_id);
 
  private:
-  std::array<uint8_t, 6> mac_address_;
+  void ResolveOwner();
+
+  std::once_flag owner_once_;
+  uint64_t owner_xuid_ = 0;
+  std::array<uint8_t, 6> mac_address_ = {};
 };
 
 }  // namespace kernel

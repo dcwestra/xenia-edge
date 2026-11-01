@@ -106,6 +106,8 @@ class Entry {
   }
 
   bool is_read_only() const;
+  // The cluster size of the volume holding this entry, in sectors.
+  virtual uint32_t sectors_per_allocation_unit() const;
 
   Entry* GetChild(const std::string_view name);
   Entry* ResolvePath(const std::string_view path);
@@ -122,8 +124,11 @@ class Entry {
   bool Delete();
   void Touch();
 
+  // |file_path| starts with the name of this entry's device root.
   X_STATUS Rename(const std::filesystem::path file_path,
                   bool replace_existing = false);
+  X_STATUS Rename(Entry* new_parent, std::string_view name,
+                  bool replace_existing);
   // If successful, out_file points to a new file. When finished, call
   // file->Destroy()
   virtual X_STATUS Open(uint32_t desired_access, File** out_file) = 0;

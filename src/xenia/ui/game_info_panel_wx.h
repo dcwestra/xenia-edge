@@ -59,8 +59,6 @@ struct ContentLocation {
 struct ContentItem {
   wxString name;
   uint64_t size_bytes = 0;
-  // Replaces the full name as the row's tooltip when set.
-  wxString tooltip;
 };
 
 // Everything known about one title: art, name and play progress in a header,
@@ -140,6 +138,7 @@ class GameInfoPanel : public wxPanel {
   void BuildXboxOriginalSaves(wxWindow* parent, wxBoxSizer* sizer);
   void BuildXboxOriginalContent(wxWindow* parent, wxBoxSizer* sizer);
   // This title's folder under XeFu's Xbox1\<area>, empty when it has none.
+  // UDATA is the signed-in profile's.
   std::filesystem::path XboxOriginalTitleDir(std::string_view area) const;
   // Name and size rows, or a note when there are none.
   void AddContentRows(wxWindow* parent, wxBoxSizer* sizer,

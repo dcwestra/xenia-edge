@@ -31,6 +31,8 @@
 #include "xenia/vfs/device.h"
 #include "xenia/xbox.h"
 
+DECLARE_bool(apply_title_update);
+
 namespace xe {
 namespace kernel {
 namespace xboxkrnl {
@@ -171,23 +173,56 @@ struct CreateOptions {
   static constexpr uint32_t FILE_RANDOM_ACCESS = 0x00000800;
 };
 
-// XeFu, the original Xbox emulator, opens the running Xbox title's data
-// directory, Xbox1\TDATA\<title id> in the HDD's Compatibility directory, as
-// the title starts. The certificate of the XBE it loaded, at 0x10000 in user
-// mode, names the title and its version.
-static void NoteXeFuTitle(std::string_view path) {
+// XeFu, the original Xbox emulator, keeps each Xbox title's data, its T: drive,
+// in Xbox1\TDATA\<title id> in the HDD's Compatibility directory and always
+// passes full paths. Splits a lowercase path in there into the title id and
+// the rest.
+static bool SplitXeFuTitleDataPath(std::string_view path, uint32_t* title_id,
+                                   std::string_view* rest) {
   constexpr std::string_view kTitleData = "\\xbox1\\tdata\\";
-  const std::string lower = xe::utf8::lower_ascii(path);
-  const size_t found = lower.rfind(kTitleData);
-  if (found == std::string::npos) {
-    return;
+  const size_t found = path.rfind(kTitleData);
+  if (found == std::string_view::npos) {
+    return false;
   }
-  const std::string_view id =
-      std::string_view(lower).substr(found + kTitleData.size());
-  uint32_t title_id = 0;
+  const std::string_view id = path.substr(found + kTitleData.size(), 8);
   if (id.size() != 8 ||
-      std::from_chars(id.data(), id.data() + id.size(), title_id, 16).ptr !=
+      std::from_chars(id.data(), id.data() + id.size(), *title_id, 16).ptr !=
           id.data() + id.size()) {
+    return false;
+  }
+  *rest = path.substr(found + kTitleData.size() + id.size());
+  return true;
+}
+
+// An original Xbox title applies its own title update: it runs the executable
+// in T:\$u when $u\ContentMeta.xbx lists the running one's version. The status
+// that hides $u from it, success for any other path. $u still lists.
+static X_STATUS HideXeFuTitleUpdate(std::string_view path) {
+  const std::string lower = xe::utf8::lower_ascii(path);
+  uint32_t title_id;
+  std::string_view rest;
+  constexpr std::string_view kTitleUpdate = "\\$u";
+  if (!SplitXeFuTitleDataPath(lower, &title_id, &rest) ||
+      !rest.starts_with(kTitleUpdate)) {
+    return X_STATUS_SUCCESS;
+  }
+  rest.remove_prefix(kTitleUpdate.size());
+  // A trailing separator still names $u.
+  if (rest.find_first_not_of('\\') == std::string_view::npos) {
+    return X_STATUS_OBJECT_NAME_NOT_FOUND;
+  }
+  return rest.front() == '\\' ? X_STATUS_OBJECT_PATH_NOT_FOUND
+                              : X_STATUS_SUCCESS;
+}
+
+// XeFu opens the running Xbox title's data directory as the title starts. The
+// certificate of the XBE it loaded, at 0x10000 in user mode, names the title
+// and its version.
+static void NoteXeFuTitle(std::string_view path) {
+  const std::string lower = xe::utf8::lower_ascii(path);
+  uint32_t title_id = 0;
+  std::string_view rest;
+  if (!SplitXeFuTitleDataPath(lower, &title_id, &rest) || !rest.empty()) {
     return;
   }
   // XeFu's own system data, such as the soundtrack database it opens at boot.
@@ -214,8 +249,11 @@ static void NoteXeFuTitle(std::string_view path) {
   // XBEH.
   if (read_user(0x10000, &magic) && magic == 0x48454258 &&
       read_user(0x10118, &certificate) &&
-      read_user(certificate + 0x8, &certificate_title_id) &&
-      certificate_title_id == title_id) {
+      read_user(certificate + 0x8, &certificate_title_id)) {
+    // Another title's data, such as an alternate title the game mounts.
+    if (certificate_title_id != title_id) {
+      return;
+    }
     std::u16string title_name;
     for (uint32_t i = 0; i < 40; ++i) {
       uint16_t c = 0;
@@ -224,7 +262,7 @@ static void NoteXeFuTitle(std::string_view path) {
       }
       title_name.push_back(char16_t(c));
     }
-    name = xe::to_utf8(title_name);
+    name = xe::to_utf8_lossy(title_name);
     vfs::XbeMetadata xbe;
     if (read_user(certificate + 0xAC, &xbe.version)) {
       xbe.title_id = title_id;
@@ -306,37 +344,45 @@ dword_result_t IoCreateFile_entry(lpdword_t handle_out, dword_t desired_access,
     root_entry = root_file->entry();
   }
 
+  X_STATUS result = X_STATUS_SUCCESS;
+  if (!cvars::apply_title_update &&
+      kernel_state()->title_id() == kXeFuTitleId) {
+    result = HideXeFuTitleUpdate(target_path);
+  }
+
   // Attempt open (or create). The host open can block on a slow drive.
   vfs::File* vfs_file;
   vfs::FileAction file_action;
-  X_STATUS result;
-  kernel_state()->RunBlockingIo(
-      [&]() {
-        if (options & kIoOpenTargetDirectory) {
+  if (XSUCCEEDED(result)) {
+    kernel_state()->RunBlockingIo(
+        [&]() {
+          if (options & kIoOpenTargetDirectory) {
+            result = kernel_state()->file_system()->OpenFile(
+                root_entry, xe::utf8::find_base_guest_path(target_path),
+                vfs::FileDisposition::kOpen, desired_access, true, false,
+                &vfs_file, &file_action);
+            if (result == X_STATUS_OBJECT_NAME_NOT_FOUND) {
+              result = X_STATUS_OBJECT_PATH_NOT_FOUND;
+            }
+            if (XSUCCEEDED(result)) {
+              file_action =
+                  vfs_file->entry()->GetChild(
+                      xe::utf8::find_name_from_guest_path(target_path))
+                      ? vfs::FileAction::kExists
+                      : vfs::FileAction::kDoesNotExist;
+            }
+            return;
+          }
           result = kernel_state()->file_system()->OpenFile(
-              root_entry, xe::utf8::find_base_guest_path(target_path),
-              vfs::FileDisposition::kOpen, desired_access, true, false,
+              root_entry, target_path,
+              vfs::FileDisposition((uint32_t)creation_disposition),
+              desired_access,
+              (create_options & CreateOptions::FILE_DIRECTORY_FILE) != 0,
+              (create_options & CreateOptions::FILE_NON_DIRECTORY_FILE) != 0,
               &vfs_file, &file_action);
-          if (result == X_STATUS_OBJECT_NAME_NOT_FOUND) {
-            result = X_STATUS_OBJECT_PATH_NOT_FOUND;
-          }
-          if (XSUCCEEDED(result)) {
-            file_action = vfs_file->entry()->GetChild(
-                              xe::utf8::find_name_from_guest_path(target_path))
-                              ? vfs::FileAction::kExists
-                              : vfs::FileAction::kDoesNotExist;
-          }
-          return;
-        }
-        result = kernel_state()->file_system()->OpenFile(
-            root_entry, target_path,
-            vfs::FileDisposition((uint32_t)creation_disposition),
-            desired_access,
-            (create_options & CreateOptions::FILE_DIRECTORY_FILE) != 0,
-            (create_options & CreateOptions::FILE_NON_DIRECTORY_FILE) != 0,
-            &vfs_file, &file_action);
-      },
-      GuestScheduler::BlockingCallClass::kConcurrent);
+        },
+        GuestScheduler::BlockingCallClass::kConcurrent);
+  }
   object_ref<XFile> file = nullptr;
 
   // A failed open leaves the handle and the information 0.
@@ -889,6 +935,18 @@ dword_result_t StfsControlDevice_entry(lpvoid_t device, dword_t control_code,
   return X_STATUS_SUCCESS;
 }
 DECLARE_XBOXKRNL_EXPORT1(StfsControlDevice, kFileSystem, kStub);
+
+// A volume is dismounted by the DismountVolume routine of its device's driver.
+// The XDK cache drive's routine closes an event and deletes the device. It
+// isn't called here. The drive leaves both behind each time it's closed.
+dword_result_t IoDismountVolume_entry(lpvoid_t device_object) {
+  if (!device_object) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(IoDismountVolume, kFileSystem, kStub);
+
 // device_extension_size = additional bytes of data (aligned up to 8 byte
 // granularity) that will be allocated at the tail of the resulting device
 // object. although it is allocated at the tail, it is accessed through a
@@ -1069,6 +1127,17 @@ void IoDeleteDevice_entry(pointer_t<X_DEVICE_OBJECT> device_ptr,
 }
 
 DECLARE_XBOXKRNL_EXPORT1(IoDeleteDevice, kFileSystem, kStub);
+
+// A handle xenia opened sits on a host backed file system with no guest
+// volume to dismount. A valid one is all that is checked.
+dword_result_t IoDismountVolumeByFileHandle_entry(dword_t file_handle) {
+  auto file = kernel_state()->object_table()->LookupObject<XFile>(file_handle);
+  if (!file) {
+    return X_STATUS_INVALID_HANDLE;
+  }
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(IoDismountVolumeByFileHandle, kFileSystem, kStub);
 
 }  // namespace xboxkrnl
 }  // namespace kernel

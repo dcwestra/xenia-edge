@@ -18,11 +18,14 @@
 #include <vector>
 
 #include "xenia/base/byte_order.h"
+#include "xenia/base/math.h"
 #include "xenia/vfs/devices/host_path_device.h"
 #include "xenia/vfs/devices/stfs_xbox.h"
+#include "xenia/vfs/devices/xcontent_container_device.h"
 #include "xenia/vfs/entry.h"
 #include "xenia/vfs/file.h"
 #include "xenia/vfs/gdfx_util.h"
+#include "xenia/vfs/virtual_file_system.h"
 #include "xenia/vfs/xbe_metadata.h"
 #include "xenia/vfs/xbox_original_data.h"
 #include "xenia/vfs/xex_metadata.h"
@@ -139,6 +142,14 @@ TEST_CASE("XBE metadata", "[xbe]") {
     REQUIRE(m->title_name == "Jedi");
     REQUIRE(m->disc_number == 1);
     REQUIRE(m->version == 6);
+  }
+
+  SECTION("A broken surrogate pair doesn't stop the name being read") {
+    auto xbe = MakeXbe(0x12);
+    Put<uint16_t>(xbe, 0x200 + 0xC + 3 * 2, 0xD800);
+    auto m = ExtractXbeMetadata(xbe.data(), xbe.size());
+    REQUIRE(m);
+    REQUIRE(m->title_name == "Jed\xEF\xBF\xBD");
   }
 
   SECTION("The title image comes back as PNG") {
@@ -293,14 +304,12 @@ TEST_CASE("Original Xbox title data on disk", "[xbox_original]") {
     REQUIRE(FindXboxOriginalPath(root, "missing").empty());
   }
 
-  SECTION("Each save folder is a save, named ones first") {
+  SECTION("Only a save folder with a name is a save") {
     const auto saves = ListXboxOriginalSaves(saves_dir);
-    REQUIRE(saves.size() == 4);
+    REQUIRE(saves.size() == 2);
     REQUIRE(saves[0].name == "career");
+    REQUIRE(saves[0].path.filename() == "AAAAAAAAAAAA");
     REQUIRE(saves[1].name == "Zeta");
-    REQUIRE(saves[2].name.empty());
-    REQUIRE(saves[2].path.filename() == "12E9194916CD");
-    REQUIRE(saves[3].name.empty());
   }
 
   SECTION("Each content folder is a package") {
@@ -309,6 +318,60 @@ TEST_CASE("Original Xbox title data on disk", "[xbox_original]") {
     REQUIRE(content.size() == 2);
     REQUIRE(content[0].name == "Bonus Map Pack");
     REQUIRE(content[1].name.empty());
+  }
+
+  std::filesystem::remove_all(root);
+}
+
+TEST_CASE("Original Xbox saves per profile", "[xbox_original]") {
+  const std::filesystem::path root =
+      std::filesystem::temp_directory_path() /
+      ("xenia-vfs-xbox-saves-" +
+       std::to_string(
+           std::chrono::steady_clock::now().time_since_epoch().count()));
+  const auto shared = root / "Xbox1" / "UDATA";
+  const auto save = std::filesystem::path("4D53004B") / "AAAAAAAAAAAA";
+  std::filesystem::create_directories(shared / save);
+  std::ofstream(shared / save / "SaveMeta.xbx") << "Name=career";
+  constexpr uint64_t kFirst = 0xE000000000000001;
+  constexpr uint64_t kSecond = 0xE000000000000002;
+  const auto first_saves = root / "E000000000000001" / "Xbox1" / "UDATA";
+  const auto second_saves = root / "E000000000000002" / "Xbox1" / "UDATA";
+
+  SECTION("No one signed in uses the shared saves") {
+    REQUIRE(FindXboxOriginalSaves(root, 0) == shared);
+    REQUIRE(PrepareXboxOriginalSaves(root, 0) == shared);
+  }
+
+  SECTION("The first profile starts with a copy of the shared saves") {
+    REQUIRE(FindXboxOriginalSaves(root, kFirst) == shared);
+    REQUIRE(PrepareXboxOriginalSaves(root, kFirst) == first_saves);
+    REQUIRE(std::filesystem::exists(first_saves / save / "SaveMeta.xbx"));
+    REQUIRE(std::filesystem::exists(shared / save / "SaveMeta.xbx"));
+    REQUIRE(FindXboxOriginalSaves(root, kFirst) == first_saves);
+  }
+
+  SECTION("Later profiles start empty") {
+    PrepareXboxOriginalSaves(root, kFirst);
+    REQUIRE(FindXboxOriginalSaves(root, kSecond) == second_saves);
+    REQUIRE(PrepareXboxOriginalSaves(root, kSecond) == second_saves);
+    REQUIRE(std::filesystem::is_empty(second_saves));
+  }
+
+  SECTION("A copy that stopped partway is made again") {
+    const auto stale = root / "E000000000000001.copying" / "Xbox1" / "UDATA";
+    std::filesystem::create_directories(stale);
+    std::ofstream(stale / "stale.bin") << "s";
+    REQUIRE(PrepareXboxOriginalSaves(root, kFirst) == first_saves);
+    REQUIRE(std::filesystem::exists(first_saves / save / "SaveMeta.xbx"));
+    REQUIRE(!std::filesystem::exists(first_saves / "stale.bin"));
+    REQUIRE(!std::filesystem::exists(root / "E000000000000001.copying"));
+  }
+
+  SECTION("The folder the saves are mounted on is made") {
+    std::filesystem::remove_all(root / "Xbox1");
+    REQUIRE(PrepareXboxOriginalSaves(root, kFirst) == first_saves);
+    REQUIRE(std::filesystem::is_directory(root / "Xbox1"));
   }
 
   std::filesystem::remove_all(root);
@@ -350,6 +413,63 @@ TEST_CASE("XEX allowed media", "[xex]") {
     REQUIRE(m->allowed_media_types == 0);
     REQUIRE(!m->RunsFromPackageOnly());
   }
+}
+
+TEST_CASE("A device mounted on a host folder", "[vfs]") {
+  const std::filesystem::path root =
+      std::filesystem::temp_directory_path() /
+      ("xenia-vfs-nested-" +
+       std::to_string(
+           std::chrono::steady_clock::now().time_since_epoch().count()));
+  std::filesystem::create_directories(root / "outer" / "Xbox1" / "UDATA");
+  std::ofstream(root / "outer" / "Xbox1" / "UDATA" / "shared.bin") << "s";
+  std::filesystem::create_directories(root / "inner");
+  std::ofstream(root / "inner" / "own.bin") << "o";
+  {
+    VirtualFileSystem vfs;
+    auto outer = std::make_unique<HostPathDevice>("\\Device\\Outer",
+                                                  root / "outer", false);
+    auto inner = std::make_unique<HostPathDevice>(
+        "\\Device\\Outer\\Xbox1\\UDATA", root / "inner", false);
+    REQUIRE(outer->Initialize());
+    REQUIRE(inner->Initialize());
+    const Device* inner_device = inner.get();
+    vfs.RegisterDevice(std::move(outer));
+    vfs.RegisterDevice(std::move(inner));
+    vfs.RegisterSymbolicLink("Y:", "\\Device\\Outer");
+
+    SECTION("The folder's path opens the mounted device") {
+      File* file = nullptr;
+      FileAction action;
+      REQUIRE(vfs.OpenFile(nullptr, "Y:\\Xbox1\\UDATA", FileDisposition::kOpen,
+                           xe::filesystem::FileAccess::kFileReadData, true,
+                           false, &file, &action) == X_STATUS_SUCCESS);
+      REQUIRE(file->entry()->device() == inner_device);
+      file->Destroy();
+    }
+
+    SECTION("A rename stays on the mounted device") {
+      Entry* entry = vfs.ResolvePath("Y:\\Xbox1\\UDATA\\own.bin");
+      REQUIRE(entry != nullptr);
+      REQUIRE(vfs.RenameEntry(entry, "Y:\\Xbox1\\away.bin", false) ==
+              X_STATUS_NOT_SAME_DEVICE);
+      REQUIRE(vfs.RenameEntry(entry, "Y:\\Xbox1\\UDATA\\moved.bin", false) ==
+              X_STATUS_SUCCESS);
+      REQUIRE(std::filesystem::exists(root / "inner" / "moved.bin"));
+    }
+
+    SECTION("The folder it is mounted on can go missing on the host") {
+      std::filesystem::remove_all(root / "outer" / "Xbox1");
+      File* file = nullptr;
+      FileAction action;
+      REQUIRE(vfs.OpenFile(nullptr, "Y:\\Xbox1\\UDATA", FileDisposition::kOpen,
+                           xe::filesystem::FileAccess::kFileReadData, true,
+                           false, &file, &action) == X_STATUS_SUCCESS);
+      REQUIRE(file->entry()->device() == inner_device);
+      file->Destroy();
+    }
+  }
+  std::filesystem::remove_all(root);
 }
 
 TEST_CASE("Host path entry found by its new name after a rename",
@@ -486,6 +606,174 @@ TEST_CASE("Host path rename checks the target name", "[vfs_rename]") {
     REQUIRE(entry->Rename("cache:\\NEW.BIN") == X_STATUS_OBJECT_NAME_COLLISION);
     REQUIRE(entry->Rename("cache:\\NEW.BIN", true) == X_STATUS_ACCESS_DENIED);
     REQUIRE(entry->name() == "new.bin");
+  }
+}
+
+constexpr size_t kStfsBlockSize = 0x1000;
+
+// Where data block |block| of a read-only STFS package below 28900 blocks
+// lies, past the level 0 tables and the level 1 table that precede it.
+static size_t StfsBlockOffset(size_t block) {
+  const size_t base =
+      xe::round_up(sizeof(XContentContainerHeader), kStfsBlockSize);
+  return base +
+         (block + block / 170 + 1 + (block >= 170 ? 1 : 0)) * kStfsBlockSize;
+}
+
+struct StfsTestPackage {
+  std::vector<uint8_t> bytes;
+  // Contiguous in blocks 1 to 172, across two hash tables.
+  std::string icon;
+  // In blocks 174 then 173.
+  std::string data;
+};
+
+static StfsTestPackage MakeStfsPackage() {
+  auto fill = [](size_t size, uint8_t seed) {
+    std::string text(size, '\0');
+    for (size_t i = 0; i < size; ++i) {
+      text[i] = char(seed + i * 7 + i / kStfsBlockSize);
+    }
+    return text;
+  };
+  StfsTestPackage package;
+  package.icon = fill(171 * kStfsBlockSize + 100, 1);
+  package.data = fill(kStfsBlockSize + 50, 200);
+  package.bytes.resize(StfsBlockOffset(175));
+  auto write = [&](size_t offset, const void* data, size_t size) {
+    std::memcpy(package.bytes.data() + offset, data, size);
+  };
+
+  auto header = std::make_unique<XContentContainerHeader>();
+  std::memset(header.get(), 0, sizeof(XContentContainerHeader));
+  header->content_header.magic = XContentPackageType::kPirs;
+  header->content_header.header_size = sizeof(XContentContainerHeader);
+  header->content_metadata.volume_type = XContentVolumeType::kStfs;
+  auto& stfs = header->content_metadata.volume_descriptor.stfs;
+  stfs.descriptor_length = sizeof(StfsVolumeDescriptor);
+  stfs.flags.bits.read_only_format = 1;
+  stfs.file_table_block_count = 1;
+  stfs.set_file_table_block_number(0);
+  stfs.total_block_count = 175;
+  write(0, header.get(), sizeof(XContentContainerHeader));
+
+  // The contiguous file's hash entries stay empty, it is read without them.
+  StfsHashTable hashes;
+  std::memset(&hashes, 0, sizeof(hashes));
+  hashes.entries[0].set_level0_next_block(0xFFFFFF);
+  write(StfsBlockOffset(0) - kStfsBlockSize, &hashes, sizeof(hashes));
+  std::memset(&hashes, 0, sizeof(hashes));
+  hashes.entries[174 % 170].set_level0_next_block(173);
+  hashes.entries[173 % 170].set_level0_next_block(0xFFFFFF);
+  write(StfsBlockOffset(170) - kStfsBlockSize, &hashes, sizeof(hashes));
+
+  StfsDirectoryBlock directory;
+  std::memset(&directory, 0, sizeof(directory));
+  auto add = [&](size_t index, const char* name, bool contiguous,
+                 uint32_t start_block, const std::string& contents) {
+    auto& entry = directory.entries[index];
+    std::memcpy(entry.name, name, std::strlen(name));
+    entry.flags.name_length = uint8_t(std::strlen(name));
+    entry.flags.contiguous = contiguous;
+    const uint32_t blocks = uint32_t(
+        xe::round_up(contents.size(), kStfsBlockSize) / kStfsBlockSize);
+    entry.set_valid_data_blocks(blocks);
+    entry.set_allocated_data_blocks(blocks);
+    entry.set_start_block_number(start_block);
+    entry.directory_index = 0xFFFF;
+    entry.length = uint32_t(contents.size());
+  };
+  add(0, "icon.png", true, 1, package.icon);
+  add(1, "data.bin", false, 174, package.data);
+  write(StfsBlockOffset(0), &directory, sizeof(directory));
+
+  for (size_t i = 0; i * kStfsBlockSize < package.icon.size(); ++i) {
+    const size_t start = i * kStfsBlockSize;
+    write(StfsBlockOffset(1 + i), package.icon.data() + start,
+          std::min(kStfsBlockSize, package.icon.size() - start));
+  }
+  write(StfsBlockOffset(174), package.data.data(), kStfsBlockSize);
+  write(StfsBlockOffset(173), package.data.data() + kStfsBlockSize,
+        package.data.size() - kStfsBlockSize);
+  return package;
+}
+
+TEST_CASE("STFS package mounted from its host file or another device",
+          "[stfs]") {
+  struct TemporaryDirectory {
+    std::filesystem::path path =
+        std::filesystem::temp_directory_path() /
+        ("xenia-vfs-stfs-" +
+         std::to_string(
+             std::chrono::steady_clock::now().time_since_epoch().count()));
+    ~TemporaryDirectory() {
+      std::error_code error;
+      std::filesystem::remove_all(path, error);
+    }
+  } temporary;
+  REQUIRE(std::filesystem::create_directories(temporary.path / "dir"));
+  const auto package = MakeStfsPackage();
+  auto write = [&](const char* name, size_t size) {
+    std::ofstream(temporary.path / name, std::ios::binary)
+        .write(reinterpret_cast<const char*>(package.bytes.data()), size);
+  };
+  write("package", package.bytes.size());
+  // Ends before the file table block.
+  write("short", StfsBlockOffset(0));
+
+  auto read = [](Device& device, const char* name) {
+    Entry* entry = device.ResolvePath(name);
+    REQUIRE(entry);
+    File* file = nullptr;
+    REQUIRE(entry->Open(FileAccess::kFileReadData, &file) == X_STATUS_SUCCESS);
+    std::string text(entry->size(), '\0');
+    size_t bytes_read = 0;
+    REQUIRE(
+        file->ReadSync({reinterpret_cast<uint8_t*>(text.data()), text.size()},
+                       0, &bytes_read) == X_STATUS_SUCCESS);
+    file->Destroy();
+    REQUIRE(bytes_read == text.size());
+    return text;
+  };
+
+  SECTION("From its host file") {
+    auto device = XContentContainerDevice::CreateContentDevice(
+        "\\Device\\Package", temporary.path / "package");
+    REQUIRE(device);
+    REQUIRE(device->Initialize());
+    REQUIRE(read(*device, "icon.png") == package.icon);
+    REQUIRE(read(*device, "data.bin") == package.data);
+  }
+
+  SECTION("A host file that ends early does not mount") {
+    auto device = XContentContainerDevice::CreateContentDevice(
+        "\\Device\\Package", temporary.path / "short");
+    REQUIRE(device);
+    REQUIRE_FALSE(device->Initialize());
+  }
+
+  HostPathDevice disc("\\Device\\Disc", temporary.path, true);
+  REQUIRE(disc.Initialize());
+
+  SECTION("From a file on another device") {
+    auto device = XContentContainerDevice::CreateContentDevice(
+        "\\Device\\Package", disc.ResolvePath("package"));
+    REQUIRE(device);
+    REQUIRE(device->Initialize());
+    REQUIRE(read(*device, "icon.png") == package.icon);
+    REQUIRE(read(*device, "data.bin") == package.data);
+  }
+
+  SECTION("A file on another device that ends early does not mount") {
+    auto device = XContentContainerDevice::CreateContentDevice(
+        "\\Device\\Package", disc.ResolvePath("short"));
+    REQUIRE(device);
+    REQUIRE_FALSE(device->Initialize());
+  }
+
+  SECTION("A directory on another device is not a package") {
+    REQUIRE_FALSE(XContentContainerDevice::CreateContentDevice(
+        "\\Device\\Package", disc.ResolvePath("dir")));
   }
 }
 

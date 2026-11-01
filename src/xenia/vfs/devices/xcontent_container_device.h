@@ -17,6 +17,7 @@
 #include "xenia/kernel/xam/content_manager.h"
 #include "xenia/vfs/device.h"
 #include "xenia/vfs/devices/stfs_xbox.h"
+#include "xenia/vfs/file.h"
 
 namespace xe {
 namespace vfs {
@@ -33,11 +34,19 @@ class XContentContainerDevice : public Device {
       const std::string_view mount_path,
       const std::filesystem::path& host_path);
 
+  // A device for the STFS package stored in |entry|, whose device has to
+  // outlive it.
+  static std::unique_ptr<XContentContainerDevice> CreateContentDevice(
+      const std::string_view mount_path, Entry* entry);
+
   static std::unique_ptr<XContentContainerHeader> ReadContainerHeader(
       const std::filesystem::path& file_path);
 
   static std::unique_ptr<XContentContainerHeader> ReadContainerHeader(
       FILE* host_file);
+
+  static std::unique_ptr<XContentContainerHeader> ReadContainerHeader(
+      File* file);
 
   ~XContentContainerDevice() override;
 
@@ -75,6 +84,12 @@ class XContentContainerDevice : public Device {
   kernel::xam::XCONTENT_AGGREGATE_DATA content_header() const;
   uint32_t license_mask() const { return LicenseMaskFromHeader(*header_); }
 
+  const std::filesystem::path& GetHostPath() const { return host_path_; }
+  // The package's file on another device, null for a host file.
+  const Entry* package_entry() const {
+    return package_file_ ? package_file_->entry() : nullptr;
+  }
+
   const XContentContainerHeader* GetContainerHeader() const {
     return header_.get();
   }
@@ -82,6 +97,9 @@ class XContentContainerDevice : public Device {
  protected:
   XContentContainerDevice(const std::string_view mount_path,
                           const std::filesystem::path& host_path);
+  // Takes ownership of |package_file|.
+  XContentContainerDevice(const std::string_view mount_path,
+                          File* package_file);
   enum class Result {
     kSuccess = 0,
     kOutOfMemory = -1,
@@ -100,7 +118,7 @@ class XContentContainerDevice : public Device {
 
   Entry* ResolvePath(const std::string_view path) override;
   void Dump(StringBuffer* string_buffer) override;
-  Result ReadHeaderAndVerify(FILE* header_file);
+  Result VerifyHeader(std::unique_ptr<XContentContainerHeader> header);
 
   void SetName(std::string name) { name_ = name; }
   const std::string& GetName() const { return name_; }
@@ -108,10 +126,10 @@ class XContentContainerDevice : public Device {
   void SetFilesSize(uint64_t files_size) { files_total_size_ = files_size; }
   const uint64_t GetFilesSize() const { return files_total_size_; }
 
-  const std::filesystem::path& GetHostPath() const { return host_path_; }
-
   std::string name_;
   std::filesystem::path host_path_;
+  // The package on another device, read in place of a host file.
+  File* package_file_ = nullptr;
 
   size_t files_total_size_;
   std::unique_ptr<Entry> root_entry_;

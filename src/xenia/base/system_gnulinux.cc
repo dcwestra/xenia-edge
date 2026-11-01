@@ -17,6 +17,8 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
+#include <string>
 #include <thread>
 
 #include "xenia/base/assert.h"
@@ -106,4 +108,16 @@ void ShowSimpleMessageBox(SimpleMessageBoxType type, std::string_view message) {
 }
 
 bool SetProcessPriorityClass(const uint32_t priority_class) { return true; }
+
+std::string GetMachineId() {
+  // systemd's, else the copy D-Bus kept before systemd.
+  for (const char* path : {"/etc/machine-id", "/var/lib/dbus/machine-id"}) {
+    std::ifstream file(path);
+    std::string id;
+    if (file >> id) {
+      return id;
+    }
+  }
+  return {};
+}
 }  // namespace xe

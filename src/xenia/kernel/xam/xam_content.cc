@@ -8,14 +8,12 @@
  */
 
 #include <algorithm>
-#include <atomic>
-#include <thread>
+#include <vector>
 
 #include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/string_util.h"
-#include "xenia/base/threading.h"
 #include "xenia/base/utf8.h"
 #include "xenia/emulator.h"
 #include "xenia/kernel/kernel_state.h"
@@ -28,15 +26,11 @@
 #include "xenia/kernel/xboxkrnl/xboxkrnl_module.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_threading.h"
 #include "xenia/kernel/xenumerator.h"
-#include "xenia/kernel/xthread.h"
 #include "xenia/ui/imgui_dialog.h"
 #include "xenia/ui/imgui_drawer.h"
-#include "xenia/vfs/devices/host_path_entry.h"
 #include "xenia/vfs/devices/stfs_xbox.h"
 #include "xenia/vfs/devices/xcontent_container_device.h"
 #include "xenia/xbox.h"
-
-DECLARE_bool(in_process_title_relaunch);
 
 DEFINE_int32(
     license_mask, 0,
@@ -560,94 +554,50 @@ dword_result_t XamContentCreateInternal_entry(
 }
 DECLARE_XAM_EXPORT1(XamContentCreateInternal, kContent, kImplemented);
 
-// A package file inside a disc image or another package can't be opened by
-// the container reader, which reads host files, so it gets a copy in the cache.
-static std::filesystem::path HostPathForPackageFile(vfs::Entry* entry) {
-  if (auto host_entry = dynamic_cast<vfs::HostPathEntry*>(entry)) {
-    return host_entry->host_path();
-  }
-  const std::filesystem::path folder =
-      kernel_state()->emulator()->cache_root() / "content_files" /
-      fmt::format("{:08X}", kernel_state()->title_id());
-  std::string name = entry->path();
-  for (char& c : name) {
-    if (c == '\\' || c == '/' || c == ':') {
-      c = '_';
-    }
-  }
-  const std::filesystem::path host_path = folder / name;
-  std::error_code ec;
-  if (std::filesystem::file_size(host_path, ec) == entry->size() && !ec) {
-    return host_path;
-  }
-  vfs::File* file = nullptr;
-  if (entry->Open(vfs::FileAccess::kFileReadData, &file) != X_STATUS_SUCCESS ||
-      !file) {
-    return {};
-  }
-  std::filesystem::create_directories(folder, ec);
-  const std::filesystem::path tmp_path = host_path.string() + ".tmp";
-  FILE* out = xe::filesystem::OpenFile(tmp_path, "wb");
-  bool ok = out != nullptr;
-  std::vector<uint8_t> buffer(1 << 20);
-  for (size_t offset = 0; ok && offset < entry->size();) {
-    size_t read = 0;
-    const size_t length =
-        std::min(buffer.size(), size_t(entry->size() - offset));
-    ok = file->ReadSync(std::span<uint8_t>(buffer.data(), length), offset,
-                        &read) == X_STATUS_SUCCESS &&
-         read && fwrite(buffer.data(), 1, read, out) == read;
-    offset += read;
-  }
-  if (out) {
-    fclose(out);
-  }
-  file->Destroy();
-  if (!ok) {
-    std::filesystem::remove(tmp_path, ec);
-    return {};
-  }
-  std::filesystem::rename(tmp_path, host_path, ec);
-  return ec ? std::filesystem::path() : host_path;
-}
-
+// Mounts the content package stored in a file, such as a Kinect speech
+// database (GAME:\nuisp1033), under root_name. unknown is a value rather than
+// an output. Only bits 12-19 of it are used and callers pass 0.
 dword_result_t XamContentOpenFile_entry(
     dword_t user_index, lpstring_t root_name, lpstring_t path, dword_t flags,
-    lpdword_t disposition_ptr, lpdword_t license_mask_ptr,
+    dword_t unknown, lpdword_t license_mask_ptr,
     pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
-  // Mounts a content package file the title names by path as root_name.
-  // Kinect titles open the skeletal tracking model that ships with them this
-  // way, such as game:\Database.xmplr as stexemplar.
-  if (disposition_ptr) {
-    *disposition_ptr = 0;
+  if (!root_name || !ValidRootName(root_name.value())) {
+    return X_ERROR_INVALID_NAME;
   }
-  X_RESULT result = X_ERROR_FILE_NOT_FOUND;
-  vfs::Entry* entry =
-      path ? kernel_state()->file_system()->ResolvePath(path.value()) : nullptr;
-  if (entry && !(entry->attributes() & vfs::kFileAttributeDirectory)) {
-    const std::filesystem::path host_path = HostPathForPackageFile(entry);
-    uint32_t content_license = 0;
-    if (!host_path.empty()) {
-      result = kernel_state()->content_manager()->OpenContentFile(
-          root_name.value(), host_path, content_license);
-    }
-    if (result == X_ERROR_SUCCESS) {
-      if (disposition_ptr) {
-        *disposition_ptr = uint32_t(kDispositionState::Open);
-      }
-      if (license_mask_ptr) {
-        *license_mask_ptr = content_license;
-      }
-    }
+  // Cleared before the request is queued.
+  if (license_mask_ptr) {
+    *license_mask_ptr = 0;
   }
-  XELOGI("XamContentOpenFile({}, {}) = {:08X}", root_name.value(),
-         path ? path.value() : "", result);
-  return CompleteRequest(overlapped_ptr, result);
+  auto run = [path = path.value(), root_name = root_name.value(),
+              overlapped = bool(overlapped_ptr)](uint32_t& extended_error,
+                                                 uint32_t& length) -> X_RESULT {
+    X_RESULT result = X_ERROR_FILE_NOT_FOUND;
+    if (auto entry = kernel_state()->file_system()->ResolvePath(path)) {
+      result =
+          kernel_state()->content_manager()->OpenContentFile(root_name, entry);
+    }
+    extended_error = X_HRESULT_FROM_WIN32(result);
+    length = 0;
+    if (result && overlapped) {
+      result = X_ERROR_FUNCTION_FAILED;
+    }
+    return result;
+  };
+
+  if (!overlapped_ptr) {
+    uint32_t extended_error, length;
+    return run(extended_error, length);
+  }
+  kernel_state()->CompleteOverlappedDeferredEx(run, overlapped_ptr);
+  return X_ERROR_IO_PENDING;
 }
-DECLARE_XAM_EXPORT1(XamContentOpenFile, kContent, kImplemented);
+DECLARE_XAM_EXPORT1(XamContentOpenFile, kContent, kSketchy);
 
 dword_result_t XamContentFlush_entry(lpstring_t root_name,
                                      pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
+  if (!root_name || !ValidRootName(root_name.value())) {
+    return X_ERROR_INVALID_NAME;
+  }
   X_RESULT result = X_ERROR_SUCCESS;
   if (overlapped_ptr) {
     kernel_state()->CompleteOverlappedImmediate(overlapped_ptr, result);
@@ -660,6 +610,9 @@ DECLARE_XAM_EXPORT1(XamContentFlush, kContent, kStub);
 
 dword_result_t XamContentClose_entry(lpstring_t root_name,
                                      pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
+  if (!root_name || !ValidRootName(root_name.value())) {
+    return X_ERROR_INVALID_NAME;
+  }
   // Closes a previously opened root from XamContentCreate*.
   return CompleteRequest(
       overlapped_ptr,
@@ -849,6 +802,11 @@ dword_result_t XamSwapDisc_entry(
 
   // Unmount the current disc
   if (filesystem->ResolvePath(mount_path) != NULL) {
+    // So nothing mounts from the disc between closing its packages and
+    // unmounting it.
+    auto global_lock = global_critical_region::AcquireDirect();
+    kernel_state()->content_manager()->ClosePackagesMountedFrom(
+        filesystem->GetDevice(mount_path));
     filesystem->UnregisterDevice(mount_path);
   }
 
@@ -1026,116 +984,121 @@ void XamLoaderGetMediaInfo_entry(lpdword_t media_type, lpdword_t title_id) {
 }
 DECLARE_XAM_EXPORT1(XamLoaderGetMediaInfo, kNone, kStub);
 
+constexpr std::string_view kLaunchRootName = "XSYSLAUNCH";
+
+// Launches |xex_name| in the package open at the launch root.
+static void LaunchOpenedImage(const std::string& xex_name, bool on_disc,
+                              uint32_t flags) {
+  LaunchTitle(fmt::format("{}:\\{}", kLaunchRootName, xex_name), {},
+              flags | (on_disc ? 0x80 : 0));
+}
+
 dword_result_t XamContentLaunchImageFromFileInternal_entry(
-    lpstring_t image_location, lpstring_t xex_name, dword_t unk) {
-  const std::string image_path = static_cast<std::string>(image_location);
-  const std::string xex_name_ = static_cast<std::string>(xex_name);
-
-  vfs::Entry* entry = kernel_state()->file_system()->ResolvePath(image_path);
-
+    lpstring_t image_location, lpstring_t xex_name, dword_t unknown) {
+  if (!image_location) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  vfs::Entry* entry =
+      kernel_state()->file_system()->ResolvePath(image_location.value());
   if (!entry) {
-    return X_STATUS_NO_SUCH_FILE;
+    return X_ERROR_FILE_NOT_FOUND;
   }
 
-  const std::filesystem::path host_path =
-      kernel_state()->emulator()->content_root() / entry->name();
-  if (!std::filesystem::exists(host_path)) {
-    std::atomic<uint64_t> progress{0};
-
-    vfs::VirtualFileSystem::ExtractContentFile(
-        entry, kernel_state()->emulator()->content_root(), progress, true);
+  const X_RESULT result = kernel_state()->content_manager()->OpenContentFile(
+      kLaunchRootName, entry);
+  if (result) {
+    return result;
   }
 
-  // In-process relaunch is disabled on macOS — see XamLoaderLaunchTitle.
-#if !XE_PLATFORM_MAC
-  if (cvars::in_process_title_relaunch) {
-    auto* emulator = kernel_state()->emulator();
-    auto host_path_utf8 = xe::path_to_utf8(host_path);
-    std::thread([emulator, host_path_utf8, module = xex_name_]() mutable {
-      emulator->RelaunchTitle(host_path_utf8, module, 0, {});
-    }).detach();
-    // Park off guest code until RelaunchTitle terminates us (Suspend can return
-    // on POSIX).
-    XThread::GetCurrentThread()->Suspend(nullptr);
-    while (true) {
-      xe::threading::NanoSleep(int64_t(1'000'000'000));
-    }
-  }
-#endif  // !XE_PLATFORM_MAC
+  // The title's own device stands for its disc, as it does for disc content.
+  const vfs::Entry* title_root = kernel_state()->file_system()->ResolvePath(
+      kernel_state()->title_mount_path_);
+  LaunchOpenedImage(xex_name ? xex_name.value() : std::string(),
+                    title_root && title_root->device() == entry->device(), 0);
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamContentLaunchImageFromFileInternal, kContent, kSketchy);
 
-  auto on_launch_new_title = kernel_state()->emulator()->on_launch_new_title();
-  if (on_launch_new_title) {
-    XELOGI("XamContentLaunchImageFromFileInternal: spawning new title process");
-    on_launch_new_title(xe::path_to_utf8(host_path), xex_name_, 0, "", "");
+static X_RESULT LaunchContentImage(uint32_t user_index,
+                                   const XCONTENT_AGGREGATE_DATA& content_data,
+                                   const std::string& xex_name,
+                                   uint32_t flags) {
+  auto content_manager = kernel_state()->content_manager();
+  uint64_t xuid = 0;
+  X_RESULT result = ContentXuid(user_index, xuid);
+  if (!result) {
+    result = content_manager->CheckPackageName(xuid, content_data);
+  }
+  if (!result && !content_manager->ContentExists(xuid, content_data)) {
+    result = X_ERROR_PATH_NOT_FOUND;
+  }
+  uint32_t content_license = 0;
+  if (!result) {
+    result = content_manager->OpenContent(kLaunchRootName, xuid, content_data,
+                                          content_license);
+  }
+  if (result) {
+    return result;
   }
 
-  kernel_state()->TerminateTitle();
+  LaunchOpenedImage(
+      xex_name,
+      content_data.device_id == static_cast<uint32_t>(DummyDeviceId::ODD),
+      flags);
   return X_ERROR_SUCCESS;
 }
 
-DECLARE_XAM_EXPORT1(XamContentLaunchImageFromFileInternal, kContent, kStub);
+dword_result_t XamContentLaunchImage_entry(dword_t user_index,
+                                           lpvoid_t content_data_ptr,
+                                           lpstring_t xex_name) {
+  if (!content_data_ptr) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  return LaunchContentImage(user_index, *content_data_ptr.as<XCONTENT_DATA*>(),
+                            xex_name ? xex_name.value() : std::string(), 0);
+}
+DECLARE_XAM_EXPORT1(XamContentLaunchImage, kContent, kSketchy);
 
 dword_result_t XamContentLaunchImageInternal_entry(lpvoid_t content_data_ptr,
-                                                   lpstring_t xex_path) {
-  XCONTENT_AGGREGATE_DATA content_data = *content_data_ptr.as<XCONTENT_DATA*>();
-
-  // title_id is written into first 8 characters of filename
-  const uint32_t title_id = xe::string_util::from_string<uint32_t>(
-      content_data.file_name().substr(0, 8), true);
-
-  // This should be done via content_manager, however as it isn't capable of
-  // such action we need to improvise.
-  const std::string package_path =
-      fmt::format("{}/Content/0000000000000000/{:08X}/{:08X}/{}",
-                  kernel_state()->title_mount_path_, title_id,
-                  static_cast<uint32_t>(content_data.content_type.get()),
-                  content_data.file_name());
-
-  auto entry = kernel_state()->file_system()->ResolvePath(package_path);
-
-  if (!entry) {
-    return X_STATUS_NO_SUCH_FILE;
+                                                   lpstring_t xex_name) {
+  if (!content_data_ptr) {
+    return X_ERROR_INVALID_PARAMETER;
   }
-
-  const std::filesystem::path host_path =
-      kernel_state()->emulator()->content_root() / entry->name();
-
-  if (!std::filesystem::exists(host_path)) {
-    std::atomic<uint64_t> progress{0};
-    kernel_state()->file_system()->ExtractContentFile(
-        entry, kernel_state()->emulator()->content_root(), progress, true);
-  }
-
-  // In-process relaunch is disabled on macOS — see XamLoaderLaunchTitle.
-#if !XE_PLATFORM_MAC
-  if (cvars::in_process_title_relaunch) {
-    auto* emulator = kernel_state()->emulator();
-    auto host_path_utf8 = xe::path_to_utf8(host_path);
-    std::thread([emulator, host_path_utf8,
-                 module = xex_path.value()]() mutable {
-      emulator->RelaunchTitle(host_path_utf8, module, 0, {});
-    }).detach();
-    // Park off guest code until RelaunchTitle terminates us (Suspend can return
-    // on POSIX).
-    XThread::GetCurrentThread()->Suspend(nullptr);
-    while (true) {
-      xe::threading::NanoSleep(int64_t(1'000'000'000));
-    }
-  }
-#endif  // !XE_PLATFORM_MAC
-
-  auto on_launch_new_title = kernel_state()->emulator()->on_launch_new_title();
-  if (on_launch_new_title) {
-    XELOGI("XamContentLaunchImageInternal: spawning new title process");
-    on_launch_new_title(xe::path_to_utf8(host_path), xex_path.value(), 0, "",
-                        "");
-  }
-
-  kernel_state()->TerminateTitle();
-  return X_ERROR_SUCCESS;
+  // XCONTENT_DATA_INTERNAL has the XUID and title ID at the same offsets.
+  return LaunchContentImage(XUserIndexNone,
+                            *content_data_ptr.as<XCONTENT_AGGREGATE_DATA*>(),
+                            xex_name ? xex_name.value() : std::string(), 0);
 }
+DECLARE_XAM_EXPORT1(XamContentLaunchImageInternal, kContent, kSketchy);
 
-DECLARE_XAM_EXPORT1(XamContentLaunchImageInternal, kContent, kStub);
+// Fills the XContentMetadata of the package's header.
+dword_result_t XamContentGetMetaDataInternal_entry(
+    lpvoid_t content_data_ptr, lpvoid_t metadata_ptr,
+    pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
+  if (!content_data_ptr || !metadata_ptr) {
+    return CompleteRequest(overlapped_ptr, X_ERROR_INVALID_PARAMETER);
+  }
+  std::vector<uint8_t> metadata;
+  X_RESULT result = kernel_state()->content_manager()->GetContentMetadata(
+      0, *content_data_ptr.as<XCONTENT_AGGREGATE_DATA*>(), &metadata);
+  if (!result) {
+    std::memcpy(metadata_ptr, metadata.data(), metadata.size());
+  }
+  return CompleteRequest(overlapped_ptr, result);
+}
+DECLARE_XAM_EXPORT1(XamContentGetMetaDataInternal, kContent, kImplemented);
+
+dword_result_t XamContentLaunchImageInternalEx_entry(lpvoid_t content_data_ptr,
+                                                     lpstring_t xex_name,
+                                                     dword_t flags) {
+  if (!content_data_ptr) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  return LaunchContentImage(XUserIndexNone,
+                            *content_data_ptr.as<XCONTENT_AGGREGATE_DATA*>(),
+                            xex_name ? xex_name.value() : std::string(), flags);
+}
+DECLARE_XAM_EXPORT1(XamContentLaunchImageInternalEx, kContent, kSketchy);
 
 void XamContentRegisterChangeCallback_entry(dword_t callback) {
   kernel_state()->xam_state()->SetContentRegisterCallback(callback);
@@ -1159,6 +1122,85 @@ dword_result_t XamContentGetDeviceVolumePath_entry(dword_t device_id,
   return X_ERROR_SUCCESS;
 }
 DECLARE_XAM_EXPORT1(XamContentGetDeviceVolumePath, kContent, kStub);
+
+// XamCache* keep files on the system cache partitions, each described by a
+// block the title owns. The id and key name the file for some cache types. No
+// cache partition is mounted here. A lookup finds nothing and a create has no
+// partition to make the file on.
+struct X_XAM_CACHE_FILE {
+  xe::be<uint32_t> flags;
+  xe::be<uint32_t> type;
+  xe::be<uint32_t> id;
+  xe::be<uint32_t> unused_C;
+  xe::be<uint64_t> key;
+  // Given for a create, found by an open.
+  xe::be<uint64_t> version;
+  xe::be<uint32_t> size;
+  xe::be<uint32_t> handle;
+  char path[0x10C];
+  // Links the open file into the cache's list.
+  uint8_t internal[0x114];
+};
+static_assert_size(X_XAM_CACHE_FILE, 0x248);
+
+constexpr uint32_t kCacheFileFlagCreate = 0x1;
+// A title's files are closed when it ends.
+constexpr uint32_t kCacheFileFlagTitle = 0x4000;
+
+dword_result_t XamCacheOpenFile_entry(pointer_t<X_XAM_CACHE_FILE> file) {
+  if (!file) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  file->flags = file->flags | kCacheFileFlagTitle;
+  const bool create = file->flags & kCacheFileFlagCreate;
+  if (!create) {
+    file->size = 0;
+    file->version = 0;
+  }
+  file->path[0] = 0;
+  file->handle = 0xFFFFFFFF;
+  return create ? X_ERROR_INVALID_DRIVE : X_ERROR_FILE_NOT_FOUND;
+}
+DECLARE_XAM_EXPORT1(XamCacheOpenFile, kContent, kStub);
+
+// Returns TRUE once the files of cache_type, or of every type for 0, are
+// deleted. There are none here.
+dword_result_t XamCacheReset_entry(dword_t cache_type) { return 1; }
+DECLARE_XAM_EXPORT1(XamCacheReset, kContent, kStub);
+
+// XamXlfs* run the queue that uploads files to Xbox LIVE file storage. Xenia
+// has no upload queue. Starting one fails whether or not a profile is signed in
+// to LIVE. Callers carry on without it. The first argument is unused.
+dword_result_t XamXlfsInitializeUploadQueue_entry(dword_t unused,
+                                                  lpdword_t queue_handle_ptr) {
+  if (queue_handle_ptr) {
+    *queue_handle_ptr = 0;
+  }
+  return X_E_FAIL;
+}
+DECLARE_XAM_EXPORT1(XamXlfsInitializeUploadQueue, kContent, kStub);
+
+// XamBackgroundDownload* drive the dashboard's download queue. Its items are
+// 0x380 bytes. There is no dashboard or marketplace to fill the queue.
+constexpr uint32_t kBackgroundDownloadItemSize = 0x380;
+
+dword_result_t XamBackgroundDownloadSetMode_entry(dword_t mode) {
+  // Nothing downloads in the background for the mode to change.
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamBackgroundDownloadSetMode, kContent, kStub);
+
+dword_result_t XamBackgroundDownloadGetActiveItem_entry(lpdword_t active_ptr,
+                                                        lpvoid_t item_ptr) {
+  // Nothing is downloading.
+  if (active_ptr && item_ptr) {
+    *active_ptr = 0;
+    item_ptr.Zero(kBackgroundDownloadItemSize);
+  }
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamBackgroundDownloadGetActiveItem, kContent, kImplemented);
+
 }  // namespace xam
 }  // namespace kernel
 }  // namespace xe

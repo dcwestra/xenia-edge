@@ -7,6 +7,9 @@
  ******************************************************************************
  */
 
+#include <algorithm>
+#include <string>
+#include <string_view>
 #include <thread>
 
 #include "xenia/base/clock.h"
@@ -16,12 +19,14 @@
 #include "xenia/base/string_util.h"
 #include "xenia/base/threading.h"
 #include "xenia/base/utf8.h"
+#include "xenia/cpu/processor.h"
 #include "xenia/emulator.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/title_id_utils.h"
 #include "xenia/kernel/user_module.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xam/xam.h"
+#include "xenia/kernel/xam/xam_content_device.h"
 #include "xenia/kernel/xam/xam_module.h"
 #include "xenia/kernel/xam/xam_private.h"
 #include "xenia/kernel/xam/xam_ui.h"
@@ -34,6 +39,7 @@
 #include "xenia/kernel/xthread.h"
 #include "xenia/ui/windowed_app_context.h"
 #include "xenia/vfs/devices/host_path_entry.h"
+#include "xenia/vfs/devices/xcontent_container_device.h"
 #include "xenia/xbox.h"
 
 #include "third_party/fmt/include/fmt/format.h"
@@ -539,10 +545,52 @@ static bool NamesDevice(std::string_view path) {
   return path.find(':') != std::string_view::npos || path.starts_with('\\');
 }
 
+// Points host_path, launch_path and package_path, which start out as the
+// title's own, at the executable at |entry| on a device outside the title, or
+// returns false when it can't be launched from there.
+static bool ResolveLaunchTarget(const vfs::Entry* entry,
+                                std::filesystem::path& host_path,
+                                std::string& launch_path,
+                                std::string& package_path) {
+  if (auto host_entry = dynamic_cast<const vfs::HostPathEntry*>(entry)) {
+    host_path = host_entry->host_path();
+    launch_path.clear();
+    package_path.clear();
+    return true;
+  }
+  auto container =
+      dynamic_cast<const vfs::XContentContainerDevice*>(entry->device());
+  if (!container) {
+    return false;
+  }
+  launch_path = entry->path();
+  const vfs::Entry* package = container->package_entry();
+  if (!package) {
+    host_path = container->GetHostPath();
+    package_path.clear();
+    return true;
+  }
+  if (auto host_package = dynamic_cast<const vfs::HostPathEntry*>(package)) {
+    host_path = host_package->host_path();
+    package_path.clear();
+    return true;
+  }
+  // Otherwise the package has to be on the title's own disc, which the
+  // relaunch mounts it from.
+  const vfs::Entry* title_root = kernel_state()->file_system()->ResolvePath(
+      kernel_state()->title_mount_path_);
+  if (!package_path.empty() || !title_root ||
+      package->device() != title_root->device()) {
+    return false;
+  }
+  package_path = package->path();
+  return true;
+}
+
 // The console's XamLoaderLaunchTitleEx, which XamLoaderLaunchTitle calls with
 // flag 4. The D: drive path is only checked for flag 4.
-static void LaunchTitle(std::string path, std::string_view d_drive_path,
-                        uint32_t flags) {
+void LaunchTitle(std::string path, std::string_view d_drive_path,
+                 uint32_t flags) {
   // Unowned, this frame never unwinds.
   auto* xam = kernel_state()->GetKernelModule<XamModule>("xam.xex").get();
 
@@ -581,10 +629,13 @@ static void LaunchTitle(std::string path, std::string_view d_drive_path,
     loader_data.launch_data_present = true;
 
     std::filesystem::path host_path = loader_data.host_path;
+    std::string package_path = loader_data.package_path;
     std::string launch_path = xe::path_to_utf8(path);
 
-    XELOGI("XamLoaderLaunchTitle: original host_path={}, launch_path={}",
-           xe::strip_pii(loader_data.host_path), launch_path);
+    XELOGI(
+        "XamLoaderLaunchTitle: original host_path={}, package_path={}, "
+        "launch_path={}",
+        xe::strip_pii(loader_data.host_path), package_path, launch_path);
 
     // Remove common guest path prefixes (case-insensitive since Xbox
     // paths are case-insensitive, games may pass e.g. "GAME:\")
@@ -598,25 +649,24 @@ static void LaunchTitle(std::string path, std::string_view d_drive_path,
 
     if (NamesDevice(launch_path)) {
       // Any other device is outside the title. Only a file a host directory
-      // backs can be launched from there.
-      auto host_entry = dynamic_cast<const vfs::HostPathEntry*>(entry);
-      if (!host_entry ||
-          (host_entry->attributes() & vfs::kFileAttributeDirectory)) {
+      // backs or one in a package can be launched from there.
+      if ((entry->attributes() & vfs::kFileAttributeDirectory) ||
+          !ResolveLaunchTarget(entry, host_path, launch_path, package_path)) {
         XELOGW("XamLoaderLaunchTitle: can't launch {}, exiting to dashboard",
                path);
         kernel_state()->ExitToDashboard();
         return;
       }
-      host_path = host_entry->host_path();
-      launch_path = "";
     } else if (host_path.extension() == ".xex") {
       host_path.remove_filename();
       host_path = ResolveHostFileName(host_path / launch_path);
       launch_path = "";
     }
 
-    XELOGI("XamLoaderLaunchTitle: normalized host_path={}, launch_path={}",
-           xe::strip_pii(xe::path_to_utf8(host_path)), launch_path);
+    XELOGI(
+        "XamLoaderLaunchTitle: normalized host_path={}, package_path={}, "
+        "launch_path={}",
+        xe::strip_pii(xe::path_to_utf8(host_path)), package_path, launch_path);
 
     // Handle title launch in-process via full Shutdown/Setup cycle. Disabled
     // on macOS — pthread_cancel there doesn't run C++ destructors, so
@@ -639,9 +689,10 @@ static void LaunchTitle(std::string path, std::string_view d_drive_path,
       // all guest threads including the caller.
       std::thread([emulator, new_host_path = std::move(new_host_path),
                    new_launch_module = std::move(new_launch_module), new_flags,
-                   new_data = std::move(new_data)]() mutable {
+                   new_data = std::move(new_data),
+                   package_path = std::move(package_path)]() mutable {
         emulator->RelaunchTitle(new_host_path, new_launch_module, new_flags,
-                                std::move(new_data));
+                                std::move(new_data), true, package_path);
       }).detach();
 
       // Stop running guest code; RelaunchTitle terminates us. Suspend can
@@ -666,7 +717,8 @@ static void LaunchTitle(std::string path, std::string_view d_drive_path,
                           loader_data.launch_flags, launch_data_hex,
                           emulator->KeepsXboxGame(host_path)
                               ? xe::path_to_utf8(emulator->xbox_disc_path())
-                              : std::string());
+                              : std::string(),
+                          package_path);
     }
 
     XELOGI("XamLoaderLaunchTitle: terminating to launch new title");
@@ -1080,22 +1132,6 @@ void XamGetActiveDashAppInfo_entry(pointer_t<X_DASH_APP_INFO> dash_app) {
 }
 DECLARE_XAM_EXPORT1(XamGetActiveDashAppInfo, kNone, kImplemented);
 
-dword_result_t XamGetDashBackstackData_entry(
-    pointer_t<X_DASH_BACKSTACK_DATA> backstack_data, lpdword_t count) {
-  auto xam_state_ = kernel_state()->xam_state();
-  uint32_t total = xam_state_->dash_backstack_nodes_count_;
-  if (total) {
-    if (*count <= total) {
-      total = *count;
-    }
-    std::memcpy(backstack_data, &xam_state_->dash_backstack_data_,
-                sizeof(X_DASH_BACKSTACK_DATA) * total);
-    xam_state_->dash_backstack_nodes_count_ = 0;
-  }
-  return X_ERROR_SUCCESS;
-}
-DECLARE_XAM_EXPORT1(XamGetDashBackstackData, kNone, kImplemented);
-
 void XampWebInstrumentationSetProfileCounts_entry(dword_t live_profiles,
                                                   dword_t local_profiles,
                                                   dword_t adult_profiles,
@@ -1195,6 +1231,56 @@ dword_result_t XamUpdateGetCurrentSystemVersion_entry() {
   return PackSystemVersion(*kernel_state()->GetKernelVersion());
 }
 DECLARE_XAM_EXPORT1(XamUpdateGetCurrentSystemVersion, kNone, kImplemented);
+
+// The newest version an installed optional media update gives for
+// module_name. Its module_name.xex or module_nameLatest.xex returns the
+// version from export 1. 0 without an update, and the name is only read once
+// there is one.
+static uint32_t GetOptionalMediaUpdateVersion(lpstring_t module_name) {
+  constexpr uint32_t kOptionalMediaUpdateTitleId = 0xFFFE07DF;
+  constexpr std::string_view kRoot = "CodecPackLoaderRoot";
+  auto content_manager = kernel_state()->content_manager();
+  auto thread_state = XThread::GetCurrentThread()->thread_state();
+  uint32_t newest = 0;
+  for (const auto& data : content_manager->ListContent(
+           static_cast<uint32_t>(DummyDeviceId::HDD), 0,
+           kOptionalMediaUpdateTitleId, XContentType::kMarketplaceContent)) {
+    uint32_t license = 0;
+    if (content_manager->OpenContent(kRoot, 0, data, license)) {
+      continue;
+    }
+    for (std::string_view suffix : {"", "Latest"}) {
+      const std::string path =
+          fmt::format("{}:\\{}{}.xex", kRoot, module_name.value(), suffix);
+      if (!kernel_state()->file_system()->ResolvePath(path)) {
+        continue;
+      }
+      const uint32_t hmodule = xboxkrnl::xeXexLoadImage(path);
+      if (!hmodule) {
+        continue;
+      }
+      auto module = kernel_state()->GetModule(path, true);
+      if (const uint32_t get_version =
+              module ? module->GetProcAddressByOrdinal(1) : 0) {
+        newest = std::max(newest, uint32_t(kernel_state()->processor()->Execute(
+                                      thread_state, get_version, nullptr, 0)));
+      }
+      xboxkrnl::xeXexUnloadImage(hmodule);
+    }
+    content_manager->CloseContent(kRoot);
+  }
+  return newest;
+}
+
+// Whether the installed optional media update gives module_name at least
+// min_version.
+dword_result_t XamIsOptionalMediaUpdateInstalled_entry(lpstring_t module_name,
+                                                       dword_t min_version) {
+  const uint32_t version =
+      module_name ? GetOptionalMediaUpdateVersion(module_name) : 0;
+  return version >= min_version;
+}
+DECLARE_XAM_EXPORT1(XamIsOptionalMediaUpdateInstalled, kNone, kImplemented);
 
 }  // namespace xam
 }  // namespace kernel

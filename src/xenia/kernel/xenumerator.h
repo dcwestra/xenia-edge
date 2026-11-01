@@ -88,6 +88,11 @@ class XEnumerator : public XObject {
 
   virtual uint32_t WriteItems(uint8_t* buffer_data, uint32_t buffer_size,
                               uint32_t* written_count) = 0;
+  // With the flags of the enumerate call, which only some enumerators use.
+  virtual uint32_t WriteItems(uint8_t* buffer_data, uint32_t buffer_size,
+                              uint32_t* written_count, uint32_t flags) {
+    return WriteItems(buffer_data, buffer_size, written_count);
+  }
 
   size_t item_size() const { return item_size_; }
   size_t items_per_enumerate() const { return items_per_enumerate_; }
@@ -299,6 +304,38 @@ class ContentEnumerator : public XEnumerator {
 
  private:
   std::vector<xam::XCONTENT_DATA> items_;
+  size_t current_item_ = 0;
+};
+
+// Content across titles, for XamContentAggregateCreateEnumerator.
+class ContentAggregateEnumerator : public XEnumerator {
+ public:
+  // Enumerates the content of other titles too.
+  static constexpr uint32_t kAllTitlesFlag = 0x80000000;
+
+  ContentAggregateEnumerator(KernelState* kernel_state,
+                             size_t items_per_enumerate)
+      : XEnumerator(kernel_state, items_per_enumerate,
+                    sizeof(xam::XCONTENT_DATA_INTERNAL)) {}
+
+  size_t item_count() const { return items_.size(); }
+
+  // |other_title| content is skipped without kAllTitlesFlag.
+  void AppendItem(const xam::XCONTENT_AGGREGATE_DATA& item, bool other_title) {
+    items_.push_back({item, other_title});
+  }
+
+  uint32_t WriteItems(uint8_t* buffer_data, uint32_t buffer_size,
+                      uint32_t* written_count) override;
+  uint32_t WriteItems(uint8_t* buffer_data, uint32_t buffer_size,
+                      uint32_t* written_count, uint32_t flags) override;
+
+ private:
+  struct Item {
+    xam::XCONTENT_AGGREGATE_DATA data;
+    bool other_title;
+  };
+  std::vector<Item> items_;
   size_t current_item_ = 0;
 };
 

@@ -551,6 +551,22 @@ object_ref<XModule> KernelState::GetModule(const std::string_view name,
   return nullptr;
 }
 
+object_ref<UserModule> KernelState::GetUserModuleForAddress(uint32_t address) {
+  auto global_lock = global_critical_region_.Acquire();
+  for (auto& user_module : user_modules_) {
+    if (user_module->module_format() != UserModule::kModuleFormatXex) {
+      continue;
+    }
+    auto xex_module = user_module->xex_module();
+    uint32_t base_address = xex_module->base_address();
+    if (address >= base_address &&
+        address - base_address < xex_module->xex_security_info()->image_size) {
+      return retain_object(user_module.get());
+    }
+  }
+  return nullptr;
+}
+
 object_ref<XThread> KernelState::LaunchModule(object_ref<UserModule> module) {
   if (!module->is_executable()) {
     return nullptr;
@@ -806,7 +822,7 @@ X_RESULT KernelState::FinishLoadingUserModule(
     // Call DllMain(DLL_PROCESS_ATTACH):
     // https://msdn.microsoft.com/en-us/library/windows/desktop/ms682583%28v=vs.85%29.aspx
     uint64_t args[] = {
-        module->handle(),
+        module->hmodule_ptr(),
         1,  // DLL_PROCESS_ATTACH
         0,  // 0 because always dynamic
     };
@@ -998,7 +1014,7 @@ void KernelState::UnloadUserModule(const object_ref<UserModule>& module,
     // Call DllMain(DLL_PROCESS_DETACH):
     // https://msdn.microsoft.com/en-us/library/windows/desktop/ms682583%28v=vs.85%29.aspx
     uint64_t args[] = {
-        module->handle(),
+        module->hmodule_ptr(),
         0,  // DLL_PROCESS_DETACH
         0,  // 0 for now, assume XexUnloadImage is like FreeLibrary
     };
@@ -1063,11 +1079,24 @@ void KernelState::UnregisterThread(XThread* thread) {
   }
 }
 
+// The kernel only notifies DLLs about threads of the title process. A thread of
+// another process taking a DLL's DLL_PROCESS_ATTACH would run the module's
+// process init, including its KeTlsAlloc calls, in that process. Host threads
+// aren't console threads at all.
+static bool NotifiesDlls(XThread* thread) {
+  return thread->is_guest_thread() &&
+         thread->guest_object<X_KTHREAD>()->process_type == X_PROCTYPE_TITLE;
+}
+
 void KernelState::OnThreadExecute(XThread* thread) {
   auto global_lock = global_critical_region_.Acquire();
 
   // Must be called on executing thread.
   assert_true(XThread::GetCurrentThread() == thread);
+
+  if (!NotifiesDlls(thread)) {
+    return;
+  }
 
   // Call DllMain(DLL_THREAD_ATTACH) for each user module:
   // https://msdn.microsoft.com/en-us/library/windows/desktop/ms682583%28v=vs.85%29.aspx
@@ -1075,7 +1104,7 @@ void KernelState::OnThreadExecute(XThread* thread) {
   for (auto user_module : user_modules_) {
     if (user_module->is_dll_module() && user_module->entry_point()) {
       uint64_t args[] = {
-          user_module->handle(),
+          user_module->hmodule_ptr(),
           user_module->is_attached()
               ? static_cast<uint64_t>(2)   // DLL_THREAD_ATTACH - Used to call
                                            // DLL for each thread created.
@@ -1101,10 +1130,12 @@ void KernelState::OnThreadExit(XThread* thread) {
   // Call DllMain(DLL_THREAD_DETACH) for each user module:
   // https://msdn.microsoft.com/en-us/library/windows/desktop/ms682583%28v=vs.85%29.aspx
   auto thread_state = thread->thread_state();
+  const bool notifies_dlls = NotifiesDlls(thread);
   for (auto user_module : user_modules_) {
-    if (user_module->is_dll_module() && user_module->entry_point()) {
+    if (notifies_dlls && user_module->is_dll_module() &&
+        user_module->entry_point()) {
       uint64_t args[] = {
-          user_module->handle(),
+          user_module->hmodule_ptr(),
           3,  // DLL_THREAD_DETACH
           0,  // 0 because always dynamic
       };
@@ -1199,8 +1230,10 @@ void KernelState::CompleteOverlappedEx(uint32_t overlapped_ptr, X_RESULT result,
                                        X_HANDLE thread_handle) {
   auto ptr = memory()->TranslateVirtual(overlapped_ptr);
   // Result last, so a caller polling it for completion reads a valid length.
+  // A completed request leaves no context behind.
   XOverlappedSetExtendedError(ptr, extended_error);
   XOverlappedSetLength(ptr, length);
+  XOverlappedSetContext(ptr, 0);
   std::atomic_thread_fence(std::memory_order_release);
   XOverlappedSetResult(ptr, result);
   // The event is left unsignaled when there is a completion routine.

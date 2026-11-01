@@ -9,7 +9,6 @@
 
 #include <algorithm>
 #include <cstring>
-#include <mutex>
 #include <tuple>
 
 #include "xenia/base/logging.h"
@@ -437,6 +436,16 @@ void XeCryptSha256Final_entry(pointer_t<XECRYPT_SHA256_STATE> sha_state,
 }
 DECLARE_XBOXKRNL_EXPORT1(XeCryptSha256Final, kNone, kImplemented);
 
+void XeCryptSha256_entry(lpvoid_t input_1, dword_t input_1_size,
+                         lpvoid_t input_2, dword_t input_2_size,
+                         lpvoid_t input_3, dword_t input_3_size,
+                         lpvoid_t output, dword_t output_size) {
+  XeCryptSha256(input_1.as<uint8_t*>(), input_1_size, input_2.as<uint8_t*>(),
+                input_2_size, input_3.as<uint8_t*>(), input_3_size,
+                output.as<uint8_t*>(), output ? uint32_t(output_size) : 0);
+}
+DECLARE_XBOXKRNL_EXPORT1(XeCryptSha256, kNone, kImplemented);
+
 void XeCryptSha512Init_entry(pointer_t<XECRYPT_SHA512_STATE> sha_state) {
   XeCryptSha512Init(sha_state);
 }
@@ -623,15 +632,103 @@ dword_result_t XeKeysGetKey_entry(word_t key, lpvoid_t key_buffer,
 }
 DECLARE_XBOXKRNL_EXPORT1(XeKeysGetKey, kNone, kSketchy);
 
+// The per-console obfuscation key (0x17) differs on every console. Like the key
+// obfuscation key above it is one of our own. Data a title protects with it
+// only has to come back the same on this emulator.
+static const uint8_t xe_console_obfuscation_key[16] = {
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+// The keys the key numbered calls (XeKeysHmacSha, XeKeysAesCbc) can use, or
+// nullptr for one we don't have.
+// Title keys, which a title hands the hypervisor (XeKeysSetKey) to use
+// without keeping them.
+static uint8_t title_keys[TITLE_KEYS_LIMIT - TITLE_KEYS_BASE][16];
+static bool title_keys_set[TITLE_KEYS_LIMIT - TITLE_KEYS_BASE];
+
+// The hypervisor doesn't use a title key as handed over: it derives the key
+// it uses from it, in a way that isn't known. These are the ones known: the
+// keys Harmonix titles set for mogg versions 12-13, 14, 15 and 16 (Dance
+// Central 2 does), and the keys their moggs decrypt with, which later titles
+// and mogg tools carry in the clear.
+struct KnownTitleKey {
+  uint8_t set[16];
+  uint8_t used[16];
+};
+static constexpr KnownTitleKey kKnownTitleKeys[] = {
+    {{0x6D, 0x85, 0xA8, 0x99, 0x8B, 0x2D, 0x1C, 0x76, 0xFA, 0xDE, 0x68, 0xF2,
+      0xAF, 0x38, 0x02, 0xED},
+     {0x01, 0x22, 0x00, 0x38, 0xD2, 0x01, 0x78, 0x8B, 0xDD, 0xCD, 0xD0, 0xF0,
+      0xFE, 0x3E, 0x24, 0x7F}},
+    {{0xB2, 0x3E, 0x8D, 0xAC, 0x46, 0x49, 0x97, 0xDE, 0x21, 0xDB, 0x31, 0xC4,
+      0x33, 0x1B, 0x75, 0x6A},
+     {0x51, 0x73, 0xAD, 0xE5, 0xB3, 0x99, 0xB8, 0x61, 0x58, 0x1A, 0xF9, 0xB8,
+      0x1E, 0xA7, 0xBE, 0xBF}},
+    {{0xBB, 0x7C, 0x64, 0xB6, 0x4A, 0x6E, 0x19, 0xE9, 0xCC, 0x30, 0xBD, 0x5D,
+      0x0B, 0x20, 0x80, 0xB4},
+     {0xC6, 0x22, 0x94, 0x30, 0xD8, 0x3C, 0x84, 0x14, 0x08, 0x73, 0x7C, 0xF2,
+      0x23, 0xF6, 0xEB, 0x5A}},
+    {{0x1F, 0x55, 0x21, 0x65, 0x97, 0x2F, 0xE5, 0xAF, 0x27, 0xD2, 0xD4, 0xF4,
+      0x5E, 0x93, 0xD1, 0x9D},
+     {0x02, 0x1A, 0x83, 0xF3, 0x97, 0xE9, 0xD4, 0xB8, 0x06, 0x74, 0x14, 0x6B,
+      0x30, 0x4C, 0x00, 0x91}},
+};
+
+dword_result_t XeKeysSetKey_entry(word_t key_num, lpvoid_t key_buffer,
+                                  dword_t key_size) {
+  if (key_num < TITLE_KEYS_BASE || key_num >= TITLE_KEYS_LIMIT) {
+    XELOGW("XeKeysSetKey: key 0x{:X} isn't a title key", uint32_t(key_num));
+    return X_STATUS_ACCESS_DENIED;
+  }
+  if (!key_buffer || key_size != 16) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  const uint8_t* key = key_buffer.as<const uint8_t*>();
+  const uint8_t* used = key;
+  for (const KnownTitleKey& known : kKnownTitleKeys) {
+    if (std::memcmp(key, known.set, sizeof(known.set)) == 0) {
+      used = known.used;
+      break;
+    }
+  }
+  if (used == key) {
+    XELOGW(
+        "XeKeysSetKey: the hypervisor key for key 0x{:X} isn't known, so it's "
+        "used as given",
+        uint32_t(key_num));
+  }
+  const uint32_t slot = key_num - TITLE_KEYS_BASE;
+  std::memcpy(title_keys[slot], used, sizeof(title_keys[slot]));
+  title_keys_set[slot] = true;
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(XeKeysSetKey, kNone, kImplemented);
+
+static const uint8_t* GetKeysKey(uint32_t key_num) {
+  if (key_num >= TITLE_KEYS_BASE && key_num < TITLE_KEYS_LIMIT) {
+    const uint32_t slot = key_num - TITLE_KEYS_BASE;
+    return title_keys_set[slot] ? title_keys[slot] : nullptr;
+  }
+  switch (key_num) {
+    case CONSOLE_OBFUSCATION_KEY:
+      return xe_console_obfuscation_key;
+    case ROAMABLE_OBFUSCATION_KEY:
+      return key19;
+    default:
+      return nullptr;
+  }
+}
+
 bool XeKeysHmacSha(uint32_t key_num, const uint8_t* inp_1, uint32_t inp_1_size,
                    const uint8_t* inp_2, uint32_t inp_2_size,
                    const uint8_t* inp_3, uint32_t inp_3_size, uint8_t* out,
                    uint32_t out_size) {
-  if (key_num != 0x19) {
+  const uint8_t* key = GetKeysKey(key_num);
+  if (!key) {
     return false;
   }
-  XeCryptHmacSha(key19, sizeof(key19), inp_1, inp_1_size, inp_2, inp_2_size,
-                 inp_3, inp_3_size, out, out_size);
+  XeCryptHmacSha(key, 16, inp_1, inp_1_size, inp_2, inp_2_size, inp_3,
+                 inp_3_size, out, out_size);
   return true;
 }
 
@@ -647,6 +744,40 @@ dword_result_t XeKeysHmacSha_entry(dword_t key_num, lpvoid_t inp_1,
              : X_STATUS_UNSUCCESSFUL;
 }
 DECLARE_XBOXKRNL_EXPORT1(XeKeysHmacSha, kNone, kImplemented);
+
+// AES with one of the keys above: CBC through feed, or ECB block by block
+// without one. Silverlight's XamlHost wraps each storage file's key with the
+// console obfuscation key through this.
+dword_result_t XeKeysAesCbc_entry(dword_t key_num, lpvoid_t inp_ptr,
+                                  dword_t inp_size, lpvoid_t out_ptr,
+                                  lpvoid_t feed_ptr, dword_t encrypt) {
+  const uint8_t* key = GetKeysKey(key_num);
+  if (!key) {
+    XELOGW("XeKeysAesCbc: key 0x{:X} not implemented", uint32_t(key_num));
+    return X_STATUS_UNSUCCESSFUL;
+  }
+  // The hypervisor takes whole blocks only.
+  if (inp_size % 16) {
+    return 0xC8000004;
+  }
+  if (inp_size && (!inp_ptr || !out_ptr)) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  XECRYPT_AES_STATE aes;
+  XeCryptAesKey(&aes, key);
+  const uint8_t* input = inp_ptr.as<uint8_t*>();
+  uint8_t* output = out_ptr.as<uint8_t*>();
+  if (feed_ptr) {
+    XeCryptAesCbc(&aes, input, inp_size, output, feed_ptr.as<uint8_t*>(),
+                  encrypt != 0);
+  } else {
+    for (uint32_t offset = 0; offset < inp_size; offset += 16) {
+      XeCryptAesEcb(&aes, input + offset, output + offset, encrypt != 0);
+    }
+  }
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(XeKeysAesCbc, kNone, kImplemented);
 
 void XeCryptRotSumSha_entry(lpvoid_t inp_1, dword_t inp_1_size, lpvoid_t inp_2,
                             dword_t inp_2_size, lpvoid_t out,
@@ -673,102 +804,6 @@ dword_result_t XeKeysAesCbcUsingKey_entry(lpvoid_t obscured_key,
   return X_STATUS_SUCCESS;
 }
 DECLARE_XBOXKRNL_EXPORT1(XeKeysAesCbcUsingKey, kNone, kImplemented);
-
-// Title keys, which a title hands the hypervisor to use without keeping them.
-// Harmonix titles derive their song audio keys with one.
-struct TitleKeys {
-  std::mutex mutex;
-  uint8_t keys[TITLE_KEYS_LIMIT - TITLE_KEYS_BASE][16] = {};
-  bool set[TITLE_KEYS_LIMIT - TITLE_KEYS_BASE] = {};
-};
-TitleKeys title_keys;
-
-// The hypervisor doesn't use a title key as handed over, it derives the key
-// it uses from it, in a way that isn't known. These are the ones known: the
-// keys Harmonix titles (Dance Central 2, 373307D2, for mogg versions 12-13, 14,
-// 15 and 16) set, and the keys their moggs decrypt with, which later titles
-// and mogg tools carry in the clear (themethod3's HV keys).
-struct KnownTitleKey {
-  uint8_t set[16];
-  uint8_t used[16];
-};
-constexpr KnownTitleKey kKnownTitleKeys[] = {
-    {{0x6D, 0x85, 0xA8, 0x99, 0x8B, 0x2D, 0x1C, 0x76, 0xFA, 0xDE, 0x68, 0xF2,
-      0xAF, 0x38, 0x02, 0xED},
-     {0x01, 0x22, 0x00, 0x38, 0xD2, 0x01, 0x78, 0x8B, 0xDD, 0xCD, 0xD0, 0xF0,
-      0xFE, 0x3E, 0x24, 0x7F}},
-    {{0xB2, 0x3E, 0x8D, 0xAC, 0x46, 0x49, 0x97, 0xDE, 0x21, 0xDB, 0x31, 0xC4,
-      0x33, 0x1B, 0x75, 0x6A},
-     {0x51, 0x73, 0xAD, 0xE5, 0xB3, 0x99, 0xB8, 0x61, 0x58, 0x1A, 0xF9, 0xB8,
-      0x1E, 0xA7, 0xBE, 0xBF}},
-    {{0xBB, 0x7C, 0x64, 0xB6, 0x4A, 0x6E, 0x19, 0xE9, 0xCC, 0x30, 0xBD, 0x5D,
-      0x0B, 0x20, 0x80, 0xB4},
-     {0xC6, 0x22, 0x94, 0x30, 0xD8, 0x3C, 0x84, 0x14, 0x08, 0x73, 0x7C, 0xF2,
-      0x23, 0xF6, 0xEB, 0x5A}},
-    {{0x1F, 0x55, 0x21, 0x65, 0x97, 0x2F, 0xE5, 0xAF, 0x27, 0xD2, 0xD4, 0xF4,
-      0x5E, 0x93, 0xD1, 0x9D},
-     {0x02, 0x1A, 0x83, 0xF3, 0x97, 0xE9, 0xD4, 0xB8, 0x06, 0x74, 0x14, 0x6B,
-      0x30, 0x4C, 0x00, 0x91}},
-};
-
-dword_result_t XeKeysSetKey_entry(word_t key_num, lpvoid_t key_buffer,
-                                  dword_t key_size) {
-  if (key_num < TITLE_KEYS_BASE || key_num >= TITLE_KEYS_LIMIT) {
-    XELOGW("XeKeysSetKey: key 0x{:04X} isn't a title key",
-           static_cast<uint16_t>(key_num));
-    return X_STATUS_ACCESS_DENIED;
-  }
-  if (!key_buffer || key_size != 16) {
-    return X_STATUS_INVALID_PARAMETER;
-  }
-  const uint8_t* key = key_buffer.as<const uint8_t*>();
-  for (const KnownTitleKey& known : kKnownTitleKeys) {
-    if (std::memcmp(key, known.set, 16) == 0) {
-      key = known.used;
-      break;
-    }
-  }
-  if (key == key_buffer.as<const uint8_t*>()) {
-    XELOGW(
-        "XeKeysSetKey: key 0x{:04X} isn't one whose hypervisor key is known, "
-        "so it's used as is and what it decrypts may be wrong",
-        static_cast<uint16_t>(key_num));
-  }
-  std::lock_guard<std::mutex> lock(title_keys.mutex);
-  const uint32_t slot = key_num - TITLE_KEYS_BASE;
-  std::memcpy(title_keys.keys[slot], key, 16);
-  title_keys.set[slot] = true;
-  return X_STATUS_SUCCESS;
-}
-DECLARE_XBOXKRNL_EXPORT1(XeKeysSetKey, kNone, kImplemented);
-
-dword_result_t XeKeysAesCbc_entry(word_t key_num, lpvoid_t inp_ptr,
-                                  dword_t inp_size, lpvoid_t out_ptr,
-                                  lpvoid_t feed_ptr, dword_t encrypt) {
-  if (!inp_ptr || !out_ptr) {
-    return X_STATUS_INVALID_PARAMETER;
-  }
-  uint8_t key[16];
-  {
-    std::lock_guard<std::mutex> lock(title_keys.mutex);
-    const uint32_t slot = key_num - TITLE_KEYS_BASE;
-    if (key_num < TITLE_KEYS_BASE || key_num >= TITLE_KEYS_LIMIT ||
-        !title_keys.set[slot]) {
-      XELOGW("XeKeysAesCbc: key 0x{:04X} isn't a title key that was set",
-             static_cast<uint16_t>(key_num));
-      return X_STATUS_ACCESS_DENIED;
-    }
-    std::memcpy(key, title_keys.keys[slot], sizeof(key));
-  }
-  // No feed is a zero one.
-  uint8_t zero_feed[16] = {};
-  XECRYPT_AES_STATE aes;
-  XeCryptAesKey(&aes, key);
-  XeCryptAesCbc(&aes, inp_ptr.as<uint8_t*>(), inp_size, out_ptr.as<uint8_t*>(),
-                feed_ptr ? feed_ptr.as<uint8_t*>() : zero_feed, encrypt != 0);
-  return X_STATUS_SUCCESS;
-}
-DECLARE_XBOXKRNL_EXPORT1(XeKeysAesCbc, kNone, kImplemented);
 
 dword_result_t XeKeysObscureKey_entry(lpvoid_t input, lpvoid_t output) {
   // Based on HvxKeysObscureKey
