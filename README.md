@@ -32,7 +32,7 @@ What that means for you:
   - Batocera 43 on an AMD Radeon RX 5700 with an Intel i7-9700.
 
   Other games and hardware may behave differently, for better or worse.
-- **Upstream's maintainer has asked not to receive AI-generated pull requests** (see [AGENTS.md](AGENTS.md)). This fork respects that and keeps its changes here.
+- **Going upstream.** AI-assisted pull requests are welcome upstream; what the maintainer asks not to receive is unsolicited fixes for issues on the tracker (see [AGENTS.md](AGENTS.md)). This fork's changes are being offered upstream as small, single-commit pull requests.
 
 ## Kinect for Xbox 360
 
