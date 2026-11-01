@@ -2038,6 +2038,13 @@ bool Emulator::ExceptionCallback(Exception* ex) {
 
   auto context = current_thread->thread_state()->context();
 
+  // A __try in the guest can take the fault, as on the console.
+  if (guest_function &&
+      kernel::xboxkrnl::DivertGuestAccessViolation(
+          ex, guest_function->MapMachineCodeToGuestAddress(ex->pc()))) {
+    return true;
+  }
+
   std::string crash_msg;
   crash_msg.append("==== CRASH DUMP ====\n");
   // Fiber-backed guest threads have no host thread, so report 0 for the host id
