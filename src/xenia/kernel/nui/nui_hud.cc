@@ -11,8 +11,19 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 
+#include "xenia/base/cvar.h"
+#include "xenia/base/filesystem.h"
+#include "xenia/base/logging.h"
 #include "xenia/base/memory.h"
+#include "xenia/base/string.h"
+
+DEFINE_path(kinect_skeleton_log, "",
+            "Write the skeletons a Kinect title tracks, every frame it hands "
+            "them to the system, to this CSV file: each tracked player's "
+            "joints with their tracking states.",
+            "Kernel");
 
 namespace xe {
 namespace kernel {
@@ -26,6 +37,9 @@ constexpr uint32_t kSkeletonSize = 448;
 // Within NUI_SKELETON_DATA.
 constexpr uint32_t kJointPositionsOffset = 32;
 constexpr uint32_t kJointStatesOffset = 352;
+// NUI_SKELETON_QUALITY flags: clipped at the right, left, top or bottom of
+// the view.
+constexpr uint32_t kQualityFlagsOffset = 432;
 constexpr uint32_t kTrackingStateTracked = 2;
 // NUI_SKELETON_POSITION_INDEX.
 constexpr int kShoulderCenter = 2;
@@ -52,6 +66,8 @@ void NuiHud::OnSkeletonFrame(const uint8_t* message, uint32_t size) {
     Skeleton& skeleton = skeletons_[i];
     skeleton.state = xe::load_and_swap<uint32_t>(data);
     skeleton.tracking_id = xe::load_and_swap<uint32_t>(data + 4);
+    skeleton.quality_flags =
+        xe::load_and_swap<uint32_t>(data + kQualityFlagsOffset);
     for (int j = 0; j < kJointCount; ++j) {
       const uint8_t* position = data + kJointPositionsOffset + j * 16;
       skeleton.joints[j].x = xe::load_and_swap<float>(position);
@@ -62,6 +78,55 @@ void NuiHud::OnSkeletonFrame(const uint8_t* message, uint32_t size) {
     }
   }
   frame_time_ = std::chrono::steady_clock::now();
+  LogSkeletons();
+}
+
+void NuiHud::LogSkeletons() {
+  if (cvars::kinect_skeleton_log.empty()) {
+    return;
+  }
+  if (!skeleton_log_) {
+    if (skeleton_log_failed_) {
+      return;
+    }
+    skeleton_log_ = xe::filesystem::OpenFile(cvars::kinect_skeleton_log, "w");
+    if (!skeleton_log_) {
+      skeleton_log_failed_ = true;
+      XELOGW("Kinect: can't write the skeleton log {}",
+             xe::strip_pii(xe::path_to_utf8(cvars::kinect_skeleton_log)));
+      return;
+    }
+    skeleton_log_start_ = frame_time_;
+    std::fputs("ms,frame,slot,tracking_id,quality", skeleton_log_);
+    for (int j = 0; j < kJointCount; ++j) {
+      std::fprintf(skeleton_log_, ",s%d,x%d,y%d,z%d", j, j, j, j);
+    }
+    std::fputc('\n', skeleton_log_);
+  }
+  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      frame_time_ - skeleton_log_start_)
+                      .count();
+  for (int i = 0; i < kSkeletonCount; ++i) {
+    const Skeleton& skeleton = skeletons_[i];
+    if (skeleton.state != kTrackingStateTracked) {
+      continue;
+    }
+    std::fprintf(skeleton_log_, "%lld,%u,%d,%u,%X", static_cast<long long>(ms),
+                 skeleton_log_frames_, i, skeleton.tracking_id,
+                 skeleton.quality_flags);
+    for (const Joint& joint : skeleton.joints) {
+      std::fprintf(skeleton_log_, ",%u,%.3f,%.3f,%.3f", joint.state, joint.x,
+                   joint.y, joint.z);
+    }
+    std::fputc('\n', skeleton_log_);
+  }
+  ++skeleton_log_frames_;
+}
+
+NuiHud::~NuiHud() {
+  if (skeleton_log_) {
+    std::fclose(skeleton_log_);
+  }
 }
 
 bool NuiHud::GetHandCursor(uint32_t tracking_id, float& x_out, float& y_out) {

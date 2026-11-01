@@ -12,6 +12,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <mutex>
 
 namespace xe {
@@ -25,6 +26,8 @@ class NuiHud {
  public:
   static constexpr int kSkeletonCount = 6;
   static constexpr int kJointCount = 20;
+
+  ~NuiHud();
 
   // The message's skeletons, as the title sent them (big-endian).
   void OnSkeletonFrame(const uint8_t* message, uint32_t size);
@@ -42,8 +45,12 @@ class NuiHud {
   struct Skeleton {
     uint32_t state;  // 2 tracked.
     uint32_t tracking_id;
+    uint32_t quality_flags;
     Joint joints[kJointCount];
   };
+
+  // Appends the tracked skeletons to kinect_skeleton_log, if it's set.
+  void LogSkeletons();
 
   std::mutex mutex_;
   Skeleton skeletons_[kSkeletonCount] = {};
@@ -53,6 +60,11 @@ class NuiHud {
   int cursor_hand_ = -1;
   float cursor_x_ = 0.5f;
   float cursor_y_ = 0.5f;
+
+  FILE* skeleton_log_ = nullptr;
+  bool skeleton_log_failed_ = false;
+  std::chrono::steady_clock::time_point skeleton_log_start_;
+  uint32_t skeleton_log_frames_ = 0;
 };
 
 }  // namespace nui
