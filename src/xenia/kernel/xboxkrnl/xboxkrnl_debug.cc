@@ -7,7 +7,9 @@
  ******************************************************************************
  */
 
+#include <algorithm>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 
@@ -559,6 +561,9 @@ static bool UnwindGuestFrame(const GuestFrame& frame, PPCContext* context) {
     if (ra != 1) {
       return false;
     }
+    if (opcode == 14) {  // addi rD, r1, d, a frame pointer, nothing saved
+      continue;
+    }
     if (opcode == 36) {  // stw rS, d(r1)
       const uint32_t at = sp + displacement;
       if (rs >= 13) {
@@ -1095,15 +1100,17 @@ static uint32_t DispatchAccessViolation(PPCContext* context,
     const uint32_t disposition = static_cast<uint32_t>(context->r[3]);
     if (disposition == kExceptionContinueExecution) {
       resume_address = LoadContextRecord(context_bytes, context);
-      XELOGD("{} at {:08X}: the handler at {:08X} of frame #{} continued at "
-             "{:08X}",
-             fault, address, handler, i, resume_address);
+      XELOGD(
+          "{} at {:08X}: the handler at {:08X} of frame #{} continued at "
+          "{:08X}",
+          fault, address, handler, i, resume_address);
       break;
     }
     if (disposition != kExceptionContinueSearch) {
-      XELOGE("{} at {:08X}: the handler at {:08X} returned {}, which isn't "
-             "supported",
-             fault, address, handler, disposition);
+      XELOGE(
+          "{} at {:08X}: the handler at {:08X} returned {}, which isn't "
+          "supported",
+          fault, address, handler, disposition);
       break;
     }
   }
@@ -1135,17 +1142,14 @@ uint32_t DispatchCodeFetchFault(PPCContext* context, uint32_t address) {
       "Code fetch fault");
 }
 
-uint32_t DispatchDataFault(PPCContext* context, uint32_t pc, bool is_store,
-                           uint32_t address) {
-  if (!context->thread_state) {
-    return 0;
-  }
-  // The search starts at the function the access is in, at the access, as the
-  // kernel hands RtlDispatchException the trap's context. Once its prolog has
-  // made the frame, the back chain names its caller; before that, as in a leaf
-  // function that makes none, lr still holds the return address and r1 is the
-  // caller's.
-  const uint32_t sp = static_cast<uint32_t>(context->r[1]);
+// Walks the frames from an access at |pc| made with |sp| and |lr|. The search
+// starts at the function the access is in, at the access, as the kernel hands
+// RtlDispatchException the trap's context. Once its prolog has made the frame,
+// the back chain names its caller; before that, as in a leaf function that
+// makes none, lr still holds the return address and r1 is the caller's.
+// Returns whether the faulting function's frame was made.
+static bool WalkGuestFaultFrames(uint32_t pc, uint32_t sp, uint32_t lr,
+                                 std::vector<GuestFrame>* out_frames) {
   GuestFrame frame = {};
   frame.pc = pc;
   frame.sp = sp;
@@ -1154,25 +1158,172 @@ uint32_t DispatchDataFault(PPCContext* context, uint32_t pc, bool is_store,
   const uint32_t prolog_length = frame.packed & 0xFF;
   const bool framed = frame.function && prolog_length &&
                       (pc - frame.function) / 4 >= prolog_length;
-  std::vector<GuestFrame> frames;
-  if (framed && IsGuestRangeReadable(sp, 4) &&
-      ReadGuestWord(sp) > sp &&
+  if (framed && IsGuestRangeReadable(sp, 4) && ReadGuestWord(sp) > sp &&
       IsGuestRangeReadable(ReadGuestWord(sp) - 8, 4)) {
     frame.entry_sp = ReadGuestWord(sp);
-    frames.push_back(frame);
+    out_frames->push_back(frame);
     WalkGuestFramesFrom(frame.entry_sp, ReadGuestWord(frame.entry_sp - 8),
-                        &frames, kDispatchFrames - 1);
-  } else {
-    frame.entry_sp = sp;
-    frames.push_back(frame);
-    WalkGuestFramesFrom(sp, static_cast<uint32_t>(context->lr), &frames,
-                        kDispatchFrames - 1);
+                        out_frames, kDispatchFrames - 1);
+    return true;
   }
+  frame.entry_sp = sp;
+  out_frames->push_back(frame);
+  WalkGuestFramesFrom(sp, lr, out_frames, kDispatchFrames - 1);
+  return false;
+}
+
+uint32_t DispatchDataFault(PPCContext* context, uint32_t pc, bool is_store,
+                           uint32_t address) {
+  if (!context->thread_state) {
+    return 0;
+  }
+  const uint32_t sp = static_cast<uint32_t>(context->r[1]);
+  std::vector<GuestFrame> frames;
+  WalkGuestFaultFrames(pc, sp, static_cast<uint32_t>(context->lr), &frames);
   // The handlers run below the faulting frame, as if the access had called
   // them, so a handler that walks the stack finds the faulting function first.
   return DispatchAccessViolation(context, frames, pc, sp, pc + 4, is_store,
                                  address, "Data fault");
 }
+
+// __C_specific_handler's scope table: a count, then these.
+struct X_SCOPE_TABLE_ENTRY {
+  xe::be<uint32_t> begin_address;
+  xe::be<uint32_t> end_address;
+  // The filter, or 1 for a constant EXCEPTION_EXECUTE_HANDLER.
+  xe::be<uint32_t> handler_address;
+  // The __except block, or 0 for a __finally block.
+  xe::be<uint32_t> jump_target;
+};
+static_assert_size(X_SCOPE_TABLE_ENTRY, 0x10);
+
+// EXCEPTION_RECORD flags set while unwinding.
+constexpr uint32_t kExceptionUnwinding = 0x2;
+constexpr uint32_t kExceptionExitUnwind = 0x4;
+
+// Points a CONTEXT record at an __except block of the function entered on
+// |establisher|: undoes the frames between, from the one the record is in,
+// reloading the registers their prologs saved, then sets the function's sp,
+// the block's address and, in r3, the exception code. The frames' own
+// __finally blocks and destructors don't run. False if a frame in between
+// can't be undone.
+static bool UnwindContextRecordTo(uint8_t* context_bytes, uint32_t establisher,
+                                  uint32_t target, uint32_t code) {
+  auto unwound = std::make_unique<PPCContext>();
+  const uint32_t iar = LoadContextRecord(context_bytes, unwound.get());
+  std::vector<GuestFrame> frames;
+  const bool framed =
+      WalkGuestFaultFrames(iar, static_cast<uint32_t>(unwound->r[1]),
+                           static_cast<uint32_t>(unwound->lr), &frames);
+  size_t target_frame = 0;
+  while (target_frame < frames.size() &&
+         frames[target_frame].entry_sp != establisher) {
+    ++target_frame;
+  }
+  if (target_frame == frames.size()) {
+    return false;
+  }
+  // A faulting function that made no frame saved nothing to reload.
+  const size_t first = framed ? 0 : 1;
+  for (size_t i = first; i < target_frame; ++i) {
+    if (!UnwindGuestFrame(frames[i], nullptr)) {
+      return false;
+    }
+  }
+  for (size_t i = first; i < target_frame; ++i) {
+    UnwindGuestFrame(frames[i], unwound.get());
+  }
+  unwound->r[1] = frames[target_frame].sp;
+  unwound->r[3] = code;
+  StoreContextRecord(context_bytes, unwound.get(), target,
+                     static_cast<uint32_t>(unwound->lr));
+  return true;
+}
+
+// The language handler of functions with __try blocks. A filter that accepts
+// the exception has its __except block run, through a continue at the block,
+// as the unwind would end. Called with the dispatcher's records.
+dword_result_t __C_specific_handler_entry(pointer_t<X_EXCEPTION_RECORD> record,
+                                          dword_t establisher_frame,
+                                          lpvoid_t context_record,
+                                          lpvoid_t dispatcher_context,
+                                          const ppc_context_t& context) {
+  if (!record || !context_record || !dispatcher_context) {
+    return kExceptionContinueSearch;
+  }
+  // __finally blocks run while unwinding, which nothing does yet.
+  if (record->exception_flags & (kExceptionUnwinding | kExceptionExitUnwind)) {
+    return kExceptionContinueSearch;
+  }
+  auto* dispatcher = dispatcher_context.as<xe::be<uint32_t>*>();
+  const uint32_t control_pc = dispatcher[0];
+  const uint32_t function_entry = dispatcher[1];
+  if (!IsGuestRangeReadable(function_entry, 4)) {
+    return kExceptionContinueSearch;
+  }
+  // The scope table is the handler data, the word ahead of the prolog.
+  const uint32_t function = ReadGuestWord(function_entry);
+  if (!IsGuestRangeReadable(function - 4, 4)) {
+    return kExceptionContinueSearch;
+  }
+  const uint32_t table = ReadGuestWord(function - 4);
+  if (!IsGuestRangeReadable(table, 4)) {
+    return kExceptionContinueSearch;
+  }
+  // A caller is at its call's return address, which can be the end of the
+  // scope the call is in, so its call is what's looked up.
+  const uint32_t pc =
+      control_pc == record->exception_address ? control_pc : control_pc - 4;
+  const uint32_t count = std::min<uint32_t>(ReadGuestWord(table), 256);
+  for (uint32_t i = 0; i < count; ++i) {
+    const uint32_t entry_ptr = table + 4 + i * sizeof(X_SCOPE_TABLE_ENTRY);
+    if (!IsGuestRangeReadable(entry_ptr, sizeof(X_SCOPE_TABLE_ENTRY))) {
+      break;
+    }
+    auto* entry =
+        kernel_memory()->TranslateVirtual<X_SCOPE_TABLE_ENTRY*>(entry_ptr);
+    if (pc < entry->begin_address || pc >= entry->end_address ||
+        !entry->jump_target) {
+      continue;
+    }
+    int32_t verdict = 1;
+    if (entry->handler_address != 1) {
+      // The filter gets EXCEPTION_POINTERS and the establisher frame, which it
+      // also finds its function's frame from in r12, as a catch funclet does.
+      const uint32_t pointers = kernel_memory()->SystemHeapAlloc(8);
+      if (!pointers) {
+        return kExceptionContinueSearch;
+      }
+      auto* words =
+          kernel_memory()->TranslateVirtual<xe::be<uint32_t>*>(pointers);
+      words[0] = record.guest_address();
+      words[1] = context_record.guest_address();
+      context->r[12] = establisher_frame;
+      uint64_t args[] = {pointers, establisher_frame};
+      verdict = static_cast<int32_t>(kernel_state()->processor()->Execute(
+          context->thread_state, entry->handler_address, args,
+          xe::countof(args)));
+      kernel_memory()->SystemHeapFree(pointers);
+    }
+    if (verdict < 0) {
+      return kExceptionContinueExecution;
+    }
+    if (!verdict) {
+      continue;
+    }
+    if (!UnwindContextRecordTo(context_record.as<uint8_t*>(), establisher_frame,
+                               entry->jump_target, record->code)) {
+      XELOGE(
+          "__C_specific_handler: can't unwind to the __except block at {:08X} "
+          "of the function entered on {:08X}",
+          uint32_t(entry->jump_target), uint32_t(establisher_frame));
+      return kExceptionContinueSearch;
+    }
+    return kExceptionContinueExecution;
+  }
+  return kExceptionContinueSearch;
+}
+DECLARE_XBOXKRNL_EXPORT1(__C_specific_handler, kDebug, kImplemented);
 
 void RtlRaiseException_entry(pointer_t<X_EXCEPTION_RECORD> record,
                              const ppc_context_t& context) {
