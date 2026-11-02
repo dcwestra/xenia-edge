@@ -3024,7 +3024,9 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
   in_render_pass_ = true;
   ++render_passes_total_;
 
-  OpenQuerySegment(false);
+  // No ZPD segment here: the render target cache transfers and clears in this
+  // pass, and those samples aren't the guest's. The guest draw's own pass
+  // resumes the segment.
 }
 
 void VulkanCommandProcessor::EndRenderPass() {
