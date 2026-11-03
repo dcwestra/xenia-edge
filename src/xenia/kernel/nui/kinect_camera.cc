@@ -22,6 +22,7 @@
 #include "xenia/base/logging.h"
 #include "xenia/base/platform.h"
 #include "xenia/base/string.h"
+#include "xenia/kernel/nui/kinect_libusb.h"
 
 DEFINE_bool(kinect_mirror, false,
             "Flip the Kinect's depth and color left to right. Titles' trackers "
@@ -33,11 +34,6 @@ DEFINE_path(kinect_playback_path, "",
             "Play a recording made with kinect_record_path to Kinect titles, "
             "over and over, instead of streaming from a Kinect.",
             "Kernel");
-
-#if XE_PLATFORM_LINUX
-#include <dlfcn.h>
-#include <libusb-1.0/libusb.h>
-#endif
 
 namespace xe {
 namespace kernel {
@@ -236,46 +232,6 @@ uint16_t KinectRawDepthToMillimeters(uint32_t raw) {
 
 #if XE_PLATFORM_LINUX
 namespace {
-
-#define XE_LIBUSB_FUNCTIONS(F)              \
-  F(libusb_init)                            \
-  F(libusb_exit)                            \
-  F(libusb_open_device_with_vid_pid)        \
-  F(libusb_close)                           \
-  F(libusb_kernel_driver_active)            \
-  F(libusb_detach_kernel_driver)            \
-  F(libusb_attach_kernel_driver)            \
-  F(libusb_claim_interface)                 \
-  F(libusb_release_interface)               \
-  F(libusb_control_transfer)                \
-  F(libusb_alloc_transfer)                  \
-  F(libusb_free_transfer)                   \
-  F(libusb_submit_transfer)                 \
-  F(libusb_cancel_transfer)                 \
-  F(libusb_handle_events_timeout_completed) \
-  F(libusb_error_name)
-
-struct Libusb {
-#define XE_LIBUSB_DECLARE(name) decltype(&::name) name = nullptr;
-  XE_LIBUSB_FUNCTIONS(XE_LIBUSB_DECLARE)
-#undef XE_LIBUSB_DECLARE
-
-  bool Load() {
-    void* library = dlopen("libusb-1.0.so.0", RTLD_NOW | RTLD_LOCAL);
-    if (!library) {
-      return false;
-    }
-#define XE_LIBUSB_RESOLVE(fn)                               \
-  fn = reinterpret_cast<decltype(fn)>(dlsym(library, #fn)); \
-  if (!fn) {                                                \
-    XELOGW("Kinect: libusb-1.0 has no {}", #fn);            \
-    return false;                                           \
-  }
-    XE_LIBUSB_FUNCTIONS(XE_LIBUSB_RESOLVE)
-#undef XE_LIBUSB_RESOLVE
-    return true;
-  }
-};
 
 constexpr uint16_t kVendorMicrosoft = 0x045E;
 constexpr uint16_t kProductKinectCamera = 0x02AE;

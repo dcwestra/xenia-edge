@@ -10,8 +10,11 @@
 #ifndef XENIA_APU_AUDIO_SYSTEM_H_
 #define XENIA_APU_AUDIO_SYSTEM_H_
 
+#include <array>
 #include <atomic>
+#include <memory>
 #include <mutex>
+#include <string>
 
 #include "xenia/base/mutex.h"
 #include "xenia/base/threading.h"
@@ -27,6 +30,16 @@ constexpr fourcc_t kAudioSaveSignature = make_fourcc("XAUD");
 
 class AudioDriver;
 class XmaDecoder;
+
+// A host recording device, delivering mono 16-bit samples at the rate it was
+// opened with.
+class AudioCapture {
+ public:
+  virtual ~AudioCapture() = default;
+  virtual std::string device_name() const = 0;
+  // Copies up to `count` samples that have arrived, returning how many.
+  virtual size_t Read(int16_t* samples, size_t count) = 0;
+};
 
 class AudioSystem {
  public:
@@ -63,6 +76,18 @@ class AudioSystem {
     uint32_t frames_dropped;
   };
   bool GetClientPerformance(size_t index, ClientPerformance* out_perf);
+
+  // The sum of what the clients last submitted, as guest (big-endian) floats
+  // in the submission layout: what the console is playing, for titles that
+  // cancel it from microphone input (XAudioCaptureRenderDriverFrame).
+  void CaptureLastFrame(uint8_t* out);
+
+  // Opens a host recording device whose name contains `device` (the default
+  // one if empty), null if there's none or this backend can't record.
+  virtual std::unique_ptr<AudioCapture> OpenCapture(const std::string& device,
+                                                    uint32_t frequency) {
+    return nullptr;
+  }
 
   // Creates an independent, non-registered driver instance.
   virtual AudioDriver* CreateDriver(xe::threading::Semaphore* semaphore,
@@ -115,6 +140,9 @@ class AudioSystem {
     std::atomic<uint32_t> frames_dropped{0};
     // Held by worker during Execute; UnregisterClient waits on it.
     std::mutex callback_mutex;
+    // The frame submitted last, as the guest wrote it.
+    std::array<uint8_t, sizeof(float) * 6 * 256> last_frame = {};
+    bool has_last_frame = false;
   };
   ClientSlot clients_[kMaximumClientCount];
 

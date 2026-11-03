@@ -10,6 +10,7 @@
 #include "xenia/apu/audio_system.h"
 #include "xenia/emulator.h"
 #include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/nui/nui_microphones.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_module.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
@@ -173,6 +174,52 @@ dword_result_t XAudioSubmitRenderDriverFrame_entry(lpunknown_t driver_ptr,
   return X_ERROR_SUCCESS;
 }
 DECLARE_XBOXKRNL_EXPORT2(XAudioSubmitRenderDriverFrame, kAudio, kImplemented,
+                         kHighFrequency);
+
+// The echo cancellation (MEC) client of a Kinect title's NUI audio,
+// {callback, argument}: called every 256-sample frame of the render driver
+// (5.33 ms, a tic), when it reads the microphones and the frame played.
+dword_result_t XAudioRegisterRenderDriverMECClient_entry(lpdword_t client,
+                                                         lpdword_t handle) {
+  if (!client || !client[0] || !handle) {
+    return X_E_INVALIDARG;
+  }
+  uint32_t mec_handle = 0;
+  const X_STATUS result = kernel_state()->nui_microphones()->RegisterMecClient(
+      client[0], client[1], &mec_handle);
+  if (XFAILED(result)) {
+    return result;
+  }
+  *handle = mec_handle;
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(XAudioRegisterRenderDriverMECClient, kAudio,
+                         kImplemented);
+
+dword_result_t XAudioUnregisterRenderDriverMECClient_entry(dword_t handle) {
+  kernel_state()->nui_microphones()->UnregisterMecClient(handle);
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(XAudioUnregisterRenderDriverMECClient, kAudio,
+                         kImplemented);
+
+dword_result_t XAudioGetRenderDriverTic_entry() {
+  return kernel_state()->nui_microphones()->render_tic();
+}
+DECLARE_XBOXKRNL_EXPORT2(XAudioGetRenderDriverTic, kAudio, kImplemented,
+                         kHighFrequency);
+
+// The frame last played, which the title cancels from the microphones: 6
+// channels of 256 big-endian floats.
+dword_result_t XAudioCaptureRenderDriverFrame_entry(dword_t handle,
+                                                    lpvoid_t buffer) {
+  if (buffer) {
+    kernel_state()->emulator()->audio_system()->CaptureLastFrame(
+        buffer.as<uint8_t*>());
+  }
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT2(XAudioCaptureRenderDriverFrame, kAudio, kImplemented,
                          kHighFrequency);
 
 }  // namespace xboxkrnl

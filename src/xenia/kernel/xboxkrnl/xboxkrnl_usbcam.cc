@@ -21,7 +21,7 @@
 
 DEFINE_bool(log_kinect, false,
             "Log the Kinect camera requests titles make, with their "
-            "parameters.",
+            "parameters, and every 10 seconds what the microphones hear.",
             "Kernel");
 DECLARE_bool(allow_nui_initialization);
 

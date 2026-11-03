@@ -9,6 +9,7 @@
 
 #include "xenia/apu/audio_system.h"
 
+#include <cstring>
 #include <limits>
 
 #include "xenia/apu/apu_flags.h"
@@ -16,6 +17,7 @@
 #include "xenia/apu/nop_audio_driver.h"
 #include "xenia/apu/xma_decoder.h"
 #include "xenia/base/assert.h"
+#include "xenia/base/byte_order.h"
 #include "xenia/base/byte_stream.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/logging.h"
@@ -305,6 +307,7 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg,
   clients_[index].callback_arg = callback_arg;
   clients_[index].wrapped_callback_arg = ptr;
   clients_[index].in_use = true;
+  clients_[index].has_last_frame = false;
   clients_[index].next_pump_us = 0;
   clients_[index].frames_submitted.store(0);
   clients_[index].frames_processed.store(0);
@@ -351,7 +354,30 @@ void AudioSystem::SubmitFrame(size_t index, float* samples) {
   }
   clients_[index].frames_submitted++;
   clients_[index].frames_processed++;
+  std::memcpy(clients_[index].last_frame.data(), samples,
+              clients_[index].last_frame.size());
+  clients_[index].has_last_frame = true;
   (clients_[index].driver)->SubmitFrame(samples);
+}
+
+void AudioSystem::CaptureLastFrame(uint8_t* out) {
+  static_assert(sizeof(ClientSlot::last_frame) == AudioDriver::kFrameSizeMax);
+  std::array<float, AudioDriver::kFrameSamplesMax> mix = {};
+  {
+    std::lock_guard<std::mutex> clients_lock(clients_mutex_);
+    for (const ClientSlot& client : clients_) {
+      if (!client.in_use || !client.has_last_frame) {
+        continue;
+      }
+      for (uint32_t i = 0; i < AudioDriver::kFrameSamplesMax; ++i) {
+        mix[i] += xe::load_and_swap<float>(client.last_frame.data() +
+                                           i * sizeof(float));
+      }
+    }
+  }
+  for (uint32_t i = 0; i < AudioDriver::kFrameSamplesMax; ++i) {
+    xe::store_and_swap<float>(out + i * sizeof(float), mix[i]);
+  }
 }
 
 bool AudioSystem::GetClientPerformance(size_t index,

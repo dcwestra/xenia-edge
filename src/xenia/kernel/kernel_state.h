@@ -56,6 +56,7 @@ class KinectMotor;
 class NuiDataStore;
 class NuiHud;
 class NuiIdentity;
+class NuiMicrophones;
 class PsCamDevice;
 }  // namespace nui
 
@@ -200,6 +201,8 @@ class KernelState {
   nui::NuiHud* nui_hud() const { return nui_hud_.get(); }
   // The system's side of Kinect ID.
   nui::NuiIdentity* nui_identity() const { return nui_identity_.get(); }
+  // The Kinect's microphone array, created when a title first asks for it.
+  nui::NuiMicrophones* nui_microphones();
   vfs::VirtualFileSystem* file_system() const { return file_system_; }
 
   uint32_t title_id() const;
@@ -452,6 +455,7 @@ class KernelState {
   std::unique_ptr<nui::NuiDataStore> nui_data_store_;
   std::unique_ptr<nui::NuiHud> nui_hud_;
   std::unique_ptr<nui::NuiIdentity> nui_identity_;
+  std::unique_ptr<nui::NuiMicrophones> nui_microphones_;
   bool kinect_motor_opened_ = false;
   std::unique_ptr<nui::KinectMotor> kinect_motor_;
   std::unique_ptr<NUIController> nui_;

@@ -22,6 +22,7 @@
 #include "xenia/kernel/nui/nui_data_store.h"
 #include "xenia/kernel/nui/nui_hud.h"
 #include "xenia/kernel/nui/nui_identity.h"
+#include "xenia/kernel/nui/nui_microphones.h"
 #include "xenia/kernel/nui/pscam_device.h"
 #include "xenia/kernel/title_id_utils.h"
 #include "xenia/kernel/user_module.h"
@@ -114,6 +115,14 @@ nui::NuiDataStore* KernelState::nui_data_store() {
   return nui_data_store_.get();
 }
 
+nui::NuiMicrophones* KernelState::nui_microphones() {
+  std::lock_guard<std::mutex> lock(pscam_device_mutex_);
+  if (!nui_microphones_) {
+    nui_microphones_ = std::make_unique<nui::NuiMicrophones>(this);
+  }
+  return nui_microphones_.get();
+}
+
 nui::KinectMotor* KernelState::kinect_motor() {
   std::lock_guard<std::mutex> lock(pscam_device_mutex_);
   if (!kinect_motor_opened_) {
@@ -131,9 +140,12 @@ KernelState::~KernelState() {
 
   ShutdownDispatchThread();
 
-  // Its worker calls into the title, so before the fibers go.
+  // Their workers call into the title, so before the fibers go.
   if (pscam_device_) {
     pscam_device_->Shutdown();
+  }
+  if (nui_microphones_) {
+    nui_microphones_->Shutdown();
   }
 
   // Reclaiming leftover fibers releases handles, so run this while the object
