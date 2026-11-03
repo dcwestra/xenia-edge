@@ -93,6 +93,8 @@ Unless noted, every new behavior is controlled by a configuration option (cvar),
   - In *Fable III*, the depth-pyramid reducer then copied one corner texel per level instead of a conservative minimum. The game's GPU culling hid castle walls and objects behind trees, so they flickered in and out.
   - Fixed at the root, with no game-specific workaround. Correct culling draws more, so busy areas can run a little slower than before.
 - **Per-shader depth bias** (`shader_depth_bias`). This is for content that relies on exact ties in the 360's 24-bit depth. *Fable II*'s dog fur shells flicker without it; a recommended config is in [`game-configs/`](game-configs/).
+- **Occlusion queries no longer count Xenia's own copies between render targets.** A query that began right after a clear also counted the full-screen draw that copies the cleared data into the next render target. *Fable II* measures how much of the moon is visible this way, so its glow showed at full strength through trees and hills.
+- **Vertex shader dot products are rounded once** (`alu_dot_products_round_once`, on). Each product is rounded like a multiplication and the sum once, so two shaders computing the same value with different instructions agree. *Fable II* draws its bending plants twice with different shaders, and a last-bit difference showed as white or blue patches on plants next to the hero and the dog. This needs 64-bit float support on the GPU.
 - **Render-to-texture readback can no longer hang or crash when the GPU can't map guest memory directly.** On AMD/RADV, GPU output read back by the CPU was copied into memory the game had just protected. The copy faulted while holding the emulator's global lock and hung the game on a loading screen.
 - **A clear warning when Vulkan falls back to a software renderer** (for example llvmpipe, after a driver update without a reboot), instead of a silent black screen. Hardware GPUs are now always preferred.
 - **A warning when the Vulkan pipeline cache was made by another driver version.** After a driver update, pipelines are rebuilt during play, which shows up as brief flashing or missing objects.
@@ -148,8 +150,7 @@ These are separate from the code, and every patch is **off by default**. Copy wh
 
 ## Known issues
 
-- *Fable II* can still flash a patch of grass or brush white for a frame, rarely, on NVIDIA and AMD alike. The flashing characters seen on NVIDIA are fixed.
-- In *Fable II*, the moon's glow can show through hills and buildings.
+- *Fable II* can still show a small white or blue patch on a plant next to the hero or the dog, less often than before. The flashing characters seen on NVIDIA and the moon's glow through hills are fixed.
 - AMD/RADV can't map the emulator's guest memory directly (`VK_EXT_external_memory_host` rejects shared memory). Readback therefore goes through an extra copy, which is safe but slower than on NVIDIA.
 - These changes were tested on the games listed above only. Everything else is as upstream left it, for better or worse.
 

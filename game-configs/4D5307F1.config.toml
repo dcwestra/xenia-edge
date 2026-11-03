@@ -7,7 +7,3 @@
 # so about half the layers flicker; 16 units is about two 24-bit depth steps.
 # Finding by himdo (Fable-2-Recomp).
 shader_depth_bias = "014F8A02DB7B19CA:16"
-# Fable II reads occlusion query results for lighting and the moon's glow.
-# "fast" answers before the GPU has, leaning toward visible, which flashes
-# objects white and shows the glow through walls; "strict" waits for the GPU.
-occlusion_query = "strict"
