@@ -44,7 +44,7 @@ Tested by the owner with a Kinect for Xbox 360 (model 1414) on Fedora 44:
 - ***Kinect Sports*** is playable. The hand-cursor menus, signing in, bowling and the stadium crowd area all work, and **players appear as their Xbox avatars**, fully dressed and with animated faces.
 - ***Kinect Adventures!*** plays River Rush: jumping and steering the raft by side-stepping both work, and **players appear as their Xbox avatars**.
 - ***Kinect Star Wars*** plays.
-- ***Dance Central 2*** is playable: menus, songs and scoring all work. Voice commands don't, see Limits.
+- ***Dance Central 2*** is playable: menus, songs and scoring all work, and so do its voice commands.
 
 ### How it works
 
@@ -52,6 +52,7 @@ Kinect games do their own skeletal tracking and Kinect ID face matching, in code
 
 - **The camera.** Depth and color at 640x480 and 30 fps, read straight from the sensor over USB (libusb), and delivered to the game the way the console does.
 - **The tilt motor, LED and accelerometer.** Games can aim the sensor at the floor and the player, as on a console.
+- **The microphones.** The Kinect's four-microphone array, for voice commands. Its firmware is uploaded to the sensor over USB, as the console does. Without a Kinect, or without the firmware, the PC's microphone stands in.
 - **Kinect ID.** The identity data games store, and the links between Kinect IDs and profiles.
 - **The Kinect system dialogs.** The pause message and the sign-in prompt, with a hand cursor to press their buttons.
 - **Xbox avatars.** Avatars are built from the system avatar asset pack, the same data the console uses. Kinect Sports carries the pack on its disc, and discs with a Kinect system update (such as *Fable: The Journey*) carry a newer one.
@@ -66,20 +67,24 @@ Kinect games do their own skeletal tracking and Kinect ID face matching, in code
 1. Plug the Kinect in with its power and USB adapter. `libusb-1.0` must be installed; most distributions have it.
 2. Give your user access to the sensor with the udev rule in [`tools/kinect/`](tools/kinect/). The file explains how to install it. Then replug the Kinect.
 3. Copy the game configs from [`game-configs/`](game-configs/) (`4D530A1A` for *Fable: The Journey*, `4D5308C9` for *Kinect Sports*, `4D5308ED` for *Kinect Adventures!*, `4D53090E` for *Kinect Star Wars*, `373307D2` for *Dance Central 2*) into your Xenia `config/` folder. They turn on `allow_nui_initialization`, plus `allow_avatar_initialization` for *Kinect Sports* and *Kinect Adventures!*.
-4. Stand about 2-3 m in front of the sensor. *Kinect Sports* doesn't track seated players.
+4. For voice commands, the Kinect's microphones need its audio firmware, which isn't on game discs. Download the Xbox 360 USB system update from Microsoft (`SystemUpdate_17559_USB.zip`) and set `kinect_audio_firmware_path` to the `$SystemUpdate/FFFE07DF00000001` file in it. The sensor forgets the firmware when it loses power, so it's uploaded again whenever a game first listens.
+5. Stand about 2-3 m in front of the sensor. *Kinect Sports* doesn't track seated players.
 
 Related settings:
 
 - `kinect_tilt` (on): lets games move the tilt motor.
 - `kinect_record_path` and `kinect_playback_path`: record a session to a file and play it back later without a sensor. Recording takes about 22 MB/s.
-- `log_kinect`: logs the camera and Kinect service traffic.
+- `kinect_microphone` (`auto`): where games hear from. `auto` uses the Kinect's microphones, or the PC's recording device if they can't be used. `kinect` or `host` uses only one of them, and `off` hides the microphone array from games.
+- `kinect_host_microphone`: the PC recording device to use, by part of its name. Empty uses the default one.
+- `kinect_microphone_gain` (8): boosts the Kinect's microphones, which come off USB quieter than games expect.
+- `log_kinect`: logs the camera and Kinect service traffic, and every 10 seconds what the microphones hear.
 - `avatar_asset_pack_path`: the system avatar package (`FFFE07DF00000002` from a disc's `$SystemUpdate` folder, or *Kinect Sports'* `AvatarAssetPack`), for avatar games whose disc doesn't carry one.
 
 ### Limits
 
 - **Linux only**, and only the original **Kinect for Xbox 360 (model 1414)**. The Xbox One Kinect isn't supported.
 - **Five games tested, all playable.** Other Kinect games may reach parts that aren't implemented yet.
-- **No Kinect audio.** The microphone array and voice commands aren't implemented.
+- **The microphones skip the sensor's own processing.** Games get the four microphones and their average, not the sensor's beamformed mix, which needs the console's Kinect audio calibration. Dance Central 2's voice commands work with this.
 - **Avatars are still missing some details.** Height and weight aren't applied yet. The editor only offers the items in the avatar pack, not marketplace or award items.
 - **Not yet tried with Kinect on Batocera.**
 
@@ -193,6 +198,8 @@ Linux needs clang. See [docs/building.md](docs/building.md) for dependencies.
 - [himdo/Fable-2-Recomp](https://github.com/himdo/Fable-2-Recomp) (MIT), for the *Fable II* texture-morphing and dog-fur findings, and just-harry for the morphing diagnosis.
 - [DanielCoffey1/Fable-III-PC](https://github.com/DanielCoffey1/Fable-III-PC), whose research pointed at the *Fable III* visibility shader. Only its findings were used, no code.
 - The [game-patches](https://github.com/xenia-canary/game-patches) community.
+- Davi Carlos's [kixenia](https://github.com/davicarlos/kixenia), whose Kinect audio code (BSD) and notes on xam and the Kinect's audio firmware (CC BY 4.0) the microphone support follows.
+- [libfreenect](https://github.com/OpenKinect/libfreenect), for the Kinect's USB protocols.
 
 ## License
 
