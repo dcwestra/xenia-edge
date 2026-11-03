@@ -113,6 +113,7 @@ class VulkanDevice {
     bool fragmentStoresAndAtomics = false;
     bool shaderClipDistance = false;
     bool shaderCullDistance = false;
+    bool shaderFloat64 = false;
     bool shaderInt16 = false;
     bool sparseBinding = false;
     bool sparseResidencyBuffer = false;

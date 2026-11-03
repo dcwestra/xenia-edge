@@ -90,6 +90,7 @@ DECLARE_bool(use_fuzzy_alpha_epsilon);
 DECLARE_bool(force_depth_clamp);
 
 DECLARE_bool(alu_round_toward_zero);
+DECLARE_bool(alu_dot_products_round_once);
 
 DECLARE_bool(xenos_sample_positions);
 

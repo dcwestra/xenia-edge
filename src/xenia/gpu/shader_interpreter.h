@@ -121,6 +121,8 @@ class ShaderInterpreter {
   const std::array<float, 4> GetFloatConstant(
       uint32_t address, bool is_relative, bool relative_address_is_a0) const;
 
+  // Rounds an exact result to float, toward zero with alu_round_toward_zero.
+  static float RoundDouble(double value);
   // Guest ALU sums and products, rounded toward zero with
   // alu_round_toward_zero.
   static float AluAdd(float a, float b);

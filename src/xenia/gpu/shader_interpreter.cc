@@ -284,6 +284,19 @@ static float RoundTowardZero(float rounded, bool rounded_away, float a,
   return rounded_away ? std::nextafter(rounded, 0.0f) : rounded;
 }
 
+float ShaderInterpreter::RoundDouble(double value) {
+  float rounded = float(value);
+  if (!cvars::alu_round_toward_zero) {
+    return rounded;
+  }
+  if (std::isinf(rounded) && std::isfinite(value)) {
+    return std::copysign(FLT_MAX, rounded);
+  }
+  return std::abs(double(rounded)) > std::abs(value)
+             ? std::nextafter(rounded, 0.0f)
+             : rounded;
+}
+
 float ShaderInterpreter::AluAdd(float a, float b) {
   float sum = a + b;
   if (!cvars::alu_round_toward_zero) {
@@ -463,43 +476,48 @@ void ShaderInterpreter::ExecuteAluInstruction(ucode::AluInstruction instr) {
                                  : vector_operands[2][i];
         }
       } break;
-      case ucode::AluVectorOpcode::kDp4: {
-        vector_result[0] = 0.0f;
-        for (uint32_t i = 0; i < 4; ++i) {
-          // Direct3D 9 behavior (0 or denormal * anything = +0).
-          // Doing the addition even for zero operands because +0 + -0 must be
-          // +0.
-          vector_result[0] +=
-              (vector_operands[0][i] && vector_operands[1][i])
-                  ? vector_operands[0][i] * vector_operands[1][i]
-                  : 0.0f;
-        }
-        replicate_vector_result_x = true;
-      } break;
-      case ucode::AluVectorOpcode::kDp3: {
-        vector_result[0] = 0.0f;
-        for (uint32_t i = 0; i < 3; ++i) {
-          // Direct3D 9 behavior (0 or denormal * anything = +0).
-          // Doing the addition even for zero operands because +0 + -0 must be
-          // +0.
-          vector_result[0] +=
-              (vector_operands[0][i] && vector_operands[1][i])
-                  ? vector_operands[0][i] * vector_operands[1][i]
-                  : 0.0f;
-        }
-        replicate_vector_result_x = true;
-      } break;
+      case ucode::AluVectorOpcode::kDp4:
+      case ucode::AluVectorOpcode::kDp3:
       case ucode::AluVectorOpcode::kDp2Add: {
-        // Doing the addition even for zero operands because +0 + -0 must be +0.
-        vector_result[0] = 0.0f;
-        for (uint32_t i = 0; i < 2; ++i) {
-          // Direct3D 9 behavior (0 or denormal * anything = +0).
-          vector_result[0] +=
-              (vector_operands[0][i] && vector_operands[1][i])
-                  ? vector_operands[0][i] * vector_operands[1][i]
-                  : 0.0f;
+        uint32_t component_count =
+            instr.vector_opcode() == ucode::AluVectorOpcode::kDp4   ? 4
+            : instr.vector_opcode() == ucode::AluVectorOpcode::kDp3 ? 3
+                                                                    : 2;
+        bool dp2add = instr.vector_opcode() == ucode::AluVectorOpcode::kDp2Add;
+        if (cvars::alu_dot_products_round_once) {
+          // Each product is rounded like a multiplication, and the sum of the
+          // products (and the dp2add addend) is rounded once, so shaders
+          // summing the same terms in a different order (dp3 versus dp2add
+          // plus a squared third term) get the same result.
+          double sum = 0.0;
+          for (uint32_t i = 0; i < component_count; ++i) {
+            // Direct3D 9 behavior (0 or denormal * anything = +0).
+            // Doing the addition even for zero operands because +0 + -0 must
+            // be +0.
+            sum += (vector_operands[0][i] && vector_operands[1][i])
+                       ? double(AluMultiply(vector_operands[0][i],
+                                            vector_operands[1][i]))
+                       : 0.0;
+          }
+          if (dp2add) {
+            sum += double(vector_operands[2][0]);
+          }
+          vector_result[0] = RoundDouble(sum);
+        } else {
+          vector_result[0] = 0.0f;
+          for (uint32_t i = 0; i < component_count; ++i) {
+            // Direct3D 9 behavior (0 or denormal * anything = +0).
+            // Doing the addition even for zero operands because +0 + -0 must
+            // be +0.
+            vector_result[0] +=
+                (vector_operands[0][i] && vector_operands[1][i])
+                    ? vector_operands[0][i] * vector_operands[1][i]
+                    : 0.0f;
+          }
+          if (dp2add) {
+            vector_result[0] += vector_operands[2][0];
+          }
         }
-        vector_result[0] += vector_operands[2][0];
         replicate_vector_result_x = true;
       } break;
       case ucode::AluVectorOpcode::kCube: {

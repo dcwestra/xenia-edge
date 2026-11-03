@@ -1070,6 +1070,71 @@ spv::Id SpirvShaderTranslator::ProcessVectorAluOperation(
       uint32_t different =
           component_mask & ~instr.vector_operands[0].GetIdenticalComponents(
                                instr.vector_operands[1]);
+      if (cvars::alu_dot_products_round_once && features_.float64 &&
+          is_vertex_shader()) {
+        // Each product is rounded like a multiplication, and the sum of the
+        // products (and the dp2add addend) is rounded once, so a dp3 and a
+        // dp2add with the third product squared separately get the same
+        // result, which geometry drawn by more than one shader relies on.
+        spv::Id type_double = builder_->makeFloatType(64);
+        spv::Id sum = spv::NoResult;
+        for (uint32_t i = 0; i < component_count; ++i) {
+          spv::Id operand_components[2];
+          for (unsigned int j = 0; j < 2; ++j) {
+            operand_components[j] =
+                builder_->createCompositeExtract(operands[j], type_float_, i);
+          }
+          spv::Id product =
+              AluMultiply(operand_components[0], operand_components[1]);
+          if (different & (1 << i)) {
+            // Shader Model 3: +0 or denormal * anything = +0.
+            product = ZeroIfAnyOperandIsZero(
+                product,
+                GetAbsoluteOperand(operand_components[0],
+                                   instr.vector_operands[0]),
+                GetAbsoluteOperand(operand_components[1],
+                                   instr.vector_operands[1]));
+          }
+          product =
+              builder_->createUnaryOp(spv::OpFConvert, type_double, product);
+          sum = i ? builder_->createNoContractionBinOp(spv::OpFAdd, type_double,
+                                                       sum, product)
+                  : product;
+        }
+        if (instr.vector_opcode == ucode::AluVectorOpcode::kDp2Add) {
+          sum = builder_->createNoContractionBinOp(
+              spv::OpFAdd, type_double, sum,
+              builder_->createUnaryOp(
+                  spv::OpFConvert, type_double,
+                  GetOperandComponents(operand_storage[2],
+                                       instr.vector_operands[2], 0b0001)));
+        }
+        // Stepped toward zero here rather than relying on the RTZ execution
+        // mode covering conversions.
+        spv::Id result =
+            builder_->createUnaryOp(spv::OpFConvert, type_float_, sum);
+        if (RoundsTowardZero()) {
+          // Step a result that rounded away from zero back toward it, which
+          // also turns overflow to infinity into the largest finite value.
+          spv::Id rounded_away = builder_->createBinOp(
+              spv::OpFOrdGreaterThan, type_bool_,
+              builder_->createUnaryBuiltinCall(
+                  type_double, ext_inst_glsl_std_450_, GLSLstd450FAbs,
+                  builder_->createUnaryOp(spv::OpFConvert, type_double,
+                                          result)),
+              builder_->createUnaryBuiltinCall(
+                  type_double, ext_inst_glsl_std_450_, GLSLstd450FAbs, sum));
+          spv::Id stepped = builder_->createUnaryOp(
+              spv::OpBitcast, type_float_,
+              builder_->createBinOp(
+                  spv::OpISub, type_uint_,
+                  builder_->createUnaryOp(spv::OpBitcast, type_uint_, result),
+                  builder_->makeUintConstant(1)));
+          result = builder_->createTriOp(spv::OpSelect, type_float_,
+                                         rounded_away, stepped, result);
+        }
+        return result;
+      }
       spv::Id result = spv::NoResult;
       for (uint32_t i = 0; i < component_count; ++i) {
         spv::Id operand_components[2];

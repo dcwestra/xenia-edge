@@ -543,6 +543,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
     bool denorm_flush_to_zero_float32;
     bool rounding_mode_rte_float32;
     bool rounding_mode_rtz_float32 = false;
+    // 64-bit floats, for dot products rounded once.
+    bool float64 = false;
 
     bool fragment_shader_sample_interlock;
 

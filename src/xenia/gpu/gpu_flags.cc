@@ -289,6 +289,15 @@ DEFINE_bool(
     "or a floor, trunc or frc this way.",
     "GPU");
 
+DEFINE_bool(
+    alu_dot_products_round_once, true,
+    "Round vertex shader dot products once, after adding up the products, "
+    "instead of after every addition. Shaders computing the same geometry "
+    "with different instructions (dp3 against dp2add plus a separate square) "
+    "then agree, as on the Xenos; Fable II's bending plants show holes "
+    "otherwise. Needs 64-bit float support on the GPU.",
+    "GPU");
+
 DEFINE_bool(xenos_sample_positions, false,
             "Rasterize 2x and 4x MSAA render targets at the Xenos sample "
             "positions, like real hardware, if the GPU and driver support it.\n"

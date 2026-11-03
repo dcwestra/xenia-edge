@@ -209,6 +209,7 @@ SpirvShaderTranslator::Features::Features(bool all)
       signed_zero_inf_nan_preserve_float32(all),
       denorm_flush_to_zero_float32(all),
       rounding_mode_rte_float32(all),
+      float64(all),
       fragment_shader_sample_interlock(all),
       demote_to_helper_invocation(all),
       fragment_shader_barycentric(all) {}
@@ -234,6 +235,7 @@ SpirvShaderTranslator::Features::Features(
           vulkan_device->properties().shaderRoundingModeRTEFloat32),
       rounding_mode_rtz_float32(
           vulkan_device->properties().shaderRoundingModeRTZFloat32),
+      float64(vulkan_device->properties().shaderFloat64),
       fragment_shader_sample_interlock(
           vulkan_device->properties().fragmentShaderSampleInterlock),
       demote_to_helper_invocation(
@@ -1326,6 +1328,11 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
     } else {
       execution_model = spv::ExecutionModelVertex;
     }
+  }
+  if (cvars::alu_dot_products_round_once && features_.float64 &&
+      is_vertex_shader()) {
+    // Vertex shader dot products are summed as doubles and rounded once.
+    builder_->addCapability(spv::Capability::Float64);
   }
   if (features_.denorm_flush_to_zero_float32) {
     // Flush to zero, similar to the real hardware, also for things like Shader
