@@ -94,7 +94,8 @@ uint8_t schema_bin[] = {
 };
 
 dword_result_t XamGetOnlineSchema_entry() {
-  static uint32_t schema_guest = 0;
+  // Kept with the kernel, since a relaunch frees the memory it's in.
+  uint32_t& schema_guest = kernel_state()->xam_state()->online_schema_address_;
 
   if (!schema_guest) {
     schema_guest =
@@ -235,6 +236,15 @@ dword_result_t XamBuildResourceLocator_entry(qword_t module,
 }
 DECLARE_XAM_EXPORT1(XamBuildResourceLocator, kNone, kImplemented);
 
+// The xam a system title gets from \SystemRoot for its resources, as xam or
+// $flash_xam.
+static object_ref<XModule> GetSystemXamModule() {
+  if (auto module = kernel_state()->GetModule("xam", true)) {
+    return module;
+  }
+  return kernel_state()->GetModule("$flash_xam", true);
+}
+
 dword_result_t XamBuildGamercardResourceLocator_entry(lpu16string_t filename,
                                                       lpvoid_t buffer_ptr,
                                                       dword_t buffer_count) {
@@ -245,7 +255,7 @@ dword_result_t XamBuildGamercardResourceLocator_entry(lpu16string_t filename,
 
   // If you're running an app that'll need them, make sure to extract xam.xex
   // resources with xextool ("xextool -d . xam.xex") and add a .xzp extension.
-  const auto xam_module = kernel_state()->GetModule("xam", true);
+  const auto xam_module = GetSystemXamModule();
 
   return keXamBuildResourceLocator(xam_module ? xam_module->hmodule_ptr() : 0,
                                    u"gamercrd", filename.value(), buffer_ptr,
@@ -256,7 +266,7 @@ DECLARE_XAM_EXPORT1(XamBuildGamercardResourceLocator, kNone, kImplemented);
 dword_result_t XamBuildSharedSystemResourceLocator_entry(lpu16string_t filename,
                                                          lpvoid_t buffer_ptr,
                                                          dword_t buffer_count) {
-  const auto xam_module = kernel_state()->GetModule("xam", true);
+  const auto xam_module = GetSystemXamModule();
 
   // see notes inside XamBuildGamercardResourceLocator above
   return keXamBuildResourceLocator(xam_module ? xam_module->hmodule_ptr() : 0,
@@ -519,6 +529,9 @@ dword_result_t XamLoaderGetLaunchData_entry(lpvoid_t buffer_ptr,
   XELOGI("XamLoaderGetLaunchData: buffer_size={} copied={} data={}",
          uint32_t(buffer_size), copy_size,
          HexBytes(loader_data.launch_data, kLaunchDataLogBytes));
+  // Launch data is handed out once so it can't reach the next title.
+  loader_data.launch_data_present = false;
+  loader_data.launch_data.clear();
   return X_ERROR_SUCCESS;
 }
 DECLARE_XAM_EXPORT1(XamLoaderGetLaunchData, kNone, kSketchy);
@@ -587,6 +600,72 @@ static bool ResolveLaunchTarget(const vfs::Entry* entry,
   return true;
 }
 
+// Starts the title at |host_path| with |launch_path| in it, or its default
+// module when empty. Doesn't return.
+static void StartTitle(XamModule::LoaderData& loader_data,
+                       const std::filesystem::path& host_path,
+                       std::string launch_path, std::string package_path) {
+  XELOGI(
+      "XamLoaderLaunchTitle: normalized host_path={}, package_path={}, "
+      "launch_path={}",
+      xe::strip_pii(xe::path_to_utf8(host_path)), package_path, launch_path);
+
+  // Handle title launch in-process via full Shutdown/Setup cycle. Disabled
+  // on macOS — pthread_cancel there doesn't run C++ destructors, so
+  // force-terminated guest threads leak locks and deadlock teardown; spawn a
+  // fresh process instead.
+#if !XE_PLATFORM_MAC
+  if (cvars::in_process_title_relaunch) {
+    auto emulator = kernel_state()->emulator();
+
+    XELOGI("XamLoaderLaunchTitle: in-process relaunch to '{}'",
+           xe::strip_pii(xe::path_to_utf8(host_path)));
+
+    auto new_host_path = xe::path_to_utf8(host_path);
+    auto new_launch_module = launch_path;
+    auto new_flags = loader_data.launch_flags;
+    auto new_data = loader_data.launch_data;
+    auto current_thread = XThread::GetCurrentThread();
+
+    // Must dispatch from a non-guest thread — RelaunchTitle terminates
+    // all guest threads including the caller.
+    std::thread([emulator, new_host_path = std::move(new_host_path),
+                 new_launch_module = std::move(new_launch_module), new_flags,
+                 new_data = std::move(new_data),
+                 package_path = std::move(package_path)]() mutable {
+      emulator->RelaunchTitle(new_host_path, new_launch_module, new_flags,
+                              std::move(new_data), true, package_path);
+    }).detach();
+
+    // Stop running guest code; RelaunchTitle terminates us. Suspend can
+    // return on POSIX, so park rather than fall through to spawn.
+    current_thread->Suspend(nullptr);
+    while (true) {
+      xe::threading::NanoSleep(int64_t(1'000'000'000));
+    }
+  }
+#endif  // !XE_PLATFORM_MAC
+
+  const std::string launch_data_hex =
+      HexBytes(loader_data.launch_data, loader_data.launch_data.size());
+
+  auto on_launch_new_title = kernel_state()->emulator()->on_launch_new_title();
+  if (on_launch_new_title) {
+    XELOGI("XamLoaderLaunchTitle: spawning new title process");
+    // The new process has no drive of its own to find the game in.
+    auto* emulator = kernel_state()->emulator();
+    on_launch_new_title(xe::path_to_utf8(host_path), launch_path,
+                        loader_data.launch_flags, launch_data_hex,
+                        emulator->KeepsXboxGame(host_path)
+                            ? xe::path_to_utf8(emulator->xbox_disc_path())
+                            : std::string(),
+                        package_path);
+  }
+
+  XELOGI("XamLoaderLaunchTitle: terminating to launch new title");
+  kernel_state()->TerminateTitle();  // Does not return.
+}
+
 // The console's XamLoaderLaunchTitleEx, which XamLoaderLaunchTitle calls with
 // flag 4. The D: drive path is only checked for flag 4.
 void LaunchTitle(std::string path, std::string_view d_drive_path,
@@ -598,8 +677,14 @@ void LaunchTitle(std::string path, std::string_view d_drive_path,
   loader_data.launch_flags = flags;
 
   // Flag 4 exits to the dashboard for a path rooted at a device. Flag 2 boots
-  // the disc in the tray in place of the path, and with no tray to emulate
-  // that exits to the dashboard too.
+  // the disc in the tray in place of the path, and exits to the dashboard too
+  // when the drive is empty.
+  std::filesystem::path disc_path;
+  if (flags & 2) {
+    if (const auto disc = kernel_state()->emulator()->inserted_disc()) {
+      disc_path = disc->path;
+    }
+  }
   if ((flags & 2) || ((flags & 4) && (path.starts_with('\\') ||
                                       d_drive_path.starts_with('\\')))) {
     path.clear();
@@ -625,7 +710,7 @@ void LaunchTitle(std::string path, std::string_view d_drive_path,
   }
 
   // An empty path means exit to dashboard.
-  if (!path.empty()) {
+  if (!path.empty() || !disc_path.empty()) {
     loader_data.launch_data_present = true;
 
     std::filesystem::path host_path = loader_data.host_path;
@@ -647,7 +732,10 @@ void LaunchTitle(std::string path, std::string_view d_drive_path,
     remove_prefix("game:\\");
     remove_prefix("d:\\");
 
-    if (NamesDevice(launch_path)) {
+    if (!disc_path.empty()) {
+      host_path = disc_path;
+      package_path.clear();
+    } else if (NamesDevice(launch_path)) {
       // Any other device is outside the title. Only a file a host directory
       // backs or one in a package can be launched from there.
       if ((entry->attributes() & vfs::kFileAttributeDirectory) ||
@@ -663,70 +751,20 @@ void LaunchTitle(std::string path, std::string_view d_drive_path,
       launch_path = "";
     }
 
-    XELOGI(
-        "XamLoaderLaunchTitle: normalized host_path={}, package_path={}, "
-        "launch_path={}",
-        xe::strip_pii(xe::path_to_utf8(host_path)), package_path, launch_path);
-
-    // Handle title launch in-process via full Shutdown/Setup cycle. Disabled
-    // on macOS — pthread_cancel there doesn't run C++ destructors, so
-    // force-terminated guest threads leak locks and deadlock teardown; spawn a
-    // fresh process instead.
-#if !XE_PLATFORM_MAC
-    if (cvars::in_process_title_relaunch) {
-      auto emulator = kernel_state()->emulator();
-
-      XELOGI("XamLoaderLaunchTitle: in-process relaunch to '{}'",
-             xe::strip_pii(xe::path_to_utf8(host_path)));
-
-      auto new_host_path = xe::path_to_utf8(host_path);
-      auto new_launch_module = launch_path;
-      auto new_flags = loader_data.launch_flags;
-      auto new_data = loader_data.launch_data;
-      auto current_thread = XThread::GetCurrentThread();
-
-      // Must dispatch from a non-guest thread — RelaunchTitle terminates
-      // all guest threads including the caller.
-      std::thread([emulator, new_host_path = std::move(new_host_path),
-                   new_launch_module = std::move(new_launch_module), new_flags,
-                   new_data = std::move(new_data),
-                   package_path = std::move(package_path)]() mutable {
-        emulator->RelaunchTitle(new_host_path, new_launch_module, new_flags,
-                                std::move(new_data), true, package_path);
-      }).detach();
-
-      // Stop running guest code; RelaunchTitle terminates us. Suspend can
-      // return on POSIX, so park rather than fall through to spawn.
-      current_thread->Suspend(nullptr);
-      while (true) {
-        xe::threading::NanoSleep(int64_t(1'000'000'000));
-      }
-    }
-#endif  // !XE_PLATFORM_MAC
-
-    const std::string launch_data_hex =
-        HexBytes(loader_data.launch_data, loader_data.launch_data.size());
-
-    auto on_launch_new_title =
-        kernel_state()->emulator()->on_launch_new_title();
-    if (on_launch_new_title) {
-      XELOGI("XamLoaderLaunchTitle: spawning new title process");
-      // The new process has no drive of its own to find the game in.
-      auto* emulator = kernel_state()->emulator();
-      on_launch_new_title(xe::path_to_utf8(host_path), launch_path,
-                          loader_data.launch_flags, launch_data_hex,
-                          emulator->KeepsXboxGame(host_path)
-                              ? xe::path_to_utf8(emulator->xbox_disc_path())
-                              : std::string(),
-                          package_path);
-    }
-
-    XELOGI("XamLoaderLaunchTitle: terminating to launch new title");
-    kernel_state()->TerminateTitle();  // Does not return.
+    StartTitle(loader_data, host_path, std::move(launch_path),
+               std::move(package_path));
   }
 
   XELOGI("XamLoaderLaunchTitle: game requested exit to dashboard");
   kernel_state()->ExitToDashboard();
+}
+
+void LaunchHostTitle(const std::filesystem::path& host_path, uint32_t flags) {
+  auto* xam = kernel_state()->GetKernelModule<XamModule>("xam.xex").get();
+  auto& loader_data = xam->loader_data();
+  loader_data.launch_flags = flags;
+  loader_data.launch_data_present = true;
+  StartTitle(loader_data, host_path, {}, {});
 }
 
 void XamLoaderLaunchTitle_entry(lpstring_t raw_name_ptr, dword_t flags) {
@@ -761,6 +799,292 @@ DECLARE_XAM_EXPORT1(XamLoaderTerminateTitle, kNone, kSketchy);
 // dashboard.
 void XamNavigateBack_entry() { kernel_state()->ExitToDashboard(); }
 DECLARE_XAM_EXPORT1(XamNavigateBack, kNone, kSketchy);
+
+// The console's xam takes URIs of up to 0x3FC bytes with the terminator.
+constexpr size_t kMaxUriSize = 0x3FC;
+
+// The console's xam rewrites a URI's scheme with these until it's one of its
+// base schemes. An alias rewrites into its template with the rest of the URI
+// in place of %s, the second template when the user is signed in to LIVE and
+// it has one. Only public aliases can be used first.
+struct UriAlias {
+  std::string_view scheme;
+  bool is_public;
+  std::string_view template_offline;
+  std::string_view template_live;
+};
+constexpr UriAlias kUriAliases[] = {
+    {"pam", false, "dash:pam:%s", {}},
+    {"hub", false, "dash:pam:BuiltIn.Hub.xzp:%s", {}},
+    {"epix", false, "hub:root:Epix:%s", {}},
+    {"gamedetails", true,
+     "hub:root:BuiltIn.ContentApp.xzp:gamedetails:MediaId=%s",
+     "hub:root:Dash.MP.ContentExplorer.lex:gamedetails:MediaId=%s"},
+    {"appdetails", true, "hub:root:BuiltIn.ContentApp.xzp:appdetails:%s",
+     "hub:root:Dash.MP.ContentExplorer.lex:appdetails:%s"},
+    {"contentdetails", true,
+     "hub:root:BuiltIn.ContentApp.xzp:contentdetails:%s",
+     "hub:root:Dash.MP.ContentExplorer.lex:contentdetails:%s"},
+    {"contentlist",
+     true,
+     {},
+     "hub:root:Dash.MP.ContentExplorer.lex:contentlist:%s"},
+    {"contentlibrary", true,
+     "hub:root:BuiltIn.ContentApp.xzp:contentlibrary:%s",
+     "hub:root:Dash.MP.ContentExplorer.lex:contentlibrary:%s"},
+    {"gameslibrary", true, "contentlibrary:PackageType=1;%s", {}},
+    {"applibrary", true, "contentlibrary:PackageType=2;%s", {}},
+    {"gamesmp", true, {}, "hub:root:Dash.MP.ContentExplorer.lex:gamesmp:%s"},
+    {"appsmp", true, {}, "hub:root:Dash.MP.ContentExplorer.lex:appsmp:%s"},
+    {"userpins", true, {}, "hub:root:Dash.MP.ContentExplorer.lex:userpins:%s"},
+    {"videosmp", true, {}, "hub:root:Dash.MP.ContentExplorer.lex:videosmp:%s"},
+    {"search", true, {}, "pam:Dash.Search.xex:scene=results|%s"},
+    {"moviedetails",
+     true,
+     {},
+     "pam:Dash.Search.xex:scene=details|itemtype=Movie|id=%s"},
+    {"tvEpisodedetails",
+     true,
+     {},
+     "pam:Dash.Search.xex:scene=details|itemtype=TVEpisode|id=%s"},
+    {"tvSeasondetails",
+     true,
+     {},
+     "pam:Dash.Search.xex:scene=details|itemtype=TVSeason|id=%s"},
+    {"tvSeriesdetails",
+     true,
+     {},
+     "pam:Dash.Search.xex:scene=details|itemtype=TVSeries|id=%s"},
+    {"tvShowdetails",
+     true,
+     {},
+     "pam:Dash.Search.xex:scene=details|itemtype=TVShow|id=%s"},
+    {"webvideocollection",
+     true,
+     {},
+     "pam:Dash.Search.xex:scene=details|itemtype=WebVideoCollection|id=%s"},
+    {"picturelibrary", false, "dash:library:picture:%s", {}},
+    {"videolibrary", false, "dash:library:video:%s", {}},
+    {"musiclibrary", false, "dash:library:music:%s", {}},
+    {"networkhelp", true, "dash:networktroubleshooter", {}},
+    {"mediaoverlay",
+     false,
+     {},
+     "dash:pamoverlay:BuiltIn.Hub.xzp:overlay:Dash.MP.ContentExplorer.lex:"
+     "overlay:%s"},
+    {"http", true, {}, "app:58480880:http:%s"},
+    {"https", true, {}, "app:58480880:https:%s"},
+    {"microsoftstore", true, {}, "pam:Dash.MP.MicrosoftStore.lex:%s"},
+    {"newlivesignup", false, "app:FFFE07DE:%s", "app:FFFE07DE:%s"},
+    {"activityfeed",
+     false,
+     {},
+     "hub:root:Dash.MP.ContentExplorer.lex:ActivityFeed:%s"},
+    {"activitydetails",
+     false,
+     {},
+     "hub:root:Dash.MP.ContentExplorer.lex:ActivityDetails:%s"},
+    {"activityalerts",
+     false,
+     {},
+     "hub:root:Dash.MP.ContentExplorer.lex:ActivityAlerts:%s"},
+};
+
+// Schemes naming a title, which xam rewrites into title: or, for an app, app:
+// with the title ID. Only a rewritten URI or a privileged caller can name a
+// title other than an app.
+struct UriTitle {
+  std::string_view scheme;
+  uint32_t title_id;
+  bool is_app;
+};
+constexpr UriTitle kUriTitles[] = {
+    {"dash", kDashboardID, false},
+    {"avatareditor", 0x584D07D1, false},
+    {"zune", 0x5848085B, true},
+    {"newlivesignup", 0xFFFE07DE, false},
+};
+
+// The schemes a rewritten URI ends with.
+constexpr std::string_view kUriBaseSchemes[] = {"title", "app", "game", "sap"};
+
+// Rewrites |uri| as the console's xam does before opening it, at most ten
+// times. |privileged| becomes set once an alias is used.
+static X_HRESULT ResolveUri(std::string& uri, bool& privileged, bool live) {
+  for (int i = 0; i < 10; i++) {
+    const size_t colon = uri.find(':');
+    const std::string scheme = uri.substr(0, colon);
+    const std::string rest =
+        colon == std::string::npos ? std::string() : uri.substr(colon + 1);
+    if (scheme.empty() || scheme.size() >= 0x21) {
+      return X_E_INVALIDARG;
+    }
+    const auto is_scheme = [&](std::string_view s) {
+      return xe::utf8::equal_case(scheme, s);
+    };
+    if (std::ranges::any_of(kUriBaseSchemes, is_scheme)) {
+      return X_E_SUCCESS;
+    }
+    std::string rewritten;
+    if (const auto title = std::ranges::find_if(
+            kUriTitles, [&](const UriTitle& t) { return is_scheme(t.scheme); });
+        title != std::end(kUriTitles)) {
+      if (!title->is_app && !privileged) {
+        return X_E_ACCESS_DENIED;
+      }
+      rewritten = fmt::format("{}:{:08X}:{}", title->is_app ? "app" : "title",
+                              title->title_id, rest);
+    } else {
+      const auto alias = std::ranges::find_if(
+          kUriAliases, [&](const UriAlias& a) { return is_scheme(a.scheme); });
+      if (alias == std::end(kUriAliases)) {
+        return X_E_INVALIDARG;
+      }
+      if (!alias->is_public && !privileged) {
+        return X_E_ACCESS_DENIED;
+      }
+      privileged = true;
+      std::string_view format = alias->template_offline;
+      if (live && !alias->template_live.empty()) {
+        format = alias->template_live;
+      }
+      if (format.empty()) {
+        return X_E_INVALIDARG;
+      }
+      rewritten = std::string(format);
+      if (const size_t at = rewritten.find("%s"); at != std::string::npos) {
+        rewritten.replace(at, 2, rest);
+      }
+    }
+    if (rewritten.size() >= kMaxUriSize) {
+      return X_E_INSUFFICIENT_BUFFER;
+    }
+    uri = std::move(rewritten);
+  }
+  return X_E_INVALIDARG;
+}
+
+// The dashboard goes to the URI in its launch data on this.
+constexpr uint32_t kXNotificationDashboardNavigate = 0x80040021;
+// The kind of launch data that holds a URI for the dashboard to go to.
+constexpr uint32_t kNavigateLaunchDataKind = 0xC;
+
+static X_HRESULT LaunchUri(uint32_t user_index, const std::string& uri_in,
+                           uint32_t flags) {
+  // The console picks LIVE's templates when LIVE's logon succeeded.
+  const X_RESULT logon =
+      kernel_state()->app_manager()->DispatchMessageSync(0xFC, 0x58003, 0, 0);
+  const bool live = int32_t(logon) >= 0 && logon != 0x001510F1;
+  std::string uri = uri_in;
+  bool privileged = flags & 0x80000000;
+  if (const X_HRESULT result = ResolveUri(uri, privileged, live);
+      XFAILED(result)) {
+    XELOGW("XamLaunchURI: can't resolve {}: {:08X}", uri_in, result);
+    return result;
+  }
+  XELOGI("XamLaunchURI: {} resolves to {}", uri_in, uri);
+  // A title: URI goes to the handler the console's xam has for the title,
+  // with the rest of the URI. Only the dashboard's is here.
+  const std::string prefix = fmt::format("title:{:08X}:", kDashboardID);
+  if (!xe::utf8::starts_with_case(uri, prefix)) {
+    XELOGW("XamLaunchURI: not opening {}", uri);
+    return X_E_NOT_SUPPORTED;
+  }
+  // Only an alias or a privileged caller reaches the dashboard's handler.
+  if (!privileged) {
+    return X_E_ACCESS_DENIED;
+  }
+  // The dashboard's handler gives the running dashboard the URI as launch
+  // data with a notification when asked to with flag 4. Otherwise it launches
+  // the dashboard with that launch data.
+  if (kernel_state()->title_id() != kDashboardID || !(flags & 4)) {
+    XELOGW("XamLaunchURI: not launching the dashboard for {}", uri);
+    return X_E_NOT_SUPPORTED;
+  }
+  const std::string rest = uri.substr(prefix.size());
+  std::vector<uint8_t> data(kMaxUriSize, 0);
+  xe::store_and_swap<uint32_t>(data.data() + 4, kNavigateLaunchDataKind);
+  xe::store_and_swap<uint32_t>(data.data() + 8, user_index);
+  std::memcpy(data.data() + 0xC, rest.data(),
+              std::min(rest.size(), kMaxUriSize - 0xC - 1));
+  auto& loader_data =
+      kernel_state()->GetKernelModule<XamModule>("xam.xex")->loader_data();
+  loader_data.launch_data_present = true;
+  loader_data.launch_data = std::move(data);
+  kernel_state()->BroadcastNotification(
+      static_cast<XNotificationID>(kXNotificationDashboardNavigate),
+      (user_index << 16) | kNavigateLaunchDataKind);
+  return X_E_SUCCESS;
+}
+
+// The console's xam passes the URI to its own app, which works out the title
+// it's for through its alias table and opens it there.
+dword_result_t XamLaunchURI_entry(dword_t user_index, lpstring_t uri_ptr,
+                                  dword_t flags,
+                                  pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
+  if (!uri_ptr) {
+    return X_E_INVALIDARG;
+  }
+  const std::string uri = uri_ptr.value();
+  if (uri.empty() || uri.size() + 1 >= kMaxUriSize) {
+    return X_E_INVALIDARG;
+  }
+  const X_HRESULT result = LaunchUri(user_index, uri, flags);
+  if (overlapped_ptr) {
+    // The HRESULT is the extended error, as XMsg requests complete.
+    kernel_state()->CompleteOverlappedImmediateEx(
+        overlapped_ptr,
+        XFAILED(result) ? X_ERROR_FUNCTION_FAILED : X_ERROR_SUCCESS, result, 0);
+    // E_PENDING, as the console's xam returns once the request is sent.
+    return 0x8000000A;
+  }
+  return result;
+}
+DECLARE_XAM_EXPORT1(XamLaunchURI, kNone, kSketchy);
+
+// The URI to go back to, which the console keeps with whether a system title
+// pushed it.
+static std::string back_uri_;
+static bool back_uri_from_system_title_ = false;
+
+dword_result_t XamPushBackURI_entry(lpstring_t uri_ptr) {
+  if (!uri_ptr) {
+    back_uri_.clear();
+    back_uri_from_system_title_ = false;
+    return X_E_SUCCESS;
+  }
+  const std::string uri = uri_ptr.value();
+  if (uri.size() >= kMaxUriSize) {
+    back_uri_.clear();
+    back_uri_from_system_title_ = false;
+    return X_E_INSUFFICIENT_BUFFER;
+  }
+  back_uri_ = uri;
+  back_uri_from_system_title_ = IsSystemTitle(kernel_state()->title_id());
+  return X_E_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamPushBackURI, kNone, kImplemented);
+
+// The console returns the two words of the demand XamBeginDemand started, and
+// whether the second is set, which is whether there is one. None is started
+// here. No demand reads as 0xFE and 0. The dashboard goes home after a sign-in
+// when there's none.
+dword_result_t XamGetCurrentDemand_entry(lpdword_t first_ptr,
+                                         lpdword_t second_ptr) {
+  if (first_ptr) {
+    *first_ptr = 0xFE;
+  }
+  if (second_ptr) {
+    *second_ptr = 0;
+  }
+  return 0;
+}
+DECLARE_XAM_EXPORT1(XamGetCurrentDemand, kNone, kImplemented);
+
+// The console returns the title that ran before the running one. That's not
+// kept here, so it's none, as for the first title started.
+dword_result_t XamLoaderGetPriorTitleId_entry() { return 0; }
+DECLARE_XAM_EXPORT1(XamLoaderGetPriorTitleId, kNone, kSketchy);
 
 uint32_t XamAllocImpl(uint32_t flags, uint32_t size,
                       xe::be<uint32_t>* out_ptr) {

@@ -93,6 +93,12 @@ class Emulator {
   // Folder persistent internal emulator data is stored in.
   const std::filesystem::path& storage_root() const { return storage_root_; }
 
+  // Folder Tools > Install System Files puts the console's flash and system
+  // partitions in.
+  std::filesystem::path system_files_path() const {
+    return storage_root_ / "system";
+  }
+
   // Folder XeFu and its xbox.xex are in, shown to them as the system partition
   // Compatibility folder.
   std::filesystem::path xefu_path() const;
@@ -298,6 +304,10 @@ class Emulator {
   X_STATUS LaunchPath(const std::filesystem::path& path,
                       std::string_view package_path = {});
 
+  // The next launch plays the boot animation from the flash first, as at
+  // power-on.
+  void RequestBootAnimation() { boot_animation_requested_ = true; }
+
   // Launches a game from a .xex file by mounting the containing folder as if it
   // was an extracted STFS container.
   X_STATUS LaunchXexFile(const std::filesystem::path& path);
@@ -442,6 +452,28 @@ class Emulator {
     disc_provider_ = std::move(provider);
   }
 
+  // A release in the game library, which the dashboard lists as its games.
+  struct LibraryTitle {
+    uint32_t title_id = 0;
+    uint32_t version = 0;
+    std::string name;
+    std::filesystem::path path;
+    std::filesystem::path icon_path;
+    XContentType content_type = XContentType::kInvalid;
+  };
+  // The app replaces the list whenever its game library changes, so guest
+  // threads never read the library itself.
+  void SetLibraryTitles(std::vector<LibraryTitle> titles) {
+    auto snapshot =
+        std::make_shared<const std::vector<LibraryTitle>>(std::move(titles));
+    std::lock_guard lock(library_titles_mutex_);
+    library_titles_ = std::move(snapshot);
+  }
+  std::shared_ptr<const std::vector<LibraryTitle>> LibraryTitles() const {
+    std::lock_guard lock(library_titles_mutex_);
+    return library_titles_;
+  }
+
   using DiscRecorder =
       std::function<void(uint32_t title_id, const std::filesystem::path& path)>;
   void set_disc_recorder(DiscRecorder recorder) {
@@ -461,6 +493,27 @@ class Emulator {
 
   // The game can request another title to be loaded.
   const std::filesystem::path GetNewDiscPath(std::string window_message = "");
+
+  // The disc a system title finds in the drive, which goes in through its open
+  // tray. A launch starts with the drive empty.
+  struct InsertedDisc {
+    std::filesystem::path path;
+    uint32_t title_id = 0;
+    bool xbox_original = false;
+  };
+  std::optional<InsertedDisc> inserted_disc() const;
+  // Whether the running title sees the drive discs go in through, rather than
+  // its own disc or none.
+  bool UsesEmulatedDrive() const;
+  // Swaps the disc in the drive for one the app picks, leaving the drive empty
+  // when it picks none.
+  void ChangeDisc();
+  // Takes whatever disc is in the drive out of it.
+  void EjectDisc();
+  // Asked on the UI thread for the disc to put in the drive. An empty path
+  // leaves it empty.
+  using DiscPicker = std::function<std::filesystem::path()>;
+  void set_disc_picker(DiscPicker picker) { disc_picker_ = std::move(picker); }
 
   void WaitUntilExit();
 
@@ -535,11 +588,19 @@ class Emulator {
   // UI-thread half of CompleteLaunch, ends with the main thread suspended.
   X_STATUS PrepareLaunch(const std::filesystem::path& path,
                          const std::string_view module_path);
+  // Links the flash and loads xam's resources for a system title.
+  void PrepareSystemTitle();
+  // Plays the boot animation before the title and resumes the main thread
+  // once it ends, or returns false when it can't play.
+  bool PlayBootAnimation();
   // Forgets the title being launched, leaving none open.
   void ResetTitleState();
   // Sets the emulator up again after Shutdown(). Nothing runs without it, so a
   // failure is fatal.
   void SetupAgain();
+  // Mounts the disc image at |path| in the drive, or returns false when it
+  // can't.
+  bool InsertDisc(const std::filesystem::path& path);
   // Takes the original Xbox game XeFu runs out of the drive.
   void EjectXboxGame() {
     xbox_disc_path_.clear();
@@ -553,11 +614,16 @@ class Emulator {
   // shown to XeFu as the disc. Persists across launches from xefu_path.
   std::filesystem::path xbox_disc_path_;
   std::optional<vfs::XbeMetadata> xbox_game_;
+  mutable std::mutex inserted_disc_mutex_;
+  std::optional<InsertedDisc> inserted_disc_;
+  DiscPicker disc_picker_;
   // Set by the UI, cleared by whichever thread launches.
   mutable std::mutex running_xbe_mutex_;
   std::optional<vfs::XbeMetadata> running_xbe_;
   std::string missing_xefu_file_;
   DiscProvider disc_provider_;
+  mutable std::mutex library_titles_mutex_;
+  std::shared_ptr<const std::vector<LibraryTitle>> library_titles_;
   DiscRecorder disc_recorder_;
   std::filesystem::path storage_root_;
   std::filesystem::path content_root_;
@@ -593,6 +659,7 @@ class Emulator {
   bool paused_;
   bool restoring_;
   std::atomic<bool> relaunching_{false};
+  bool boot_animation_requested_ = false;
   // Held across a launch and a whole relaunch so title teardown waits for a
   // launch to finish. Recursive, as a relaunch launches under it.
   std::recursive_mutex launch_mutex_;

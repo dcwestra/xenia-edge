@@ -800,15 +800,7 @@ dword_result_t XamSwapDisc_entry(
   // Mount to Cdrom0 so the game: symlink points to the new disc
   auto mount_path = "\\Device\\Cdrom0";
 
-  // Unmount the current disc
-  if (filesystem->ResolvePath(mount_path) != NULL) {
-    // So nothing mounts from the disc between closing its packages and
-    // unmounting it.
-    auto global_lock = global_critical_region::AcquireDirect();
-    kernel_state()->content_manager()->ClosePackagesMountedFrom(
-        filesystem->GetDevice(mount_path));
-    filesystem->UnregisterDevice(mount_path);
-  }
+  kernel_state()->emulator()->EjectDisc();
 
   std::u16string text_message = xe::load_and_swap<std::u16string>(
       kernel_state()->memory()->TranslateVirtual(error_message->stringTextPtr));
@@ -967,11 +959,21 @@ DECLARE_XAM_EXPORT1(XamLoaderGetDvdTrayState, kNone, kImplemented);
 
 void XamLoaderGetMediaInfoEx_entry(lpdword_t media_type, lpdword_t title_id,
                                    lpdword_t unk3) {
+  uint32_t disc_type = X_DVD_DISC_STATE::XBOX_360_GAME_DISC;
+  uint32_t disc_title_id = 0;
+  // A game is in its own drive.
+  if (kernel_state()->emulator()->UsesEmulatedDrive()) {
+    const auto disc = kernel_state()->emulator()->inserted_disc();
+    disc_type = !disc                 ? X_DVD_DISC_STATE::NO_DISC
+                : disc->xbox_original ? X_DVD_DISC_STATE::XBOX_GAME_DISC
+                                      : X_DVD_DISC_STATE::XBOX_360_GAME_DISC;
+    disc_title_id = disc ? disc->title_id : 0;
+  }
   if (media_type) {
-    *media_type = X_DVD_DISC_STATE::XBOX_360_GAME_DISC;
+    *media_type = disc_type;
   }
   if (title_id) {
-    *title_id = 0;
+    *title_id = disc_title_id;
   }
   if (unk3) {
     *unk3 = 0;
@@ -1024,6 +1026,14 @@ static X_RESULT LaunchContentImage(uint32_t user_index,
                                    const std::string& xex_name,
                                    uint32_t flags) {
   auto content_manager = kernel_state()->content_manager();
+  // A game library title starts from where the library keeps it.
+  if (const auto path = content_manager->LibraryContentPath(content_data)) {
+    std::error_code ec;
+    if (!std::filesystem::exists(*path, ec)) {
+      return X_ERROR_PATH_NOT_FOUND;
+    }
+    LaunchHostTitle(*path, flags);
+  }
   uint64_t xuid = 0;
   X_RESULT result = ContentXuid(user_index, xuid);
   if (!result) {
@@ -1087,6 +1097,65 @@ dword_result_t XamContentGetMetaDataInternal_entry(
   return CompleteRequest(overlapped_ptr, result);
 }
 DECLARE_XAM_EXPORT1(XamContentGetMetaDataInternal, kContent, kImplemented);
+
+#pragma pack(push, 4)
+struct X_CONTENT_ATTRIBUTES {
+  xe::be<uint32_t> file_attributes;
+  xe::be<uint64_t> creation_time;
+  xe::be<uint64_t> last_access_time;
+  xe::be<uint64_t> last_write_time;
+  xe::be<uint64_t> size;
+};
+#pragma pack(pop)
+static_assert_size(X_CONTENT_ATTRIBUTES, 0x24);
+
+// The package's file attributes, times and size with any data files.
+static X_RESULT GetContentAttributes(uint64_t xuid,
+                                     const XCONTENT_AGGREGATE_DATA& data,
+                                     X_CONTENT_ATTRIBUTES* attributes_ptr) {
+  ContentAttributes attributes;
+  if (const X_RESULT result =
+          kernel_state()->content_manager()->GetContentAttributes(
+              xuid, data, &attributes)) {
+    return result;
+  }
+  attributes_ptr->file_attributes = vfs::kFileAttributeNormal;
+  attributes_ptr->creation_time = attributes.creation_time;
+  attributes_ptr->last_access_time = attributes.last_access_time;
+  attributes_ptr->last_write_time = attributes.last_write_time;
+  attributes_ptr->size = attributes.size;
+  return X_ERROR_SUCCESS;
+}
+
+dword_result_t XamContentGetAttributes_entry(
+    dword_t user_index, lpvoid_t content_data_ptr,
+    pointer_t<X_CONTENT_ATTRIBUTES> attributes_ptr,
+    pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
+  if (!content_data_ptr || !attributes_ptr) {
+    return CompleteRequest(overlapped_ptr, X_ERROR_INVALID_PARAMETER);
+  }
+  uint64_t xuid = 0;
+  X_RESULT result = ContentXuid(user_index, xuid);
+  if (!result) {
+    result = GetContentAttributes(xuid, *content_data_ptr.as<XCONTENT_DATA*>(),
+                                  attributes_ptr);
+  }
+  return CompleteRequest(overlapped_ptr, result);
+}
+DECLARE_XAM_EXPORT1(XamContentGetAttributes, kContent, kImplemented);
+
+dword_result_t XamContentGetAttributesInternal_entry(
+    lpvoid_t content_data_ptr, pointer_t<X_CONTENT_ATTRIBUTES> attributes_ptr,
+    pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
+  if (!content_data_ptr || !attributes_ptr) {
+    return CompleteRequest(overlapped_ptr, X_ERROR_INVALID_PARAMETER);
+  }
+  return CompleteRequest(
+      overlapped_ptr,
+      GetContentAttributes(0, *content_data_ptr.as<XCONTENT_AGGREGATE_DATA*>(),
+                           attributes_ptr));
+}
+DECLARE_XAM_EXPORT1(XamContentGetAttributesInternal, kContent, kImplemented);
 
 dword_result_t XamContentLaunchImageInternalEx_entry(lpvoid_t content_data_ptr,
                                                      lpstring_t xex_name,

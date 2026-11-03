@@ -12,7 +12,9 @@
 #include "xenia/emulator.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstring>
+#include <utility>
 
 #if !XE_PLATFORM_WIN32
 #include <dlfcn.h>
@@ -48,12 +50,14 @@
 #include "xenia/kernel/title_id_utils.h"
 #include "xenia/kernel/user_module.h"
 #include "xenia/kernel/xam/achievement_manager.h"
+#include "xenia/kernel/xam/content_manager.h"
 #include "xenia/kernel/xam/ui/disc_swap_ui.h"
 #include "xenia/kernel/xam/xam_module.h"
 #include "xenia/kernel/xam/xdbf/spa_info.h"
 #include "xenia/kernel/xbdm/xbdm_module.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_module.h"
 #include "xenia/kernel/xconfig.h"
+#include "xenia/kernel/xfile.h"
 #include "xenia/kernel/xthread.h"
 #include "xenia/memory.h"
 #include "xenia/ui/file_picker.h"
@@ -69,10 +73,13 @@
 #include "xenia/vfs/devices/xcontent_container_device.h"
 #include "xenia/vfs/entry.h"
 #include "xenia/vfs/file.h"
+#include "xenia/vfs/iso_metadata.h"
+#include "xenia/vfs/stfs_metadata.h"
 #include "xenia/vfs/virtual_file_system.h"
 #include "xenia/vfs/xbe_metadata.h"
 #include "xenia/vfs/xbox_original_data.h"
 #include "xenia/vfs/xex_metadata.h"
+#include "xenia/vfs/zar_metadata.h"
 
 #if XE_ARCH_AMD64
 #include "xenia/cpu/backend/x64/x64_backend.h"
@@ -297,6 +304,7 @@ void Emulator::Shutdown() {
   title_version_.clear();
   game_info_database_.reset();
   paused_ = false;
+  boot_animation_requested_ = false;
 
   XELOGI("Emulator::Shutdown: teardown complete");
 }
@@ -750,6 +758,11 @@ X_STATUS Emulator::LaunchPath(const std::filesystem::path& path,
   }
   // A file an earlier launch missed says nothing about this one.
   missing_xefu_file_.clear();
+  // The drive starts empty.
+  {
+    std::lock_guard<std::mutex> lock(inserted_disc_mutex_);
+    inserted_disc_.reset();
+  }
 
   if (!package_path.empty()) {
     return LaunchDiscPackage(path, package_path);
@@ -833,6 +846,16 @@ X_STATUS Emulator::LaunchXexFile(const std::filesystem::path& path) {
   // Launch the game.
   auto fs_path = fmt::format("{}\\", kDefaultGameSymbolicLink) +
                  xe::path_to_utf8(file_name);
+  // A folder holding its own xam is the title's flash even with system files
+  // installed.
+  std::string package_root;
+  if (file_system_->FindSymbolicLink(kDefaultGameSymbolicLink, package_root) &&
+      (file_system_->ResolvePath(
+           fmt::format("{}\\xam.xex", kDefaultGameSymbolicLink)) ||
+       file_system_->ResolvePath(
+           fmt::format("{}\\$flash_xam.xex", kDefaultGameSymbolicLink)))) {
+    file_system_->RegisterSymbolicLink("\\SystemRoot", package_root);
+  }
   X_STATUS result = CompleteLaunch(path, fs_path);
 
   if (XFAILED(result)) {
@@ -840,34 +863,7 @@ X_STATUS Emulator::LaunchXexFile(const std::filesystem::path& path) {
   }
 
   SetDeploymentType(XDeploymentType::kInstalledToHDD);
-
-  if (!kernel::IsSystemTitle(kernel_state_->title_id())) {
-    return result;
-  }
-
-  const std::string mount_path =
-      utf8::find_base_guest_path(kernel_state_->GetExecutableModule()->path());
-
-  // System related symlinks. This should point to dashboard location in the
-  // future.
-  file_system_->RegisterSymbolicLink("\\SystemRoot", mount_path);
-
-  auto module = kernel_state_->LoadUserModule("xam.xex");
-
-  if (!module) {
-    module = kernel_state_->LoadUserModule("$flash_xam.xex");
-  }
-
-  // The title is running by now, so a failure here doesn't fail the launch.
-  if (module) {
-    const X_STATUS xam_result =
-        kernel_state_->FinishLoadingUserModule(module, false);
-    if (XFAILED(xam_result)) {
-      XELOGE("Failed to load the system xam module: {:08X}", xam_result);
-    }
-  }
-
-  return X_STATUS_SUCCESS;
+  return result;
 }
 
 X_STATUS Emulator::LaunchDiscImage(const std::filesystem::path& path) {
@@ -888,6 +884,120 @@ std::filesystem::path Emulator::xefu_path() const {
 void Emulator::InsertXboxGame(const std::filesystem::path& path) {
   xbox_disc_path_ = path;
   xbox_game_ = vfs::ExtractXbeMetadata(path);
+}
+
+// The drive's device.
+constexpr std::string_view kDiscDrivePath = "\\Device\\Cdrom0";
+
+std::optional<Emulator::InsertedDisc> Emulator::inserted_disc() const {
+  std::lock_guard<std::mutex> lock(inserted_disc_mutex_);
+  return inserted_disc_;
+}
+
+bool Emulator::UsesEmulatedDrive() const {
+  if (!kernel::IsSystemTitle(kernel_state_->title_id())) {
+    return false;
+  }
+  // A system title launched from a disc keeps that disc.
+  const bool drive_empty = !file_system_->GetDevice(kDiscDrivePath);
+  std::lock_guard<std::mutex> lock(inserted_disc_mutex_);
+  return inserted_disc_ || drive_empty;
+}
+
+void Emulator::ChangeDisc() {
+  EjectDisc();
+  if (!disc_picker_ || !display_window_) {
+    return;
+  }
+  // The fiber parks while the picker is up, so the guest threads sharing its
+  // CPU keep running.
+  std::filesystem::path path;
+  xe::threading::Fence fence;
+  if (!display_window_->app_context().CallInUIThread([this, &path, &fence]() {
+        path = disc_picker_();
+        fence.Signal();
+      })) {
+    return;
+  }
+  kernel::GuestScheduler::WaitOnFence(fence);
+  if (!path.empty()) {
+    InsertDisc(path);
+  }
+}
+
+void Emulator::EjectDisc() {
+  {
+    std::lock_guard<std::mutex> lock(inserted_disc_mutex_);
+    inserted_disc_.reset();
+  }
+  // So nothing opens or mounts from the disc while it goes away.
+  auto global_lock = global_critical_region::AcquireDirect();
+  const vfs::Device* device = file_system_->GetDevice(kDiscDrivePath);
+  if (!device) {
+    return;
+  }
+  for (const auto& file :
+       kernel_state_->object_table()->GetObjectsByType<kernel::XFile>(
+           kernel::XObject::Type::File)) {
+    if (file->entry()->device() == device) {
+      file->ReleaseHandle();
+    }
+  }
+  kernel_state_->content_manager()->ClosePackagesMountedFrom(device);
+  file_system_->UnregisterDevice(kDiscDrivePath);
+}
+
+bool Emulator::InsertDisc(const std::filesystem::path& path) {
+  auto device = CreateVfsDevice(path, kDiscDrivePath);
+  if (!device || !device->Initialize()) {
+    XELOGE("Unable to put {} in the drive, it is an unsupported format",
+           xe::strip_pii(xe::path_to_utf8(path)));
+    return false;
+  }
+  InsertedDisc disc{path};
+  std::optional<vfs::XbeMetadata> xbe;
+  switch (GetFileSignature(path)) {
+    case FileSignatureType::XISO:
+      if (auto xex = vfs::ExtractIsoMetadata(path)) {
+        disc.title_id = xex->title_id;
+      } else {
+        xbe = vfs::ExtractXbeMetadata(path);
+      }
+      break;
+    case FileSignatureType::ZAR:
+      if (auto xex = vfs::ExtractZarMetadata(path)) {
+        disc.title_id = xex->title_id;
+      }
+      break;
+    case FileSignatureType::LIVE:
+    case FileSignatureType::CON:
+    case FileSignatureType::PIRS:
+      if (auto stfs = vfs::ExtractStfsMetadata(path)) {
+        disc.title_id = stfs->title_id;
+        // An original Xbox package names the game its executable is.
+        if (stfs->content_type == uint32_t(XContentType::kXboxTitle)) {
+          xbe = vfs::ExtractXbeMetadata(path);
+        }
+      }
+      break;
+    case FileSignatureType::XBE:
+      xbe = vfs::ExtractXbeMetadata(path);
+      break;
+    default:
+      if (auto xex = vfs::ExtractXexMetadata(path)) {
+        disc.title_id = xex->title_id;
+      }
+      break;
+  }
+  if (xbe) {
+    disc.title_id = xbe->title_id;
+    disc.xbox_original = true;
+  }
+  file_system_->RegisterDevice(std::move(device));
+  XELOGI("Put {:08X} in the drive", disc.title_id);
+  std::lock_guard<std::mutex> lock(inserted_disc_mutex_);
+  inserted_disc_ = std::move(disc);
+  return true;
 }
 
 std::optional<vfs::XbeMetadata> Emulator::running_xbe() const {
@@ -2356,6 +2466,7 @@ static std::string format_version(xex2_version version) {
 
 X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
                                   const std::string_view module_path) {
+  const bool boot_animation = std::exchange(boot_animation_requested_, false);
   // The window icon and on_launch listeners need the UI thread.
   X_STATUS result = X_STATUS_UNSUCCESSFUL;
   display_window_->app_context().CallInUIThreadSynchronous(
@@ -2373,10 +2484,110 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
     module->xex_module()->PrecompileStaticInitializers();
   }
 
+  // A dashboard asks for xam's resources as soon as it starts.
+  if (kernel::IsSystemTitle(kernel_state_->title_id())) {
+    PrepareSystemTitle();
+  }
+
   // Drops only the launch suspend, so a debugger break still holds.
-  main_thread_->Resume();
+  if (!boot_animation || !PlayBootAnimation()) {
+    main_thread_->Resume();
+  }
 
   return X_STATUS_SUCCESS;
+}
+
+void Emulator::PrepareSystemTitle() {
+  // Without installed system files the title's folder stands in for the flash.
+  std::string system_root;
+  if (!file_system_->FindSymbolicLink("\\SystemRoot", system_root)) {
+    file_system_->RegisterSymbolicLink(
+        "\\SystemRoot", utf8::find_base_guest_path(
+                            kernel_state_->GetExecutableModule()->path()));
+  }
+  // xam links media: to the flash, which holds the system fonts.
+  file_system_->RegisterSymbolicLink("media:", "\\SystemRoot");
+
+  // Only its resources are used, through the resource locators.
+  auto module = kernel_state_->LoadUserModule("\\SystemRoot\\xam.xex");
+  if (!module) {
+    module = kernel_state_->LoadUserModule("\\SystemRoot\\$flash_xam.xex");
+  }
+  // A failure here doesn't fail the title.
+  if (module) {
+    const X_STATUS result =
+        kernel_state_->FinishLoadingUserModule(module, false);
+    if (XFAILED(result)) {
+      XELOGE("Failed to load the system xam module: {:08X}", result);
+    }
+  }
+}
+
+bool Emulator::PlayBootAnimation() {
+  auto title = kernel_state_->GetExecutableModule();
+  // A launched boot animation is the title itself.
+  if (title->is_dll_module() && !title->entry_point()) {
+    return false;
+  }
+
+  auto animation =
+      kernel_state_->LoadUserModule("\\Device\\Flash\\bootanim.xex");
+  if (!animation) {
+    XELOGE("The boot animation isn't in the system files");
+    return false;
+  }
+  if (XFAILED(kernel_state_->FinishLoadingUserModule(animation))) {
+    XELOGE("Failed to initialize the boot animation");
+    kernel_state_->UnloadUserModule(animation);
+    return false;
+  }
+  auto xboxkrnl =
+      kernel_state_->GetKernelModule<kernel::xboxkrnl::XboxkrnlModule>(
+          "xboxkrnl.exe");
+  auto animation_thread =
+      xboxkrnl->StartBootAnimation(animation, /*main_thread=*/false);
+  if (!animation_thread) {
+    kernel_state_->UnloadUserModule(animation);
+    return false;
+  }
+
+  uint32_t logo = 0;
+  title->GetOptHeader(XEX_HEADER_XBOX360_LOGO, &logo);
+  const uint32_t first_frame = xe::logging::GetFrameNumber();
+  // Does what xam's title startup routine does before the entry point.
+  auto loader = kernel::object_ref<kernel::XHostThread>(new kernel::XHostThread(
+      kernel_state_.get(), 128 * 1024, 0,
+      [this, xboxkrnl, animation, animation_thread, logo, first_frame,
+       main_thread = main_thread_]() {
+        // Its startup clears an end request made before its first frame.
+        uint64_t timeout = static_cast<uint64_t>(-100000ll);
+        while (xe::logging::GetFrameNumber() == first_frame &&
+               animation_thread->Wait(3, 1, 0, &timeout) == X_STATUS_TIMEOUT) {
+        }
+        if (logo) {
+          auto header =
+              memory_->TranslateVirtual<const xex2_opt_ms_logo*>(logo);
+          constexpr uint32_t kLogoOffset = offsetof(xex2_opt_ms_logo, logo);
+          if (header->section_size > kLogoOffset) {
+            xboxkrnl->SetBootAnimationLogo(logo + kLogoOffset,
+                                           header->logo_size);
+          }
+        }
+        xboxkrnl->EndBootAnimation(0);
+        kernel_state_->UnloadUserModule(animation);
+        main_thread->Resume();
+        return 0;
+      },
+      0, true));
+  loader->set_name("Boot Animation Loader");
+  if (XFAILED(loader->Create())) {
+    XELOGE("Could not create the boot animation loader thread");
+    animation_thread->Terminate(0);
+    kernel_state_->UnloadUserModule(animation);
+    return false;
+  }
+  animation_thread->Resume();
+  return true;
 }
 
 void Emulator::SetupAgain() {
@@ -2417,14 +2628,26 @@ X_STATUS Emulator::PrepareLaunch(const std::filesystem::path& path,
     file_system_->RegisterDevice(std::move(content_device));
   }
 
-  // System extension modules such as the extra AV codecs.
-  const auto sysext_path = storage_root_ / "sysext";
-  if (std::filesystem::is_directory(sysext_path)) {
-    auto sysext_device = std::make_unique<vfs::HostPathDevice>(
-        "\\Device\\Harddisk0\\SystemExtPartition", sysext_path, true);
-    if (sysext_device->Initialize()) {
-      file_system_->RegisterDevice(std::move(sysext_device));
+  // The files of an installed system update.
+  for (const auto& [mount_path, folder] :
+       {std::pair{"\\Device\\Flash", "flash"},
+        std::pair{"\\Device\\Harddisk0\\SystemExtPartition", "sysext"},
+        std::pair{"\\Device\\Harddisk0\\SystemAuxPartition", "sysaux"}}) {
+    const auto host_path = system_files_path() / folder;
+    if (!std::filesystem::is_directory(host_path)) {
+      continue;
     }
+    auto device =
+        std::make_unique<vfs::HostPathDevice>(mount_path, host_path, true);
+    if (device->Initialize()) {
+      file_system_->RegisterDevice(std::move(device));
+    }
+  }
+  // \SystemRoot is the flash, where titles find the system fonts.
+  std::string system_root;
+  if (file_system_->GetDevice("\\Device\\Flash") &&
+      !file_system_->FindSymbolicLink("\\SystemRoot", system_root)) {
+    file_system_->RegisterSymbolicLink("\\SystemRoot", "\\Device\\Flash");
   }
 
   // Setup NullDevices for raw HDD partition accesses

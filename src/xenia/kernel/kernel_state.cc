@@ -23,6 +23,7 @@
 #include "xenia/kernel/nui/nui_hud.h"
 #include "xenia/kernel/nui/nui_identity.h"
 #include "xenia/kernel/nui/pscam_device.h"
+#include "xenia/kernel/title_id_utils.h"
 #include "xenia/kernel/user_module.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xam/xam_system_link.h"
@@ -574,6 +575,16 @@ object_ref<XThread> KernelState::LaunchModule(object_ref<UserModule> module) {
 
   SetExecutableModule(module);
   XELOGI("KernelState: Launching module...");
+
+  // The boot animation is a DLL with no entry point.
+  if (module->is_dll_module() && !module->entry_point()) {
+    auto thread = GetKernelModule<xboxkrnl::XboxkrnlModule>("xboxkrnl.exe")
+                      ->StartBootAnimation(module, /*main_thread=*/true);
+    if (thread) {
+      emulator()->processor()->PreLaunch();
+    }
+    return thread;
+  }
 
   // Create a thread to run in.
   // We start suspended so we can run the debugger prep.
@@ -1182,6 +1193,13 @@ void KernelState::RegisterNotifyListener(XNotifyListener* listener) {
     listener->EnqueueNotification(kXNotificationSystemUI,
                                   xam_state()->IsUIActive());
     listener->EnqueueNotification(kXNotificationSystemSignInChanged, 1);
+    // Sent when a storage device comes or goes. The dashboard rescans its
+    // content on it. Content can change on the host between runs so the
+    // dashboard gets one at start.
+    if (title_id() == kDashboardID) {
+      listener->EnqueueNotification(kXNotificationSystemStorageDevicesChanged,
+                                    0);
+    }
   }
   if (!has_notified_live_startup_ && listener->mask() & kXNotifyLive) {
     has_notified_live_startup_ = true;

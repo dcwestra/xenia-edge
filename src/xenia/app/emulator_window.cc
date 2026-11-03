@@ -18,6 +18,7 @@
 #include "xenia/ui/install_progress_dialog_wx.h"
 #include "xenia/ui/profile_editor_dialog_wx.h"
 #include "xenia/ui/quick_settings_dialog_wx.h"
+#include "xenia/ui/system_files_installer_wx.h"
 #include "xenia/ui/windowed_app_wx.h"
 
 #include <algorithm>
@@ -166,6 +167,7 @@ extern char** environ;
 #include <wx/msgdlg.h>
 #include <wx/mstream.h>
 #include <wx/panel.h>
+#include <wx/progdlg.h>
 #include <wx/settings.h>
 #include <wx/slider.h>
 #include <wx/statbmp.h>
@@ -346,7 +348,7 @@ bool IsLaunchOnlyArg(std::string_view arg) {
   for (const std::string_view name :
        {"--target=", "--launch_module=", "--launch_flags=", "--launch_data=",
         "--launch_xbox_disc=", "--launch_package=",
-        "--slot_bindings_passthrough="}) {
+        "--slot_bindings_passthrough=", "--boot_animation="}) {
     if (xe::utf8::starts_with(arg, name)) {
       return true;
     }
@@ -677,10 +679,24 @@ void EmulatorWindow::ShutdownGraphicsSystemPresenterPainting() {
   presenter_painting_ = nullptr;
 }
 
+void EmulatorWindow::PublishLibraryTitles() {
+  std::vector<Emulator::LibraryTitle> titles;
+  for (const auto& entry : game_library_->entries()) {
+    if (entry.paths.empty()) {
+      continue;
+    }
+    titles.push_back(
+        {entry.title_id, entry.version, entry.name, entry.default_path().path,
+         game_library_->IconPath(entry.key()), entry.content_type});
+  }
+  emulator_->SetLibraryTitles(std::move(titles));
+}
+
 void EmulatorWindow::InitializeGameLibrary() {
   const auto library_root = emulator_->storage_root() / "library";
 
   game_library_ = std::make_unique<GameLibrary>(library_root);
+  game_library_->set_changed_callback([this]() { PublishLibraryTitles(); });
   game_library_->Load();
 
   // The files are read off the UI thread, and each result is recorded back on
@@ -982,6 +998,10 @@ void EmulatorWindow::OnEmulatorInitialized() {
   emulator_->set_on_disc_swap([this](uint8_t) {
     app_context_.CallInUIThread([this]() { UpdateTitle(); });
   });
+
+  // The dashboard's open tray asks for a disc the way File > Open asks for a
+  // title.
+  emulator_->set_disc_picker([this]() { return PickTitleFile(); });
 }
 
 void EmulatorWindow::EmulatorWindowListener::OnClosing(ui::UIEvent& e) {
@@ -1055,6 +1075,11 @@ bool EmulatorWindow::Initialize() {
                              std::bind(&EmulatorWindow::FileOpen, this));
       file_open_menu_item_ = open_item.get();
       file_menu->AddChild(std::move(open_item));
+      auto start_dashboard_item =
+          WxMenuItem::Create(MenuItem::Type::kString, _("Start Dashboard"),
+                             std::bind(&EmulatorWindow::StartDashboard, this));
+      file_start_dashboard_menu_item_ = start_dashboard_item.get();
+      file_menu->AddChild(std::move(start_dashboard_item));
       auto add_games_item =
           WxMenuItem::Create(MenuItem::Type::kString, _("&Add Games..."),
                              std::bind(&EmulatorWindow::FileAddGames, this));
@@ -1147,6 +1172,9 @@ bool EmulatorWindow::Initialize() {
       tools_menu->AddChild(
           WxMenuItem::Create(MenuItem::Type::kString, _("&Install Content..."),
                              std::bind(&EmulatorWindow::InstallContent, this)));
+      tools_menu->AddChild(WxMenuItem::Create(
+          MenuItem::Type::kString, _("Install System Files..."),
+          std::bind(&EmulatorWindow::InstallSystemFiles, this)));
     }
     tools_menu_ = tools_menu.get();
     main_menu->AddChild(std::move(tools_menu));
@@ -1993,8 +2021,13 @@ void EmulatorWindow::FileDrop(const std::filesystem::path& path) {
 }
 
 void EmulatorWindow::FileOpen() {
-  std::filesystem::path path;
+  const std::filesystem::path path = PickTitleFile();
+  if (!path.empty()) {
+    RunTitle(path);
+  }
+}
 
+std::filesystem::path EmulatorWindow::PickTitleFile() {
   auto file_picker = xe::ui::FilePicker::Create();
   file_picker->set_mode(ui::FilePicker::Mode::kOpen);
   file_picker->set_type(ui::FilePicker::Type::kFile);
@@ -2018,15 +2051,19 @@ void EmulatorWindow::FileOpen() {
       //{"Content Package (*.xcp)", "*.xcp" },
       {"All Files", "*"},
   });
-  if (file_picker->Show(window_.get())) {
-    auto selected_files = file_picker->selected_files();
-    if (!selected_files.empty()) {
-      path = selected_files[0];
-    }
-    if (!path.empty()) {
-      RunTitle(path);
-    }
+  if (!file_picker->Show(window_.get()) ||
+      file_picker->selected_files().empty()) {
+    return {};
   }
+  return file_picker->selected_files().front();
+}
+
+void EmulatorWindow::StartDashboard() {
+  RunTitle(GetInstalledDashboardPath(), /*boot_animation=*/true);
+}
+
+std::filesystem::path EmulatorWindow::GetInstalledDashboardPath() const {
+  return emulator_->system_files_path() / "flash" / "dash.xex";
 }
 
 void EmulatorWindow::FileAddGames() {
@@ -2307,6 +2344,7 @@ void EmulatorWindow::ApplyContentVisibility() {
     file_stop_menu_item_->SetEnabled(title_open);
   }
   UpdateAddGamesMenuState();
+  UpdateStartDashboardMenuState();
   // Subsystem-affecting cvars and tools (install/zar) only make sense between
   // launches.
   if (config_menu_) {
@@ -2418,6 +2456,75 @@ void EmulatorWindow::InstallContent() {
     }).detach();
   });
   dlg.ShowModal();
+}
+
+void EmulatorWindow::InstallSystemFiles() {
+  auto file_picker = xe::ui::FilePicker::Create();
+  file_picker->set_mode(ui::FilePicker::Mode::kOpen);
+  file_picker->set_type(ui::FilePicker::Type::kFile);
+  file_picker->set_title(_("Select a USB System Update").utf8_string());
+  file_picker->set_extensions({
+      {"Zip Archives (*.zip)", "*.zip"},
+      {"All Files", "*"},
+  });
+  if (!file_picker->Show(window_.get()) ||
+      file_picker->selected_files().empty()) {
+    return;
+  }
+  const auto zip_path = file_picker->selected_files().front();
+
+  auto* wx_window = dynamic_cast<ui::WxWindow*>(window_.get());
+  ui::SystemFilesResult result;
+  {
+    wxProgressDialog progress(_("Install System Files"),
+                              _("Installing the system files..."), 100,
+                              wx_window ? wx_window->frame() : nullptr,
+                              wxPD_APP_MODAL | wxPD_CAN_ABORT | wxPD_AUTO_HIDE);
+    result = ui::InstallSystemFiles(
+        zip_path, emulator_->system_files_path(),
+        [&progress](size_t done, size_t total) {
+          return progress.Update(int(done * 100 / total));
+        });
+  }
+  UpdateStartDashboardMenuState();
+
+  switch (result) {
+    case ui::SystemFilesResult::kSuccess:
+      ShowWindowMessage(
+          window_.get(), _("System files installed"),
+          wxString::Format(_("The system files are installed in:\n%s"),
+                           wxString::FromUTF8(xe::path_to_utf8(
+                               emulator_->system_files_path()))),
+          wxICON_INFORMATION);
+      break;
+    case ui::SystemFilesResult::kCancelled:
+      break;
+    case ui::SystemFilesResult::kNotSystemUpdate:
+      ShowWindowMessage(window_.get(), _("Install System Files"),
+                        _("This file isn't a USB system update."),
+                        wxICON_WARNING);
+      break;
+    case ui::SystemFilesResult::kReadFailed:
+      ShowWindowMessage(window_.get(), _("Install System Files"),
+                        _("Failed to read the system update."), wxICON_ERROR);
+      break;
+    case ui::SystemFilesResult::kWriteFailed:
+      ShowWindowMessage(window_.get(), _("Install System Files"),
+                        _("Failed to write the system files."), wxICON_ERROR);
+      break;
+    case ui::SystemFilesResult::kRestoreFailed:
+      ShowWindowMessage(
+          window_.get(), _("Install System Files"),
+          wxString::Format(
+              _("The previous system files couldn't be put back in place. "
+                "Move their folders back or delete them to install again. "
+                "They are in:\n%s"),
+              wxString::FromUTF8(
+                  xe::path_to_utf8(ui::GetUnrestoredSystemFilesPath(
+                      emulator_->system_files_path())))),
+          wxICON_ERROR);
+      break;
+  }
 }
 
 void EmulatorWindow::ShowContentDirectory() {
@@ -2547,6 +2654,16 @@ void EmulatorWindow::UpdateAddGamesMenuState() {
   }
   const bool title_open = emulator_ && emulator_->is_title_open();
   file_add_games_menu_item_->SetEnabled(!title_open);
+}
+
+void EmulatorWindow::UpdateStartDashboardMenuState() {
+  if (!file_start_dashboard_menu_item_ || !emulator_) {
+    return;
+  }
+  std::error_code ec;
+  file_start_dashboard_menu_item_->SetEnabled(
+      !emulator_->is_title_open() &&
+      std::filesystem::exists(GetInstalledDashboardPath(), ec));
 }
 
 void EmulatorWindow::PopulateProfileMenu(ui::MenuItem* parent) {
@@ -3731,7 +3848,7 @@ bool EmulatorWindow::SpawnEmulatorProcess(const std::vector<std::string>& args,
 }
 
 void EmulatorWindow::LaunchTitleInNewProcess(
-    const std::filesystem::path& path_to_file) {
+    const std::filesystem::path& path_to_file, bool boot_animation) {
   // Verify the file exists
   if (!path_to_file.empty() && !std::filesystem::exists(path_to_file)) {
     XELOGE("Cannot launch title - file not found: {}",
@@ -3740,8 +3857,11 @@ void EmulatorWindow::LaunchTitleInNewProcess(
   }
 
   // Tell game process to return to UI when it exits
-  if (!SpawnEmulatorProcess({"--return_to_ui=true"},
-                            xe::path_to_utf8(path_to_file))) {
+  std::vector<std::string> args = {"--return_to_ui=true"};
+  if (boot_animation) {
+    args.push_back("--boot_animation=true");
+  }
+  if (!SpawnEmulatorProcess(args, xe::path_to_utf8(path_to_file))) {
     return;
   }
 
@@ -3753,8 +3873,8 @@ void EmulatorWindow::LaunchTitleInNewProcess(
   app_context_.QuitFromUIThread();
 }
 
-xe::X_STATUS EmulatorWindow::RunTitle(
-    const std::filesystem::path& path_to_file) {
+xe::X_STATUS EmulatorWindow::RunTitle(const std::filesystem::path& path_to_file,
+                                      bool boot_animation) {
   std::error_code ec = {};
   bool titleExists = std::filesystem::exists(path_to_file, ec);
 
@@ -3885,7 +4005,7 @@ xe::X_STATUS EmulatorWindow::RunTitle(
     // cvars.
     config::ReloadConfig();
     config::LoadGameConfigForFile(abs_path);
-    LaunchTitleInNewProcess(abs_path);
+    LaunchTitleInNewProcess(abs_path, boot_animation);
     return X_STATUS_SUCCESS;
   }
 
@@ -3905,7 +4025,7 @@ xe::X_STATUS EmulatorWindow::RunTitle(
       (!last_apu.empty() && last_apu != cvars::apu)) {
     XELOGI("RunTitle: backend changed (gpu {} -> {}, apu {} -> {}); respawning",
            last_gpu, cvars::gpu, last_apu, cvars::apu);
-    LaunchTitleInNewProcess(abs_path);
+    LaunchTitleInNewProcess(abs_path, boot_animation);
     return X_STATUS_SUCCESS;
   }
   if (auto status = emulator_->SetupSubsystems(); XFAILED(status)) {
@@ -3933,6 +4053,9 @@ xe::X_STATUS EmulatorWindow::RunTitle(
   // toolbar/render transition paints immediately. Post-launch work goes
   // back to the UI thread via CallAfter.
   auto* emulator = emulator_;
+  if (boot_animation) {
+    emulator->RequestBootAnimation();
+  }
   std::thread([this, emulator, abs_path]() {
     auto result = emulator->LaunchPath(abs_path);
     if (result) {
