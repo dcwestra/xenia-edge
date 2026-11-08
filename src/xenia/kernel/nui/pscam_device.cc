@@ -360,6 +360,7 @@ void PsCamDevice::WorkerMain() {
   // Without the sensor's color, a gray picture at its rate.
   auto next_color = clock::now();
   std::vector<uint8_t> depth;
+  std::vector<uint16_t> raw_depth;
   std::vector<uint8_t> color;
   std::vector<uint8_t> sensor_color;
   while (true) {
@@ -399,22 +400,14 @@ void PsCamDevice::WorkerMain() {
         if (cvars::kinect_packed_depth) {
           depth = frame_;
         } else {
-          // Big-endian 16-bit values, from the sensor's big-endian 11-bit
-          // bitstream.
-          depth.resize(KinectCamera::kDepthWidth * KinectCamera::kDepthHeight *
-                       2);
-          uint32_t bits = 0;
-          uint32_t bit_count = 0;
-          size_t in = 0;
-          for (size_t out = 0; out < depth.size(); out += 2) {
-            while (bit_count < 11) {
-              bits = (bits << 8) | frame_[in++];
-              bit_count += 8;
-            }
-            bit_count -= 11;
-            const uint16_t value = uint16_t((bits >> bit_count) & 0x7FF);
-            depth[out] = uint8_t(value >> 8);
-            depth[out + 1] = uint8_t(value);
+          // Big-endian 16-bit values.
+          raw_depth.resize(KinectCamera::kDepthWidth *
+                           KinectCamera::kDepthHeight);
+          UnpackKinectDepth(frame_.data(), raw_depth.data());
+          depth.resize(raw_depth.size() * 2);
+          for (size_t i = 0; i < raw_depth.size(); ++i) {
+            depth[i * 2] = uint8_t(raw_depth[i] >> 8);
+            depth[i * 2 + 1] = uint8_t(raw_depth[i]);
           }
         }
       }

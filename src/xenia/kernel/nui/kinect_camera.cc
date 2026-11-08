@@ -230,6 +230,51 @@ uint16_t KinectRawDepthToMillimeters(uint32_t raw) {
   return uint16_t(meters * 1000.0 + 0.5);
 }
 
+uint16_t MillimetersToKinectRawDepth(uint32_t millimeters) {
+  constexpr uint16_t kNoReading = 2047;
+  if (!millimeters) {
+    return kNoReading;
+  }
+  const double raw =
+      2842.5 * (std::atan(double(millimeters) / 123.6) - 1.1863) + 0.5;
+  // Nearer than raw 0 reaches, the sensor sees nothing either.
+  if (raw < 0.0 || raw >= 1084.0) {
+    return kNoReading;
+  }
+  const uint16_t value = uint16_t(raw);
+  return KinectRawDepthToMillimeters(value) ? value : kNoReading;
+}
+
+void PackKinectDepth(const uint16_t* raw, uint8_t* packed) {
+  constexpr size_t kPixels =
+      size_t(KinectCamera::kDepthWidth) * KinectCamera::kDepthHeight;
+  uint32_t bits = 0;
+  uint32_t bit_count = 0;
+  for (size_t i = 0; i < kPixels; ++i) {
+    bits = (bits << 11) | (raw[i] & 0x7FF);
+    bit_count += 11;
+    while (bit_count >= 8) {
+      bit_count -= 8;
+      *packed++ = uint8_t(bits >> bit_count);
+    }
+  }
+}
+
+void UnpackKinectDepth(const uint8_t* packed, uint16_t* raw) {
+  constexpr size_t kPixels =
+      size_t(KinectCamera::kDepthWidth) * KinectCamera::kDepthHeight;
+  uint32_t bits = 0;
+  uint32_t bit_count = 0;
+  for (size_t i = 0; i < kPixels; ++i) {
+    while (bit_count < 11) {
+      bits = (bits << 8) | *packed++;
+      bit_count += 8;
+    }
+    bit_count -= 11;
+    raw[i] = uint16_t((bits >> bit_count) & 0x7FF);
+  }
+}
+
 #if XE_PLATFORM_LINUX
 namespace {
 

@@ -60,6 +60,16 @@ class KinectCamera {
   virtual void Stop() = 0;
 };
 
+// The raw depth value a Kinect for Xbox 360 reports for a distance, the
+// inverse of KinectRawDepthToMillimeters: 2047, no reading, for 0 and for
+// distances outside the sensor's range. For depth from other sources.
+uint16_t MillimetersToKinectRawDepth(uint32_t millimeters);
+
+// A frame of raw depth values (KinectCamera::kDepthWidth x kDepthHeight) to and
+// from the sensor's 11-bit big-endian packing (KinectCamera::kDepthFrameBytes).
+void PackKinectDepth(const uint16_t* raw, uint8_t* packed);
+void UnpackKinectDepth(const uint8_t* packed, uint16_t* raw);
+
 // The Kinect's motor device: its tilt motor, which tilts the sensor to an
 // angle relative to gravity it measures with its accelerometer, and its LED.
 class KinectMotor {
