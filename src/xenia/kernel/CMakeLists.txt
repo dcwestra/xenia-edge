@@ -23,6 +23,8 @@ target_link_libraries(xenia-kernel PUBLIC
 if(WIN32)
   target_link_libraries(xenia-kernel PUBLIC winhttp)
 endif()
+# A webcam standing in for a Kinect (nui/webcam_kinect.cc).
+target_link_libraries(xenia-kernel PRIVATE xenia-helper-sdl SDL3)
 xe_target_defaults(xenia-kernel)
 
 if(XENIA_BUILD_TESTS)

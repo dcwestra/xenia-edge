@@ -48,8 +48,12 @@ class KinectCamera {
   using FrameCallback =
       std::function<void(const uint8_t* data, size_t size, uint32_t timestamp)>;
 
-  // Null if there is no Kinect, no libusb, or no permission to open it.
-  static std::unique_ptr<KinectCamera> Open();
+  // What kinect_camera chooses: a recording playing (kinect_playback_path), a
+  // Kinect, or a webcam standing in for one. Null if there's none, or no
+  // libusb, or no permission to open it. storage_root holds the webcam's pose
+  // models.
+  static std::unique_ptr<KinectCamera> Open(
+      const std::filesystem::path& storage_root);
   virtual ~KinectCamera() = default;
 
   // Starts depth, and color too if color_callback isn't null - without
@@ -61,6 +65,9 @@ class KinectCamera {
   // what the depth pixel in its place does, rather than as the Kinect's color
   // camera, beside its depth camera, sees it.
   virtual bool IsColorRegistered() const { return false; }
+  // Whether titles should be given a simulated tilt motor, the camera having
+  // none of its own.
+  virtual bool NeedsSimulatedMotor() const { return false; }
   virtual void Stop() = 0;
 };
 
@@ -104,9 +111,15 @@ class KinectMotor {
     TiltStatus status;
   };
 
-  // Null if there is no Kinect motor, no libusb, or no permission to open it.
-  // With a recording playing (kinect_playback_path), a simulated one.
+  // Null if there is no Kinect motor, no libusb, or no permission to open it,
+  // or kinect_camera is a webcam. With a recording playing
+  // (kinect_playback_path), a simulated one.
   static std::unique_ptr<KinectMotor> Open();
+  // A motor that reaches any tilt it's given about as fast as the real one,
+  // so titles' tilting runs as it would, for cameras without one.
+  static std::unique_ptr<KinectMotor> CreateSimulated();
+  // Where the simulated motor has tilted to, in degrees up.
+  static float SimulatedTiltDegrees();
   virtual ~KinectMotor() = default;
 
   virtual bool SetLed(Led led) = 0;

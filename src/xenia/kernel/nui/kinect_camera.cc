@@ -23,12 +23,18 @@
 #include "xenia/base/platform.h"
 #include "xenia/base/string.h"
 #include "xenia/kernel/nui/kinect_libusb.h"
+#include "xenia/kernel/nui/webcam_kinect.h"
 
 DEFINE_bool(kinect_mirror, false,
             "Flip the Kinect's depth and color left to right. Titles' trackers "
             "take the sensor's own orientation: flipped, a left arm reads as a "
             "right one.",
             "Kernel");
+
+DEFINE_string(kinect_camera, "auto",
+              "What Kinect titles see through: auto (a Kinect for Xbox 360, "
+              "else a webcam standing in for one), kinect or webcam.",
+              "Kernel");
 
 DEFINE_path(kinect_playback_path, "",
             "Play a recording made with kinect_record_path to Kinect titles, "
@@ -178,32 +184,35 @@ class KinectCameraPlayback : public KinectCamera {
 
 // With a recording playing, a motor that reaches any tilt it's given about
 // as fast as the real one, so titles' tilting runs as it would.
-class KinectMotorSimulated : public KinectMotor {
+// The simulated motor's tilt, one for the process: cameras without a motor
+// of their own draw what a sensor tilted this way would see.
+class SimulatedTilt {
  public:
-  bool SetLed(Led led) override { return true; }
-
-  bool SetTilt(int degrees) override {
-    std::lock_guard<std::mutex> lock(mutex_);
-    from_degrees_ = CurrentDegrees();
-    to_degrees_ = float(std::clamp(degrees, -kMaxTiltDegrees, kMaxTiltDegrees));
-    move_start_ = std::chrono::steady_clock::now();
-    return true;
+  static SimulatedTilt& Get() {
+    static SimulatedTilt tilt;
+    return tilt;
   }
 
-  bool GetState(State& state) override {
+  void Set(int degrees) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    from_degrees_ = CurrentDegrees();
+    to_degrees_ = float(std::clamp(degrees, -KinectMotor::kMaxTiltDegrees,
+                                   KinectMotor::kMaxTiltDegrees));
+    move_start_ = std::chrono::steady_clock::now();
+  }
+
+  // The angle now, and whether it's still on its way.
+  float Degrees(bool* moving = nullptr) {
     std::lock_guard<std::mutex> lock(mutex_);
     const float degrees = CurrentDegrees();
-    const float radians = degrees * 3.14159265f / 180.0f;
-    state.accel[0] = 0;
-    state.accel[1] = int16_t(std::lround(kCountsPerG * std::cos(radians)));
-    state.accel[2] = int16_t(std::lround(kCountsPerG * std::sin(radians)));
-    state.tilt_half_degrees = int8_t(std::lround(degrees * 2.0f));
-    state.status =
-        degrees == to_degrees_ ? TiltStatus::kStopped : TiltStatus::kMoving;
-    return true;
+    if (moving) {
+      *moving = degrees != to_degrees_;
+    }
+    return degrees;
   }
 
  private:
+  // About as fast as the real motor.
   static constexpr float kDegreesPerSecond = 15.0f;
 
   float CurrentDegrees() const {
@@ -222,6 +231,28 @@ class KinectMotorSimulated : public KinectMotor {
   float from_degrees_ = 0.0f;
   float to_degrees_ = 0.0f;
   std::chrono::steady_clock::time_point move_start_;
+};
+
+class KinectMotorSimulated : public KinectMotor {
+ public:
+  bool SetLed(Led led) override { return true; }
+
+  bool SetTilt(int degrees) override {
+    SimulatedTilt::Get().Set(degrees);
+    return true;
+  }
+
+  bool GetState(State& state) override {
+    bool moving;
+    const float degrees = SimulatedTilt::Get().Degrees(&moving);
+    const float radians = degrees * 3.14159265f / 180.0f;
+    state.accel[0] = 0;
+    state.accel[1] = int16_t(std::lround(kCountsPerG * std::cos(radians)));
+    state.accel[2] = int16_t(std::lround(kCountsPerG * std::sin(radians)));
+    state.tilt_half_degrees = int8_t(std::lround(degrees * 2.0f));
+    state.status = moving ? TiltStatus::kMoving : TiltStatus::kStopped;
+    return true;
+  }
 };
 
 }  // namespace
@@ -718,10 +749,8 @@ class KinectMotorLinux : public KinectMotor {
 
 }  // namespace
 
-std::unique_ptr<KinectMotor> KinectMotor::Open() {
-  if (!cvars::kinect_playback_path.empty()) {
-    return std::make_unique<KinectMotorSimulated>();
-  }
+namespace {
+std::unique_ptr<KinectMotor> OpenKinectMotor() {
   auto motor = std::make_unique<KinectMotorLinux>();
   if (!motor->Initialize()) {
     return nullptr;
@@ -729,29 +758,43 @@ std::unique_ptr<KinectMotor> KinectMotor::Open() {
   return motor;
 }
 
-std::unique_ptr<KinectCamera> KinectCamera::Open() {
-  if (!cvars::kinect_playback_path.empty()) {
-    auto playback = std::make_unique<KinectCameraPlayback>();
-    if (!playback->Initialize(cvars::kinect_playback_path)) {
-      return nullptr;
-    }
-    return playback;
-  }
+std::unique_ptr<KinectCamera> OpenKinectCamera() {
   auto camera = std::make_unique<KinectCameraLinux>();
   if (!camera->Initialize()) {
     return nullptr;
   }
   return camera;
 }
+}  // namespace
 #else
-std::unique_ptr<KinectMotor> KinectMotor::Open() {
-  if (!cvars::kinect_playback_path.empty()) {
-    return std::make_unique<KinectMotorSimulated>();
-  }
-  return nullptr;
+namespace {
+std::unique_ptr<KinectMotor> OpenKinectMotor() { return nullptr; }
+std::unique_ptr<KinectCamera> OpenKinectCamera() { return nullptr; }
+}  // namespace
+#endif
+
+std::unique_ptr<KinectMotor> KinectMotor::CreateSimulated() {
+  return std::make_unique<KinectMotorSimulated>();
 }
 
-std::unique_ptr<KinectCamera> KinectCamera::Open() {
+float KinectMotor::SimulatedTiltDegrees() {
+  return SimulatedTilt::Get().Degrees();
+}
+
+std::unique_ptr<KinectMotor> KinectMotor::Open() {
+  if (!cvars::kinect_playback_path.empty()) {
+    return CreateSimulated();
+  }
+  // A webcam has no motor: titles get a simulated one from the start, as
+  // they would a Kinect's.
+  if (cvars::kinect_camera == "webcam") {
+    return CreateSimulated();
+  }
+  return OpenKinectMotor();
+}
+
+std::unique_ptr<KinectCamera> KinectCamera::Open(
+    const std::filesystem::path& storage_root) {
   if (!cvars::kinect_playback_path.empty()) {
     auto playback = std::make_unique<KinectCameraPlayback>();
     if (!playback->Initialize(cvars::kinect_playback_path)) {
@@ -759,9 +802,20 @@ std::unique_ptr<KinectCamera> KinectCamera::Open() {
     }
     return playback;
   }
+  const std::string& mode = cvars::kinect_camera;
+  if (mode != "auto" && mode != "kinect" && mode != "webcam") {
+    XELOGW("Kinect: kinect_camera is auto, kinect or webcam, not {}", mode);
+  }
+  if (mode != "webcam") {
+    if (auto camera = OpenKinectCamera()) {
+      return camera;
+    }
+  }
+  if (mode != "kinect") {
+    return OpenWebcamKinectCamera(storage_root);
+  }
   return nullptr;
 }
-#endif
 
 }  // namespace nui
 }  // namespace kernel

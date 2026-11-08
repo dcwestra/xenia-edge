@@ -200,7 +200,8 @@ void PsCamDevice::OpenCamera() {
     return;
   }
   camera_opened_ = true;
-  camera_ = KinectCamera::Open();
+  camera_ = KinectCamera::Open(kernel_state_->emulator()->storage_root());
+  needs_simulated_motor_ = camera_ && camera_->NeedsSimulatedMotor();
   synthetic_ = !camera_ && cvars::kinect_synthetic_depth;
   if (synthetic_) {
     XELOGI("Kinect: no Kinect, streaming empty depth frames instead");

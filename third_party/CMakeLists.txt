@@ -705,7 +705,8 @@ endif()
 # Build SDL3 from source on every platform using upstream's own CMake. Xenia
 # drives windowing/rendering/GPU directly, so the SDL subsystems we don't
 # consume are switched off. Only audio + joystick/gamepad/haptic + events are
-# exercised by xenia-apu-sdl / xenia-hid-sdl. Linux builds shared so the
+# exercised by xenia-apu-sdl / xenia-hid-sdl, and the camera by xenia-kernel.
+# Linux builds shared so the
 # runtime dlopen("libSDL3.so.0") path in system_gnulinux.cc can resolve and so
 # linuxdeploy can bundle the .so into the AppImage; Windows/macOS build static.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -718,7 +719,8 @@ endif()
 set(SDL_TEST_LIBRARY OFF CACHE INTERNAL "")
 set(SDL_INSTALL OFF CACHE INTERNAL "")
 set(SDL_DISABLE_INSTALL ON CACHE INTERNAL "")
-set(SDL_CAMERA OFF CACHE INTERNAL "")
+# The camera: a webcam can stand in for a Kinect (kernel/nui/webcam_kinect.cc).
+set(SDL_CAMERA ON CACHE INTERNAL "")
 set(SDL_DIALOG OFF CACHE INTERNAL "")
 set(SDL_GPU OFF CACHE INTERNAL "")
 set(SDL_RENDER OFF CACHE INTERNAL "")

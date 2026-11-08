@@ -131,6 +131,11 @@ nui::KinectMotor* KernelState::kinect_motor() {
     kinect_motor_opened_ = true;
     kinect_motor_ = nui::KinectMotor::Open();
   }
+  // A camera without a motor of its own, such as a webcam, gets a simulated
+  // one once it's open.
+  if (!kinect_motor_ && pscam_device_ && pscam_device_->NeedsSimulatedMotor()) {
+    kinect_motor_ = nui::KinectMotor::CreateSimulated();
+  }
   return kinect_motor_.get();
 }
 

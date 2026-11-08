@@ -49,6 +49,9 @@ class PsCamDevice {
     std::lock_guard<std::mutex> lock(mutex_);
     return streaming_;
   }
+  // Whether the camera opened has no tilt motor of its own, so titles get a
+  // simulated one. Without the lock: KernelState asks under its own.
+  bool NeedsSimulatedMotor() const { return needs_simulated_motor_; }
 
   // Queues the frame buffer described by the request (code 0x05) at
   // request_address. Its completion routine runs once a frame fills it.
@@ -119,6 +122,7 @@ class PsCamDevice {
   uint32_t color_frame_number_ = 0;
   uint32_t frames_received_ = 0;
   std::atomic<bool> worker_running_ = false;
+  std::atomic<bool> needs_simulated_motor_ = false;
   object_ref<XHostThread> worker_;
 };
 
