@@ -54,6 +54,7 @@
 #include "xenia/base/threading.h"
 #include "xenia/base/utf8.h"
 #include "xenia/config.h"
+#include "xenia/kernel/nui/kinect_view.h"
 #include "xenia/ui/imgui_audio_dialog.h"
 #include "xenia/ui/imgui_confirm_dialog.h"
 #include "xenia/ui/imgui_context_menu.h"
@@ -188,6 +189,7 @@ extern char** environ;
 #include "version.h"
 
 DECLARE_bool(log_draws);
+DECLARE_bool(kinect_view);
 DECLARE_bool(log_resolves);
 DECLARE_bool(debug);
 DECLARE_path(target);
@@ -613,6 +615,8 @@ std::unique_ptr<EmulatorWindow> EmulatorWindow::Create(
 
 EmulatorWindow::~EmulatorWindow() {
   library_fill_alive_->store(false);
+  // Its textures belong to the immediate drawer.
+  kinect_view_.reset();
 
   // The burst thread captures through the UI thread, which is this one, so
   // keep running its calls until it notices the stop.
@@ -970,6 +974,9 @@ void EmulatorWindow::OnEmulatorInitialized() {
 
   emulator_initialized_ = true;
   window_->SetMainMenuEnabled(true);
+  if (cvars::kinect_view && !kinect_view_) {
+    ToggleKinectView();
+  }
   RefreshProfileMenu();
   RefreshControllersMenu();
   // Live-refresh the Controllers menu on hotplug / auto-bind / detach.
@@ -1763,6 +1770,9 @@ void EmulatorWindow::OnKeyDown(ui::KeyEvent& e) {
     case ui::VirtualKey::kF8: {
       ToggleDebugSettingsDialog();
     } break;
+    case ui::VirtualKey::kF9: {
+      ToggleKinectView();
+    } break;
     case ui::VirtualKey::kF11: {
       ToggleFullscreen();
     } break;
@@ -1867,6 +1877,9 @@ void EmulatorWindow::ToggleContextMenu(bool use_cursor_position) {
 
   context_menu->AddAction(
       "Debug Settings", [this]() { ToggleDebugSettingsDialog(); }, "F8");
+
+  context_menu->AddAction(
+      "Kinect View", [this]() { ToggleKinectView(); }, "F9");
 
   context_menu->AddSeparator();
 
@@ -2918,6 +2931,17 @@ void EmulatorWindow::ToggleDebugSettingsDialog() {
   debug_dialog_ = new ui::ImGuiDebugDialog(imgui_drawer(), this,
                                            emulator()->input_system());
   debug_dialog_->SetOnCloseCallback([this]() { debug_dialog_ = nullptr; });
+}
+
+void EmulatorWindow::ToggleKinectView() {
+  if (kinect_view_) {
+    kinect_view_.reset();
+    return;
+  }
+  if (imgui_drawer_) {
+    kinect_view_ = std::make_unique<kernel::nui::KinectViewOverlay>(
+        imgui_drawer_.get(), emulator_->kernel_state());
+  }
 }
 
 void EmulatorWindow::RefreshProfileMenu() {

@@ -41,6 +41,14 @@
 class wxTimer;
 
 namespace xe {
+namespace kernel {
+namespace nui {
+class KinectViewOverlay;
+}  // namespace nui
+}  // namespace kernel
+}  // namespace xe
+
+namespace xe {
 namespace app {
 
 class GameListPanel;
@@ -241,6 +249,7 @@ class EmulatorWindow {
   void ToggleDisplayConfigDialog();
   void TogglePerformanceTuningDialog();
   void ToggleDebugSettingsDialog();
+  void ToggleKinectView();
   void ToggleContextMenu(bool use_cursor_position = true);
   void ShowCompatibility();
   void ShowFAQ();
@@ -266,6 +275,8 @@ class EmulatorWindow {
   // Creation may fail, in this case immediate drawer UI must not be drawn.
   std::unique_ptr<ui::ImmediateDrawer> immediate_drawer_;
   ui::Presenter* presenter_painting_ = nullptr;
+  // The Kinect view overlay (F9), dropped before the drawers it draws with.
+  std::unique_ptr<kernel::nui::KinectViewOverlay> kinect_view_;
 
   bool emulator_initialized_ = false;
 

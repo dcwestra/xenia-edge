@@ -41,6 +41,15 @@ using IconsData = std::map<uint32_t, std::span<const uint8_t>>;
 
 constexpr ImVec2 default_image_icon_size = ImVec2(64.f, 64.f);
 
+// Something drawn over the game every frame without taking input, such as a
+// heads-up display: unlike with a dialog open, the game keeps the keyboard and
+// mouse, and the hotkeys stay active.
+class ImGuiOverlay {
+ public:
+  virtual ~ImGuiOverlay() = default;
+  virtual void Draw() = 0;
+};
+
 class ImGuiDrawer : public WindowInputListener, public UIDrawer {
  public:
   ImGuiDrawer(Window* window, size_t z_order);
@@ -53,6 +62,9 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
 
   void AddNotification(ImGuiNotification* notification);
   void RemoveNotification(ImGuiNotification* notification);
+
+  void AddOverlay(ImGuiOverlay* overlay);
+  void RemoveOverlay(ImGuiOverlay* overlay);
 
   // SetPresenter may be called from the destructor.
   void SetPresenter(Presenter* new_presenter);
@@ -73,6 +85,10 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
 
   std::unique_ptr<ImmediateTexture> LoadImGuiIcon(
       std::span<const uint8_t> data);
+  // An R8G8B8A8 texture, from the UI thread. Null without an immediate drawer.
+  std::unique_ptr<ImmediateTexture> CreateTexture(uint32_t width,
+                                                  uint32_t height,
+                                                  const uint8_t* rgba);
   std::map<uint32_t, std::unique_ptr<ImmediateTexture>> LoadIcons(
       IconsData data);
 
@@ -147,6 +163,7 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   // All queued notifications. Notification at index 0 is currently presented
   // one.
   std::vector<ImGuiNotification*> notifications_;
+  std::vector<ImGuiOverlay*> overlays_;
   // Using an index, not an iterator, because after the erasure, the adjustment
   // must be done for the vector element indices that would be in the iterator
   // range that would be invalidated.

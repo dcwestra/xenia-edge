@@ -25,6 +25,7 @@
 #include "xenia/emulator.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/nui/kinect_camera.h"
+#include "xenia/kernel/nui/kinect_view.h"
 #include "xenia/kernel/xthread.h"
 
 DECLARE_bool(log_kinect);
@@ -312,6 +313,9 @@ void PsCamDevice::OnDepthFrame(const uint8_t* data, size_t size) {
   if (recorder_) {
     recorder_->AddFrame(KinectRecorder::Stream::kDepth, data, size);
   }
+  if (size == KinectCamera::kDepthFrameBytes) {
+    KinectView::Get().PublishPackedDepth(data);
+  }
   std::lock_guard<std::mutex> lock(mutex_);
   std::memcpy(frame_.data(), data, std::min(size, frame_.size()));
   frame_ready_ = true;
@@ -469,6 +473,7 @@ void PsCamDevice::WorkerMain() {
         color.resize(sensor_color.size());
         ViewColorFrame(sensor_color.data(), color_settings, color_registered,
                        color.data());
+        KinectView::Get().PublishColor(color.data());
         // A frame as handed over every 10 seconds, beside the sensor's.
         if (cvars::log_kinect && !(color_number % 300)) {
           const std::filesystem::path path =

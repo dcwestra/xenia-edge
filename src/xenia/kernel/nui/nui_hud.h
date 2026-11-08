@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <mutex>
+#include <vector>
 
 namespace xe {
 namespace kernel {
@@ -36,6 +37,15 @@ class NuiHud {
   // 0 or an ID not in view) points, 0 to 1 across and down. False with no
   // tracked player, or none recently.
   bool GetHandCursor(uint32_t tracking_id, float& x_out, float& y_out);
+
+  // A player the title tracks, as it last sent them, for the Kinect view:
+  // skeleton space, meters from the sensor, x mirrored against its picture.
+  struct TrackedSkeleton {
+    float joints[kJointCount][3];
+    uint32_t states[kJointCount];  // 0 not tracked, 1 inferred, 2 tracked.
+  };
+  // The players tracked in the last frame, if one came recently.
+  std::vector<TrackedSkeleton> GetTrackedSkeletons();
 
  private:
   struct Joint {

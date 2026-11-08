@@ -123,6 +123,27 @@ void NuiHud::LogSkeletons() {
   ++skeleton_log_frames_;
 }
 
+std::vector<NuiHud::TrackedSkeleton> NuiHud::GetTrackedSkeletons() {
+  std::vector<TrackedSkeleton> tracked;
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (std::chrono::steady_clock::now() - frame_time_ > kFrameTimeout) {
+    return tracked;
+  }
+  for (const Skeleton& skeleton : skeletons_) {
+    if (skeleton.state != kTrackingStateTracked) {
+      continue;
+    }
+    TrackedSkeleton& out = tracked.emplace_back();
+    for (int j = 0; j < kJointCount; ++j) {
+      out.joints[j][0] = skeleton.joints[j].x;
+      out.joints[j][1] = skeleton.joints[j].y;
+      out.joints[j][2] = skeleton.joints[j].z;
+      out.states[j] = skeleton.joints[j].state;
+    }
+  }
+  return tracked;
+}
+
 NuiHud::~NuiHud() {
   if (skeleton_log_) {
     std::fclose(skeleton_log_);

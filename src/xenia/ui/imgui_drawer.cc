@@ -135,7 +135,7 @@ void ImGuiDrawer::AddNotification(ImGuiNotification* dialog) {
     return;
   }
   ResetFrameTimeIfIdle();
-  if (notifications_.empty()) {
+  if (notifications_.empty() && overlays_.empty()) {
     if (presenter_) {
       presenter_->AddUIDrawerFromUIThread(this, z_order_);
     }
@@ -145,6 +145,41 @@ void ImGuiDrawer::AddNotification(ImGuiNotification* dialog) {
   if (presenter_) {
     presenter_->RequestUIPaintFromUIThread();
   }
+}
+
+void ImGuiDrawer::AddOverlay(ImGuiOverlay* overlay) {
+  assert_not_null(overlay);
+  if (std::ranges::find(std::as_const(overlays_), overlay) !=
+      overlays_.cend()) {
+    return;
+  }
+  ResetFrameTimeIfIdle();
+  if (dialogs_.empty() && notifications_.empty() && overlays_.empty() &&
+      presenter_) {
+    presenter_->AddUIDrawerFromUIThread(this, z_order_);
+  }
+  overlays_.push_back(overlay);
+  if (presenter_) {
+    presenter_->RequestUIPaintFromUIThread();
+  }
+}
+
+void ImGuiDrawer::RemoveOverlay(ImGuiOverlay* overlay) {
+  auto it = std::ranges::find(std::as_const(overlays_), overlay);
+  if (it == overlays_.cend()) {
+    return;
+  }
+  overlays_.erase(it);
+  DetachIfLastWindowRemoved();
+}
+
+std::unique_ptr<ImmediateTexture> ImGuiDrawer::CreateTexture(
+    uint32_t width, uint32_t height, const uint8_t* rgba) {
+  if (!immediate_drawer_) {
+    return nullptr;
+  }
+  return immediate_drawer_->CreateTexture(
+      width, height, ImmediateTextureFilter::kLinear, false, rgba);
 }
 
 void ImGuiDrawer::RemoveNotification(ImGuiNotification* dialog) {
@@ -548,14 +583,14 @@ void ImGuiDrawer::SetPresenter(Presenter* new_presenter) {
     if (presenter_ == new_presenter) {
       return;
     }
-    if (!dialogs_.empty()) {
+    if (!dialogs_.empty() || !notifications_.empty() || !overlays_.empty()) {
       presenter_->RemoveUIDrawerFromUIThread(this);
     }
     ImGuiIO& io = GetIO();
   }
   presenter_ = new_presenter;
   if (presenter_) {
-    if (!dialogs_.empty()) {
+    if (!dialogs_.empty() || !notifications_.empty() || !overlays_.empty()) {
       presenter_->AddUIDrawerFromUIThread(this, z_order_);
     }
   }
@@ -599,7 +634,7 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
     return;
   }
 
-  if (dialogs_.empty() && notifications_.empty()) {
+  if (dialogs_.empty() && notifications_.empty() && overlays_.empty()) {
     return;
   }
 
@@ -665,6 +700,10 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
   }
   dialog_loop_next_index_ = SIZE_MAX;
 
+  for (ImGuiOverlay* overlay : overlays_) {
+    overlay->Draw();
+  }
+
   if (!notifications_.empty() && are_notifications_enabled_) {
     auto guest_notifications =
         notifications_ | std::views::filter([](auto* notification) {
@@ -710,7 +749,7 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
   // (FazeIn/FazeOut) During static display (Present stage), game frames will
   // trigger repaints via RefreshGuestOutput ->
   // RequestPaintOrConnectionRecoveryViaWindow
-  bool needs_continuous_repaint = !dialogs_.empty();
+  bool needs_continuous_repaint = !dialogs_.empty() || !overlays_.empty();
   if (!needs_continuous_repaint) {
     for (const auto* notification : notifications_) {
       if (notification->IsAnimating()) {
@@ -983,7 +1022,7 @@ void ImGuiDrawer::SwitchToPhysicalMouseAndUpdateMousePosition(
 
 void ImGuiDrawer::ResetFrameTimeIfIdle() {
   // Draw isn't called while nothing is shown, so the idle gap would skew delta
-  if (dialogs_.empty() && notifications_.empty()) {
+  if (dialogs_.empty() && notifications_.empty() && overlays_.empty()) {
     last_frame_time_ticks_ = Clock::QueryHostTickCount();
   }
 }
@@ -993,7 +1032,8 @@ void ImGuiDrawer::DetachIfLastWindowRemoved() {
   // only dialog, then adding a dialog, from within a dialog's Draw function,
   // re-registering the ImGuiDrawer may result in ImGui being drawn multiple
   // times in the current frame.
-  if (!dialogs_.empty() || !notifications_.empty() || IsDrawingDialogs()) {
+  if (!dialogs_.empty() || !notifications_.empty() || !overlays_.empty() ||
+      IsDrawingDialogs()) {
     return;
   }
   if (presenter_) {
