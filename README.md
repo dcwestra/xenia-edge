@@ -80,9 +80,28 @@ Related settings:
 - `log_kinect`: logs the camera and Kinect service traffic, and every 10 seconds what the microphones hear.
 - `avatar_asset_pack_path`: the system avatar package (`FFFE07DF00000002` from a disc's `$SystemUpdate` folder, or *Kinect Sports'* `AvatarAssetPack`), for avatar games whose disc doesn't carry one.
 
+### No Kinect? A webcam can stand in
+
+Without a Kinect, a webcam (USB or a laptop's own) can take its place. Games track players from the Kinect's depth picture, which a webcam doesn't have, so the fork makes one: it finds the player's pose in the webcam's picture with MediaPipe's pose model, and draws a body in that pose as the depth a Kinect would see of them, standing in front of it in an empty room. The games' own trackers then find the drawn body as they would a real player. Color is the webcam's picture, lined up with the body.
+
+1. Run [`tools/kinect/get_webcam_files.sh`](tools/kinect/get_webcam_files.sh). It downloads MediaPipe's pose model and converts it for ONNX Runtime, and downloads ONNX Runtime too unless the system has it (Fedora: `sudo dnf install onnxruntime`). Everything goes in the `kinect` folder of Xenia's storage folder.
+2. Copy the game configs as for a Kinect (step 3 above).
+3. Stand where the webcam sees you, or sit: when your legs are out of view, standing legs are drawn for you. Where you first settle is the play distance; stepping toward or away from the webcam from there, sideways and jumping all come through.
+4. Press **F9** in a game for the **Kinect view**: what the game sees and the players it tracks, the webcam's picture with the pose found in it, and advice on aiming the webcam or where to stand. It works with a Kinect too.
+
+Related settings:
+
+- `kinect_camera` (`auto`): `auto` uses a Kinect, or a webcam without one. `kinect` or `webcam` uses only one of them.
+- `kinect_webcam`: the webcam to use, by part of its name. Empty uses the first one.
+- `kinect_webcam_fov` (70): the webcam's horizontal field of view in degrees.
+- `kinect_webcam_distance` (2.6) and `kinect_webcam_player_height` (1.70): where the player stands from the Kinect and how tall they are, in meters.
+- `kinect_webcam_models_path` and `kinect_onnxruntime_path`: where the pose models and ONNX Runtime are, if not in the `kinect` folder.
+- `kinect_view`: shows the Kinect view from the start.
+
 ### Limits
 
 - **Linux only**, and only the original **Kinect for Xbox 360 (model 1414)**. The Xbox One Kinect isn't supported.
+- **A webcam sees one player.** Depth toward and away from it is estimated from one picture, so it's rougher than a Kinect's. The tilt motor is simulated.
 - **Five games tested, all playable.** Other Kinect games may reach parts that aren't implemented yet.
 - **The microphones skip the sensor's own processing.** Games get the four microphones and their average, not the sensor's beamformed mix, which needs the console's Kinect audio calibration. Dance Central 2's voice commands work with this.
 - **Avatars are still missing some details.** Height and weight aren't applied yet. The editor only offers the items in the avatar pack, not marketplace or award items.
