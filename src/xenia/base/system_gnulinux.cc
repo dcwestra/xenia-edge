@@ -9,17 +9,12 @@
 
 #include <alloca.h>
 #include <dlfcn.h>
-#include <spawn.h>
 #include <stdlib.h>
-#include <sys/wait.h>
-#include <unistd.h>
 
-#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <string>
-#include <thread>
 
 #include "xenia/base/assert.h"
 #include "xenia/base/logging.h"
@@ -32,47 +27,56 @@
 namespace {
 using SDL_ShowSimpleMessageBox_fn = int (*)(uint32_t flags, const char* title,
                                             const char* message, void* window);
+using SDL_OpenURL_fn = bool (*)(const char* url);
+using SDL_GetError_fn = const char* (*)();
 constexpr uint32_t kSDL_MessageBoxError = 0x00000010;
 constexpr uint32_t kSDL_MessageBoxWarning = 0x00000020;
 constexpr uint32_t kSDL_MessageBoxInformation = 0x00000040;
 }  // namespace
 
-extern char** environ;
-
 namespace xe {
 
-// Hands |target| to xdg-open as its own argument, with no shell to interpret
-// it, so a path holding $, ` or " opens as named, and returns without waiting.
-// system() ran it through sh and blocked the caller until xdg-open exited.
-static void XdgOpen(const std::string& target) {
-  char program[] = "xdg-open";
-  std::string argument = target;
-  char* argv[] = {program, argument.data(), nullptr};
-  pid_t pid;
-  int result = posix_spawnp(&pid, program, nullptr, nullptr, argv, environ);
-  if (result != 0) {
-    XELOGE("Failed to run xdg-open for {}: {}", target, std::strerror(result));
-    return;
-  }
-  // Reap it off the calling (often UI) thread so it doesn't linger as a zombie.
-  std::thread([pid]() {
-    int status;
-    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
-    }
-  }).detach();
-}
-
-void LaunchWebBrowser(const std::string_view url) { XdgOpen(std::string(url)); }
-
-void LaunchFileExplorer(const std::filesystem::path& path) {
-  XdgOpen(path.string());
-}
-
-void ShowSimpleMessageBox(SimpleMessageBoxType type, std::string_view message) {
+void* LoadSDL3Library() {
+  // The versioned soname is what the runtime package installs. The unversioned
+  // one only comes with the development package.
   void* libsdl = dlopen("libSDL3.so.0", RTLD_LAZY | RTLD_LOCAL);
   if (!libsdl) {
     libsdl = dlopen("libSDL3.so", RTLD_LAZY | RTLD_LOCAL);
   }
+  return libsdl;
+}
+
+namespace {
+// Goes through the desktop portal or xdg-open, never a shell.
+void OpenUrl(const std::string& url) {
+  void* libsdl = LoadSDL3Library();
+  if (!libsdl) {
+    XELOGE("Failed to open {}: {}", xe::strip_pii(url), dlerror());
+    return;
+  }
+  auto pSDL_OpenURL =
+      reinterpret_cast<SDL_OpenURL_fn>(dlsym(libsdl, "SDL_OpenURL"));
+  auto pSDL_GetError =
+      reinterpret_cast<SDL_GetError_fn>(dlsym(libsdl, "SDL_GetError"));
+  if (!pSDL_OpenURL) {
+    XELOGE("Failed to open {}: SDL_OpenURL is unavailable", xe::strip_pii(url));
+  } else if (!pSDL_OpenURL(url.c_str())) {
+    XELOGE("Failed to open {}: {}", xe::strip_pii(url),
+           pSDL_GetError ? pSDL_GetError() : "unknown error");
+  }
+  dlclose(libsdl);
+}
+}  // namespace
+
+void LaunchWebBrowser(const std::string_view url) { OpenUrl(std::string(url)); }
+
+void LaunchFileExplorer(const std::filesystem::path& path) {
+  std::error_code ec;
+  OpenUrl(std::filesystem::absolute(path, ec).string());
+}
+
+void ShowSimpleMessageBox(SimpleMessageBoxType type, std::string_view message) {
+  void* libsdl = LoadSDL3Library();
   assert_not_null(libsdl);
   if (libsdl) {
     auto pSDL_ShowSimpleMessageBox =

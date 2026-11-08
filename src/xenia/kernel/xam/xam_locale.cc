@@ -14,6 +14,7 @@
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/util/xfiletime.h"
 #include "xenia/kernel/xam/xam_private.h"
+#include "xenia/kernel/xam/xam_state.h"
 #include "xenia/kernel/xconfig.h"
 #include "xenia/kernel/xenumerator.h"
 #include "xenia/kernel/xthread.h"
@@ -186,6 +187,18 @@ uint8_t xeXamGetCountryFromOnlineCountry(uint8_t id) {
   };
 #pragma warning(suppress : 6385)
   return id < xe::countof(table) ? table[id] : 0;
+}
+
+uint32_t xeXamGetOnlineCountryFeatures(uint8_t id) {
+  const auto country_id = static_cast<XOnlineCountry>(id);
+
+  for (const auto& [country, features] : kOnlineCountryFeatures) {
+    if (country == country_id) {
+      return features;
+    }
+  }
+
+  return 0x80000000;
 }
 
 uint8_t xeXamGetLocaleFromCountry(uint8_t id) {
@@ -496,6 +509,11 @@ dword_result_t XamGetCountryFromOnlineCountry_entry(dword_t id) {
 }
 DECLARE_XAM_EXPORT1(XamGetCountryFromOnlineCountry, kLocale, kImplemented);
 
+dword_result_t XamGetOnlineCountryFeatures_entry(dword_t id) {
+  return xeXamGetOnlineCountryFeatures(static_cast<uint8_t>(id));
+}
+DECLARE_XAM_EXPORT1(XamGetOnlineCountryFeatures, kLocale, kImplemented);
+
 dword_result_t XamGetLocaleEx_entry(dword_t max_country_id,
                                     dword_t max_locale_id) {
   return xeXamGetLocaleEx(static_cast<uint8_t>(max_country_id),
@@ -682,7 +700,7 @@ dword_result_t XamGetLanguage_entry() {
 }
 DECLARE_XAM_EXPORT1(XamGetLanguage, kNone, kImplemented);
 
-dword_result_t XTLGetLanguageV2_entry() {
+XLanguage xeXTLGetLanguageV2() {
   auto desired_language =
       static_cast<XLanguage>(kernel_state()->xconfig()->ReadSetting<uint32_t>(
           XCONFIG_USER_CATEGORY,
@@ -690,16 +708,20 @@ dword_result_t XTLGetLanguageV2_entry() {
 
   uint32_t region = xeXGetGameRegion();
   if (desired_language < XLanguage::kSwedish) {
-    return static_cast<uint32_t>(desired_language);
+    return desired_language;
   }
   if ((region & 0xff00) != 0x100) {
-    return static_cast<uint32_t>(XLanguage::kEnglish);
+    return XLanguage::kEnglish;
   }
   if (region == 0x101) {
-    return static_cast<uint32_t>(XLanguage::kJapanese);
+    return XLanguage::kJapanese;
   } else {
-    return static_cast<uint32_t>(XLanguage::kKorean);
+    return XLanguage::kKorean;
   }
+}
+
+dword_result_t XTLGetLanguageV2_entry() {
+  return static_cast<uint32_t>(xeXTLGetLanguageV2());
 }
 DECLARE_XAM_EXPORT1(XTLGetLanguageV2, kNone, kImplemented);
 

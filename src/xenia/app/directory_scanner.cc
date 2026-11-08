@@ -17,9 +17,11 @@
 
 #include "third_party/fmt/include/fmt/format.h"
 #include "third_party/stb/stb_image.h"
-#include "xenia/app/game_title_db.h"
+#include "xenia/app/game_library.h"
 #include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
+#include "xenia/kernel/title_id_utils.h"
+#include "xenia/kernel/xam/indie_game.h"
 #include "xenia/vfs/iso_metadata.h"
 #include "xenia/vfs/stfs_metadata.h"
 #include "xenia/vfs/xbe_metadata.h"
@@ -109,11 +111,35 @@ void ApplyXbe(DiscoveredGame& g, const vfs::XbeMetadata& m) {
   g.title_id_hex = fmt::format("{:08X}", m.title_id);
   g.media_id = 0;
   g.title_name = m.title_name;
+  g.content_type = uint32_t(XContentType::kXboxTitle);
   g.version = vfs::XexVersion::FromValue(m.version).ToString();
   g.disc_number = static_cast<uint8_t>(m.disc_number);
   g.disc_count = 0;
   if (!m.icon_png.empty()) {
     SetIcon(g, m.icon_png);
+  }
+}
+
+// An indie game is what its GameInfo.xml says it is, not the XNA title
+// launcher's content it installs as.
+void ApplyIndieGame(DiscoveredGame& g, kernel::xam::IndieGame game) {
+  g.title_id = game.title_id;
+  g.title_id_hex = fmt::format("{:08X}", game.title_id);
+  g.media_id = 0;
+  g.disc_number = 0;
+  g.disc_count = 0;
+  g.title_name = game.name;
+  if (!game.name.empty()) {
+    g.display_name = std::move(game.name);
+  }
+  g.content_type_name = "Indie Game";
+  // The header's art is the launcher's.
+  g.icon_png.clear();
+  g.icon_rgba.clear();
+  g.icon_width = 0;
+  g.icon_height = 0;
+  if (!game.icon.empty()) {
+    SetIcon(g, std::move(game.icon));
   }
 }
 
@@ -150,19 +176,15 @@ DiscoveredGame MakeFromStfs(const std::filesystem::path& path,
 }  // namespace
 
 std::string ResolveImportName(const DiscoveredGame& g) {
-  // STFS header title is authoritative.
-  if (g.format == "stfs") {
-    const std::string& stfs_name = PreferredName(g);
-    if (!stfs_name.empty()) {
-      return stfs_name;
-    }
+  // A disc image or bare executable has no type of its own and keeps the
+  // title type GameFileInfo starts with.
+  GameFileInfo info;
+  if (g.content_type) {
+    info.content_type = XContentType(g.content_type);
   }
-  // Otherwise prefer the x360db title, which also resolves alternative ids.
-  if (const GameTitleInfo* info = GetGameTitleInfo(g.title_id);
-      info && !info->name.empty()) {
-    return info->name;
-  }
-  return PreferredName(g);
+  info.title_name = g.title_name;
+  info.display_name = g.display_name;
+  return NameNewRelease(g.title_id, &info, {}, {}, g.path);
 }
 
 DirectoryScanner::DirectoryScanner() = default;
@@ -522,6 +544,28 @@ void DirectoryScanner::ScanDirectory(const std::filesystem::path& dir) {
               phase2_hits++;
               continue;
             }
+          }
+          if (m->content_type == uint32_t(XContentType::kMarketplaceContent) &&
+              m->title_id == kernel::kXN_2002) {
+            if (auto game = kernel::xam::ReadIndieGame(path)) {
+              XELOGD(
+                  "DirectoryScanner:   indie stfs hit '{}' — title_id={:08X}, "
+                  "name='{}'",
+                  xe::strip_pii(xe::path_to_utf8(path)), game->title_id,
+                  game->name);
+              DiscoveredGame g = MakeFromStfs(path, *m);
+              ApplyIndieGame(g, std::move(*game));
+              RecordGame(std::move(g));
+              phase2_hits++;
+              continue;
+            }
+          }
+          // The XNA title launcher's content isn't a game of its own.
+          if (m->title_id == kernel::kXN_2002) {
+            XELOGD(
+                "DirectoryScanner:   stfs filtered '{}' — XNA title launcher",
+                xe::strip_pii(xe::path_to_utf8(path)));
+            continue;
           }
           if (!IsLaunchableContentType(m->content_type)) {
             XELOGD(

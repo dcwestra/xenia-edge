@@ -116,6 +116,10 @@ class ProfileManager {
   }
   const X_XAMACCOUNTINFO* GetAccount(const uint64_t xuid);
 
+  // The profile's picture: its personal picture if it has one, else its gamer
+  // picture, each at 64 px before 32 px. Empty if it has none.
+  std::vector<uint8_t> GetAccountIcon(const uint64_t xuid);
+
   uint32_t GetAccountCount() const {
     return static_cast<uint32_t>(accounts_.size());
   }
@@ -135,6 +139,8 @@ class ProfileManager {
 
  private:
   void UpdateConfig(const uint64_t xuid, const uint8_t slot);
+  // Tells titles and the host UI which slots are signed in now.
+  void NotifySignInChanged();
   bool CreateAccount(const uint64_t xuid, const std::string gamertag);
   bool CreateAccount(const uint64_t xuid, const X_XAMACCOUNTINFO* account);
   bool WriteAccount(const uint64_t xuid, const X_XAMACCOUNTINFO* account);

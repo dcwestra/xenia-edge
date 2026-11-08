@@ -15,12 +15,15 @@
 
 #include "third_party/fmt/include/fmt/format.h"
 #include "third_party/tomlplusplus/toml.hpp"
+#include "xenia/app/game_title_db.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/string_util.h"
 #include "xenia/base/utf8.h"
 #include "xenia/emulator.h"
+#include "xenia/kernel/title_id_utils.h"
+#include "xenia/kernel/xam/indie_game.h"
 #include "xenia/vfs/iso_metadata.h"
 #include "xenia/vfs/stfs_metadata.h"
 #include "xenia/vfs/xbe_metadata.h"
@@ -72,6 +75,39 @@ static void NormalizeDefault(LibraryEntry& entry) {
   }
 }
 
+std::string NameNewRelease(uint32_t title_id, const GameFileInfo* info,
+                           std::string_view hint, std::string_view sibling,
+                           const std::filesystem::path& path) {
+  // An original Xbox executable's certificate can hold a shortened title.
+  const bool xbox = info && info->content_type == XContentType::kXboxTitle;
+  if (info && !xbox && !info->title_name.empty()) {
+    return info->title_name;
+  }
+  if (info && !xbox && !info->display_name.empty()) {
+    return info->display_name;
+  }
+  if (const GameTitleInfo* known = GetGameTitleInfo(title_id);
+      known && !known->name.empty()) {
+    return known->name;
+  }
+  if (!hint.empty()) {
+    return std::string(hint);
+  }
+  if (xbox && !info->title_name.empty()) {
+    return info->title_name;
+  }
+  if (!sibling.empty()) {
+    return std::string(sibling);
+  }
+  // A file named default says nothing, and a drive's root has no folder name.
+  auto file = path.stem();
+  if (xe::utf8::equal_case(xe::path_to_utf8(file), "default") &&
+      !path.parent_path().filename().empty()) {
+    file = path.parent_path().filename();
+  }
+  return xe::path_to_utf8(file);
+}
+
 const LibraryPath& LibraryEntry::default_path() const {
   assert_false(paths.empty());
   for (const auto& p : paths) {
@@ -98,10 +134,28 @@ GameFileInfo FromXbe(vfs::XbeMetadata m) {
   info.content_type = XContentType::kXboxTitle;
   return info;
 }
+
+GameFileInfo FromIndieGame(kernel::xam::IndieGame game) {
+  GameFileInfo info;
+  info.icon = std::move(game.icon);
+  info.title_name = game.name;
+  info.display_name = std::move(game.name);
+  info.content_type = XContentType::kMarketplaceContent;
+  return info;
+}
 }  // namespace
 
-std::optional<GameFileInfo> ReadGameFileInfo(
-    const std::filesystem::path& path) {
+std::optional<GameFileInfo> ReadGameFileInfo(const std::filesystem::path& path,
+                                             XLanguage language) {
+  // An indie game installed as a folder.
+  std::error_code ec;
+  if (std::filesystem::is_directory(path, ec)) {
+    auto game = kernel::xam::ReadIndieGame(path);
+    if (!game) {
+      return std::nullopt;
+    }
+    return FromIndieGame(std::move(*game));
+  }
   const auto extension =
       xe::utf8::lower_ascii(xe::path_to_utf8(path.extension()));
   if (extension == ".xbe") {
@@ -126,7 +180,16 @@ std::optional<GameFileInfo> ReadGameFileInfo(
       return GameFileInfo{m->media_id, m->version.value(), m->disc_number,
                           m->disc_count};
     }
-  } else if (auto m = vfs::ExtractStfsMetadata(path)) {
+  } else if (auto m = vfs::ExtractStfsMetadata(path, language)) {
+    // An indie game installed as the package file itself.
+    if (m->content_type == uint32_t(XContentType::kMarketplaceContent) &&
+        m->title_id == kernel::kXN_2002) {
+      auto game = kernel::xam::ReadIndieGame(path);
+      if (!game) {
+        return std::nullopt;
+      }
+      return FromIndieGame(std::move(*game));
+    }
     // An Xbox Original package is listed as the game its executable names.
     if (m->content_type == uint32_t(XContentType::kXboxTitle)) {
       if (auto xbe = vfs::ExtractXbeMetadata(path)) {
@@ -172,6 +235,10 @@ bool GameLibrary::HasReleaseFolder(uint32_t title_id) const {
 
 std::filesystem::path GameLibrary::IconPath(const LibraryKey& key) const {
   return EntryDir(key) / "icon.png";
+}
+
+std::filesystem::path GameLibrary::BoxArtPath(const LibraryKey& key) const {
+  return EntryDir(key) / "boxart.jpg";
 }
 
 LibraryEntry* GameLibrary::Find(const LibraryKey& key) {
@@ -285,7 +352,7 @@ std::vector<GameLibrary::Release> GameLibrary::SplitIntoReleases(
   std::vector<std::optional<GameFileInfo>> infos;
   infos.reserve(entry.paths.size());
   for (const auto& path : entry.paths) {
-    infos.push_back(ReadGameFileInfo(path.path));
+    infos.push_back(ReadGameFileInfo(path.path, language_));
   }
 
   // A file that can't be read right now (moved, unplugged) must not look like
@@ -537,11 +604,12 @@ std::vector<GameLibrary::MissingFields> GameLibrary::FindMissingFields() const {
   std::error_code ec;
   for (const auto& entry : entries_) {
     // A title still in an older layout gets its fields when it is migrated.
-    if (entry.content_type != XContentType::kInvalid ||
+    if ((entry.content_type != XContentType::kInvalid && !entry.name.empty()) ||
         !std::filesystem::exists(EntryDir(entry.key()) / "game.toml", ec)) {
       continue;
     }
     MissingFields release{entry.key()};
+    release.language = language_;
     for (const auto& path : entry.paths) {
       release.paths.push_back(path.path);
     }
@@ -555,7 +623,7 @@ std::optional<GameFileInfo> GameLibrary::ReadMissingFields(
   for (const auto& path : missing.paths) {
     // A path that was unreadable when the title was split can belong to
     // another release.
-    auto info = ReadGameFileInfo(path);
+    auto info = ReadGameFileInfo(path, missing.language);
     if (info && info->version == missing.key.version) {
       return info;
     }
@@ -566,12 +634,23 @@ std::optional<GameFileInfo> GameLibrary::ReadMissingFields(
 bool GameLibrary::FillMissingFields(const LibraryKey& key,
                                     const GameFileInfo& info) {
   const auto* existing = Find(key);
-  if (!existing || existing->content_type != XContentType::kInvalid ||
-      info.content_type == XContentType::kInvalid) {
+  if (!existing) {
     return false;
   }
   LibraryEntry entry = *existing;
-  entry.content_type = info.content_type;
+  if (entry.content_type == XContentType::kInvalid) {
+    entry.content_type = info.content_type;
+  }
+  // Added before its name could be read, like an executable that keeps it only
+  // in its $$XTINFO section.
+  if (entry.name.empty() && !entry.paths.empty()) {
+    entry.name =
+        NameNewRelease(key.title_id, &info, {}, {}, entry.default_path().path);
+  }
+  if (entry.content_type == existing->content_type &&
+      entry.name == existing->name) {
+    return false;
+  }
   return Upsert(std::move(entry));
 }
 
@@ -644,7 +723,8 @@ bool GameLibrary::WriteEntryAtomic(const LibraryEntry& entry,
 }
 
 bool GameLibrary::Upsert(LibraryEntry entry) {
-  if (entry.title_id == kXeFuTitleId) {
+  // These are listed as the games they run.
+  if (entry.title_id == kXeFuTitleId || entry.title_id == kernel::kXN_2002) {
     return false;
   }
   NormalizeDefault(entry);
@@ -665,7 +745,7 @@ bool GameLibrary::Upsert(LibraryEntry entry) {
   return true;
 }
 
-bool GameLibrary::AddDisc(uint32_t title_id, const std::string& name,
+bool GameLibrary::AddDisc(uint32_t title_id, const std::string& hint,
                           const std::filesystem::path& path) {
   if (title_id == 0 || path.empty()) {
     return false;
@@ -674,7 +754,7 @@ bool GameLibrary::AddDisc(uint32_t title_id, const std::string& name,
   // Which release this belongs to is the file's own version. Discs of a set
   // share one, so a disc joins its siblings without anything having to work
   // out that they are siblings.
-  const auto info = ReadGameFileInfo(path);
+  const auto info = ReadGameFileInfo(path, language_);
   const LibraryKey key{title_id, info ? info->version : 0};
   LibraryEntry* existing = Find(key);
 
@@ -684,14 +764,9 @@ bool GameLibrary::AddDisc(uint32_t title_id, const std::string& name,
   } else {
     entry.title_id = title_id;
     entry.version = key.version;
-    entry.name = name;
-    if (entry.name.empty()) {
-      // A recorded disc swap supplies no name. Borrow the title's, or the
-      // release shows up in the list as a nameless entry.
-      if (const auto* sibling = FindByTitle(title_id)) {
-        entry.name = sibling->name;
-      }
-    }
+    const auto* sibling = FindByTitle(title_id);
+    entry.name = NameNewRelease(title_id, info ? &*info : nullptr, hint,
+                                sibling ? sibling->name : std::string(), path);
   }
 
   const bool known =

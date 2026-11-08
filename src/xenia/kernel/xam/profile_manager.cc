@@ -20,6 +20,7 @@
 #include "xenia/hid/input_system.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/crypto_utils.h"
+#include "xenia/kernel/xam/xam_state.h"
 #include "xenia/kernel/xboxkrnl/xecrypt_sha.h"
 #include "xenia/vfs/devices/host_path_device.h"
 
@@ -112,28 +113,30 @@ ProfileManager::ProfileManager(KernelState* kernel_state,
     LoadAccount(account_xuid);
   }
 
+  // Nothing listens yet. The first title listener gets a sign-in change when
+  // it registers and the host UI one once the kernel is up.
   if (!cvars::logged_profile_slot_0_xuid.empty()) {
     Login(xe::string_util::from_string<uint64_t>(
               cvars::logged_profile_slot_0_xuid, true),
-          0);
+          0, false);
   }
 
   if (!cvars::logged_profile_slot_1_xuid.empty()) {
     Login(xe::string_util::from_string<uint64_t>(
               cvars::logged_profile_slot_1_xuid, true),
-          1);
+          1, false);
   }
 
   if (!cvars::logged_profile_slot_2_xuid.empty()) {
     Login(xe::string_util::from_string<uint64_t>(
               cvars::logged_profile_slot_2_xuid, true),
-          2);
+          2, false);
   }
 
   if (!cvars::logged_profile_slot_3_xuid.empty()) {
     Login(xe::string_util::from_string<uint64_t>(
               cvars::logged_profile_slot_3_xuid, true),
-          3);
+          3, false);
   }
 }
 
@@ -211,8 +214,7 @@ void ProfileManager::SyncProfilesWithConfig() {
   }
 
   // Send a single notification after all changes
-  kernel_state_->BroadcastNotification(kXNotificationSystemSignInChanged,
-                                       GetUsedUserSlots().to_ulong());
+  NotifySignInChanged();
 }
 
 UserProfile* ProfileManager::GetProfileLive(const uint64_t xuid) const {
@@ -314,6 +316,55 @@ bool ProfileManager::LoadAccount(const uint64_t xuid) {
   return true;
 }
 
+std::vector<uint8_t> ProfileManager::GetAccountIcon(const uint64_t xuid) {
+  static constexpr XTileType kIconTiles[] = {
+      XTileType::kPersonalGamerTile, XTileType::kGamerTile,
+      XTileType::kPersonalGamerTileSmall, XTileType::kGamerTileSmall};
+
+  if (const auto profile = GetProfile(xuid); profile) {
+    for (const XTileType tile_type : kIconTiles) {
+      const auto icon = profile->GetProfileIcon(tile_type);
+      if (!icon.empty()) {
+        return {icon.begin(), icon.end()};
+      }
+    }
+    return {};
+  }
+
+  if (!accounts_.contains(xuid) || !MountProfile(xuid)) {
+    return {};
+  }
+
+  std::vector<uint8_t> icon_data;
+  for (const XTileType tile_type : kIconTiles) {
+    const std::string guest_path = fmt::format(kDefaultMountFormat, xuid) +
+                                   ":\\" + kTileFileNames.at(tile_type);
+
+    xe::vfs::File* file = nullptr;
+    xe::vfs::FileAction action = {};
+    const X_STATUS status = kernel_state_->file_system()->OpenFile(
+        nullptr, guest_path, xe::vfs::FileDisposition::kOpen,
+        xe::vfs::FileAccess::kFileReadData, false, true, &file, &action);
+    if (XFAILED(status) || !file) {
+      continue;
+    }
+    if (file->entry()) {
+      icon_data.resize(file->entry()->size());
+      size_t bytes_read = 0;
+      file->ReadSync(std::span<uint8_t>(icon_data.data(), icon_data.size()), 0,
+                     &bytes_read);
+      icon_data.resize(bytes_read);
+    }
+    file->Destroy();
+    if (!icon_data.empty()) {
+      break;
+    }
+  }
+
+  DismountProfile(xuid);
+  return icon_data;
+}
+
 bool ProfileManager::MountProfile(const uint64_t xuid, std::string mount_path) {
   std::filesystem::path profile_path = GetProfilePath(xuid);
   if (mount_path.empty()) {
@@ -359,7 +410,7 @@ void ProfileManager::Login(const uint64_t xuid, const uint8_t user_index,
     return entry.second->xuid() == xuid;
   });
   if (it != logged_profiles_.end()) {
-    Logout(it->first);
+    Logout(it->first, notify);
   }
 
   // Whoever holds the slot asked for leaves it.
@@ -395,10 +446,15 @@ void ProfileManager::Login(const uint64_t xuid, const uint8_t user_index,
   user_tracker_->AddUser(xuid);
 
   if (notify) {
-    kernel_state_->BroadcastNotification(kXNotificationSystemSignInChanged,
-                                         GetUsedUserSlots().to_ulong());
+    NotifySignInChanged();
   }
   UpdateConfig(xuid, assigned_user_slot);
+}
+
+void ProfileManager::NotifySignInChanged() {
+  kernel_state_->BroadcastNotification(kXNotificationSystemSignInChanged,
+                                       GetUsedUserSlots().to_ulong());
+  kernel_state_->emulator()->on_signin_changed();
 }
 
 void ProfileManager::Logout(const uint8_t user_index, bool notify) {
@@ -412,22 +468,18 @@ void ProfileManager::Logout(const uint8_t user_index, bool notify) {
   DismountProfile(profile->second->xuid());
   logged_profiles_.erase(profile);
   if (notify) {
-    kernel_state_->BroadcastNotification(kXNotificationSystemSignInChanged,
-                                         GetUsedUserSlots().to_ulong());
+    NotifySignInChanged();
   }
   UpdateConfig(0, user_index);
 }
 
 void ProfileManager::LoginMultiple(
     const std::map<uint8_t, uint64_t>& profiles) {
-  int slots_mask = 0;
   for (auto [slot, xuid] : profiles) {
     Login(xuid, slot, false);
-    slots_mask |= (1 << slot);
   }
 
-  kernel_state_->BroadcastNotification(kXNotificationSystemSignInChanged,
-                                       slots_mask);
+  NotifySignInChanged();
 }
 
 std::vector<uint64_t> ProfileManager::FindProfiles() const {
@@ -661,8 +713,7 @@ bool ProfileManager::UpdateAccount(const uint64_t xuid,
     // Turning Live on or off moves the user between signed in locally and
     // signed in to Live.
     if (live_changed) {
-      kernel_state_->BroadcastNotification(kXNotificationSystemSignInChanged,
-                                           GetUsedUserSlots().to_ulong());
+      NotifySignInChanged();
     }
   }
   return true;

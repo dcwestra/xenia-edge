@@ -122,25 +122,29 @@ dword_result_t NtQueryInformationFile_entry(
       break;
     }
     case XFileXctdCompressionInformation: {
-      // Bit 0 set for a file stored XCTD compressed, which a title then
-      // decompresses itself as it reads. Kinect Sports (4D5308C9) asks of its
-      // asset bundles, and taking a failure as "don't know" it reads a
-      // compressed one as it is and corrupts its heap. On the console this
-      // probably comes from the file system; here it's the magic such a file
-      // begins with.
+      // Only disc file systems answer. Their directory entries flag compressed
+      // files but rebuilt images can lose the flag, unlike the magic those
+      // files start with.
+      if (!file->device()->is_gdfx()) {
+        status = X_STATUS_INVALID_PARAMETER;
+        out_length = 0;
+        break;
+      }
       constexpr uint32_t kXctdMagic = 0x0FF512ED;
       uint8_t magic[4] = {};
       size_t bytes_read = 0;
-      kernel_state()->RunBlockingIo(
-          [&]() {
-            if (file->file()->ReadSync(magic, 0, &bytes_read) !=
-                X_STATUS_SUCCESS) {
-              bytes_read = 0;
-            }
-          },
-          file->device()->supports_concurrent_io()
-              ? GuestScheduler::BlockingCallClass::kConcurrent
-              : GuestScheduler::BlockingCallClass::kSerial);
+      if (!(file->entry()->attributes() & vfs::kFileAttributeDirectory)) {
+        kernel_state()->RunBlockingIo(
+            [&]() {
+              if (file->file()->ReadSync(magic, 0, &bytes_read) !=
+                  X_STATUS_SUCCESS) {
+                bytes_read = 0;
+              }
+            },
+            file->device()->supports_concurrent_io()
+                ? GuestScheduler::BlockingCallClass::kConcurrent
+                : GuestScheduler::BlockingCallClass::kSerial);
+      }
       auto info = info_ptr.as<X_FILE_XCTD_COMPRESSION_INFORMATION*>();
       info->flags = bytes_read == sizeof(magic) &&
                             xe::load_and_swap<uint32_t>(magic) == kXctdMagic

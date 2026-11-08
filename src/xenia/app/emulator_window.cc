@@ -11,8 +11,10 @@
 
 #include "xenia/app/discord/discord_presence.h"
 #include "xenia/app/game_compat_db.h"
+#include "xenia/app/game_title_db.h"
 #include "xenia/ui/advanced_settings_dialog_wx.h"
 #include "xenia/ui/avatar_editor_dialog_wx.h"
+#include "xenia/ui/cover_art_downloader.h"
 #include "xenia/ui/game_list_panel_wx.h"
 #include "xenia/ui/game_scan_progress_dialog_wx.h"
 #include "xenia/ui/install_progress_dialog_wx.h"
@@ -20,6 +22,7 @@
 #include "xenia/ui/quick_settings_dialog_wx.h"
 #include "xenia/ui/system_files_installer_wx.h"
 #include "xenia/ui/windowed_app_wx.h"
+#include "xenia/ui/wx_locale.h"
 
 #include <algorithm>
 #include <array>
@@ -32,6 +35,7 @@
 #include <span>
 #include <sstream>
 #include <thread>
+#include <unordered_map>
 
 #include <wx/timer.h>
 
@@ -138,7 +142,10 @@ extern char** environ;
 #include "xenia/gpu/command_processor.h"
 #include "xenia/gpu/graphics_system.h"
 #include "xenia/hid/input_system.h"
+#include "xenia/kernel/title_id_utils.h"
 #include "xenia/kernel/user_module.h"
+#include "xenia/kernel/xam/content_manager.h"
+#include "xenia/kernel/xam/indie_game.h"
 #include "xenia/kernel/xam/profile_manager.h"
 #include "xenia/kernel/xam/xam_module.h"
 #include "xenia/kernel/xam/xam_state.h"
@@ -197,6 +204,12 @@ DEFINE_transient_bool(return_to_ui, false,
                       "Return to UI process when game exits. Set automatically "
                       "when launching from UI.",
                       "General");
+
+DEFINE_bool(boot_to_dashboard, false,
+            "Start the installed dashboard after the boot animation instead of "
+            "showing the game list, and go back to the dashboard when a title "
+            "exits.",
+            "General");
 
 DEFINE_bool(fullscreen, false, "Whether to launch the emulator in fullscreen.",
             "Display");
@@ -681,13 +694,30 @@ void EmulatorWindow::ShutdownGraphicsSystemPresenterPainting() {
 
 void EmulatorWindow::PublishLibraryTitles() {
   std::vector<Emulator::LibraryTitle> titles;
+  const auto indie_games_path =
+      emulator_->kernel_state()->content_manager()->IndieGamesPath();
   for (const auto& entry : game_library_->entries()) {
     if (entry.paths.empty()) {
       continue;
     }
-    titles.push_back(
-        {entry.title_id, entry.version, entry.name, entry.default_path().path,
-         game_library_->IconPath(entry.key()), entry.content_type});
+    auto path = entry.default_path().path;
+    // The dashboard lists an installed indie package itself so a game also
+    // added from elsewhere goes by the installed copy.
+    if (entry.content_type == XContentType::kMarketplaceContent &&
+        entry.paths.size() > 1) {
+      for (const auto& other : entry.paths) {
+        std::error_code ec;
+        if (std::filesystem::equivalent(other.path.parent_path(),
+                                        indie_games_path, ec)) {
+          path = other.path;
+          break;
+        }
+      }
+    }
+    titles.push_back({entry.title_id, entry.version, entry.name,
+                      std::move(path), game_library_->IconPath(entry.key()),
+                      game_library_->BoxArtPath(entry.key()),
+                      entry.content_type});
   }
   emulator_->SetLibraryTitles(std::move(titles));
 }
@@ -696,8 +726,11 @@ void EmulatorWindow::InitializeGameLibrary() {
   const auto library_root = emulator_->storage_root() / "library";
 
   game_library_ = std::make_unique<GameLibrary>(library_root);
+  game_library_->set_language(
+      XLanguageFromLocaleCode(ui::GetActiveLocaleCanonicalName()));
   game_library_->set_changed_callback([this]() { PublishLibraryTitles(); });
   game_library_->Load();
+  AddInstalledIndieGamesToLibrary();
 
   // The files are read off the UI thread, and each result is recorded back on
   // it so the library is only ever changed from there.
@@ -767,6 +800,15 @@ void EmulatorWindow::AddLaunchedTitleToLibrary(uint32_t title_id,
     }
     return;
   }
+  // The XNA title launcher runs an indie game, which is listed as itself from
+  // its package. The launcher can't run without one so it isn't listed.
+  if (title_id == kernel::kXN_2002) {
+    if (const auto& game = emulator_->indie_game()) {
+      RecordLaunchedDisc(game->title_id, game->name, game->package_path);
+      SetIndieGameIcon(*game);
+    }
+    return;
+  }
   // The disc's path belongs to the disc's own title, not the package's.
   if (!emulator_->last_launch_package().empty()) {
     return;
@@ -777,30 +819,72 @@ void EmulatorWindow::AddLaunchedTitleToLibrary(uint32_t title_id,
     return;
   }
 
-  // Adopt the running title's icon if we have no art yet. The SPA writes it to
-  // the per-title GPD on boot, so a signed-in profile has it by now.
+  // Adopt the running title's icon if we have no art yet, the one from its SPA
+  // that the window shows.
   std::error_code ec;
   if (title_id == 0 ||
       std::filesystem::exists(game_library_->IconPath(*key), ec)) {
     return;
   }
-  auto* xam_state = emulator_->kernel_state()
-                        ? emulator_->kernel_state()->xam_state()
-                        : nullptr;
-  auto* pm = xam_state ? xam_state->profile_manager() : nullptr;
-  if (!pm) {
+  auto* game_info = emulator_->game_info_database();
+  if (!game_info || !game_info->IsValid()) {
     return;
   }
-  for (uint8_t slot = 0; slot < XUserMaxUserCount; ++slot) {
-    auto* profile = pm->GetProfile(slot);
-    if (!profile) {
-      continue;
-    }
-    auto icon = profile->GetTitleIcon(title_id);
-    if (!icon.empty()) {
-      game_library_->SetIcon(*key, icon);
+  auto icon = game_info->GetIcon();
+  if (!icon.empty()) {
+    game_library_->SetIcon(*key, icon);
+  }
+}
+
+bool EmulatorWindow::AddInstalledIndieGamesToLibrary() {
+  bool changed = false;
+  while (const auto* launcher = game_library_->FindByTitle(kernel::kXN_2002)) {
+    if (!game_library_->Remove(launcher->key())) {
       break;
     }
+    changed = true;
+  }
+  // A listed package isn't read again, which for one kept as the package file
+  // means mounting it.
+  std::set<std::filesystem::path> listed;
+  for (const auto& entry : game_library_->entries()) {
+    if (entry.content_type == XContentType::kMarketplaceContent) {
+      for (const auto& path : entry.paths) {
+        listed.insert(path.path);
+      }
+    }
+  }
+  const auto root =
+      emulator_->kernel_state()->content_manager()->IndieGamesPath();
+  for (const auto& package : xe::filesystem::ListFiles(root)) {
+    const auto path = package.path / package.name;
+    if (listed.contains(path)) {
+      continue;
+    }
+    const auto game = kernel::xam::ReadIndieGame(path);
+    if (!game ||
+        game_library_->FindByPath(game->title_id, game->package_path)) {
+      continue;
+    }
+    if (game_library_->AddDisc(game->title_id, game->name,
+                               game->package_path)) {
+      SetIndieGameIcon(*game);
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+void EmulatorWindow::SetIndieGameIcon(const kernel::xam::IndieGame& game) {
+  const auto* entry =
+      game_library_->FindByPath(game.title_id, game.package_path);
+  std::error_code ec;
+  if (!entry ||
+      std::filesystem::exists(game_library_->IconPath(entry->key()), ec)) {
+    return;
+  }
+  if (!game.icon.empty()) {
+    game_library_->SetIcon(entry->key(), game.icon);
   }
 }
 
@@ -851,6 +935,16 @@ void EmulatorWindow::OnEmulatorInitialized() {
               ApplyContentVisibility();
             });
       });
+  // Sign-in changes come from the title, the ImGui profiles menu and the wx
+  // menu alike. Deferred, since the ImGui menu signs in while it draws.
+  emulator_->on_signin_changed.AddListener([this]() {
+    app_context_.CallInUIThreadDeferred([this]() {
+      if (game_list_panel_ && !emulator_->is_title_open()) {
+        game_list_panel_->Reload();
+      }
+      RefreshProfileMenu();
+    });
+  });
   emulator_->on_relaunch_failed.AddListener([this]() {
     app_context_.CallInUIThread([this]() { OnLaunchFailed(); });
   });
@@ -948,8 +1042,10 @@ void EmulatorWindow::OnEmulatorInitialized() {
             launch_data.length(), xe::strip_pii(xbox_disc), package);
 
         std::vector<std::string> args;
-        // Preserve return_to_ui through the title-to-title chain
-        if (cvars::return_to_ui) {
+        // Preserve return_to_ui through the title-to-title chain. The game list
+        // gets it too, which keeps boot_to_dashboard from starting the
+        // dashboard in its place.
+        if (cvars::return_to_ui || host_path.empty()) {
           args.push_back("--return_to_ui=true");
         }
         // Preserve fullscreen state, except when returning to UI (no game).
@@ -992,7 +1088,8 @@ void EmulatorWindow::OnEmulatorInitialized() {
       });
 
   emulator_->set_on_exit_to_dashboard(
-      [this]() { return StopTitleAndReturnToList(); });
+      [this]() { return StopTitleAndReturnHome(); });
+  emulator_->set_on_power_off([this]() { return StopTitleAndReturnToList(); });
 
   // Register callback for disc swap to update title bar
   emulator_->set_on_disc_swap([this](uint8_t) {
@@ -1002,6 +1099,12 @@ void EmulatorWindow::OnEmulatorInitialized() {
   // The dashboard's open tray asks for a disc the way File > Open asks for a
   // title.
   emulator_->set_disc_picker([this]() { return PickTitleFile(); });
+
+  // File > Close of a title in its own process starts a new one for the list.
+  if (cvars::target.empty() && !cvars::return_to_ui &&
+      !emulator_->is_title_open() && DashboardIsHome()) {
+    StartDashboard();
+  }
 }
 
 void EmulatorWindow::EmulatorWindowListener::OnClosing(ui::UIEvent& e) {
@@ -1172,9 +1275,18 @@ bool EmulatorWindow::Initialize() {
       tools_menu->AddChild(
           WxMenuItem::Create(MenuItem::Type::kString, _("&Install Content..."),
                              std::bind(&EmulatorWindow::InstallContent, this)));
+      auto system_files_menu =
+          WxMenuItem::Create(MenuItem::Type::kPopup, _("Install System Files"));
+      system_files_menu->AddChild(WxMenuItem::Create(
+          MenuItem::Type::kString, _("Download && Install..."),
+          std::bind(&EmulatorWindow::DownloadSystemFiles, this)));
+      system_files_menu->AddChild(WxMenuItem::Create(
+          MenuItem::Type::kString, _("Select File..."),
+          std::bind(&EmulatorWindow::SelectSystemFiles, this)));
+      tools_menu->AddChild(std::move(system_files_menu));
       tools_menu->AddChild(WxMenuItem::Create(
-          MenuItem::Type::kString, _("Install System Files..."),
-          std::bind(&EmulatorWindow::InstallSystemFiles, this)));
+          MenuItem::Type::kString, _("Download Cover Art..."),
+          std::bind(&EmulatorWindow::DownloadCoverArt, this)));
     }
     tools_menu_ = tools_menu.get();
     main_menu->AddChild(std::move(tools_menu));
@@ -1448,8 +1560,10 @@ bool EmulatorWindow::Initialize() {
       game_list_panel_ = new GameListPanel(frame, this);
       game_list_panel_->SetLaunchCallback(
           [this](const std::filesystem::path& path) { RunTitle(path); });
+      // Added hidden, since showing both center panes at once moves one off
+      // dock position 0 and wx then ignores Show() on it.
       aui->AddPane(game_list_panel_,
-                   wxAuiPaneInfo().Name("game_list").CenterPane());
+                   wxAuiPaneInfo().Name("game_list").CenterPane().Hide());
       aui->Update();
       wx_window->SetContentVisibilityCallback(
           [this]() { ApplyContentVisibility(); });
@@ -1763,13 +1877,15 @@ void EmulatorWindow::ToggleContextMenu(bool use_cursor_position) {
 
   context_menu->AddSeparator();
 
-  context_menu->AddAction("Return to Game List", [this, input_sys]() {
+  const char* return_label =
+      DashboardIsHome() ? "Return to Dashboard" : "Return to Game List";
+  context_menu->AddAction(return_label, [this, input_sys, return_label]() {
     new ui::ImGuiConfirmDialog(
-        imgui_drawer(), "Return to Game List",
+        imgui_drawer(), return_label,
         "Really stop title? Unsaved progress will be lost.",
         [this](bool confirmed) {
           if (confirmed) {
-            StopTitleAndReturnToList();
+            StopTitleAndReturnHome();
           }
         },
         input_sys);
@@ -2066,6 +2182,12 @@ std::filesystem::path EmulatorWindow::GetInstalledDashboardPath() const {
   return emulator_->system_files_path() / "flash" / "dash.xex";
 }
 
+bool EmulatorWindow::DashboardIsHome() const {
+  std::error_code ec;
+  return cvars::boot_to_dashboard &&
+         std::filesystem::exists(GetInstalledDashboardPath(), ec);
+}
+
 void EmulatorWindow::FileAddGames() {
   auto file_picker = xe::ui::FilePicker::Create();
   file_picker->set_mode(ui::FilePicker::Mode::kOpen);
@@ -2113,10 +2235,9 @@ void EmulatorWindow::FileAddGames() {
         continue;
       }
       const auto& primary = group.front().game;
-      const std::string name = ResolveImportName(primary);
       bool changed = false;
       for (const auto& pi : group) {
-        changed |= library->AddDisc(primary.title_id, name, pi.game.path);
+        changed |= library->AddDisc(primary.title_id, {}, pi.game.path);
       }
       if (!changed) {
         continue;
@@ -2212,6 +2333,24 @@ bool EmulatorWindow::StopTitleAndReturnToList() {
     });
   }).detach();
   return true;
+}
+
+bool EmulatorWindow::StopTitleAndReturnHome() {
+  if (!DashboardIsHome()) {
+    return StopTitleAndReturnToList();
+  }
+  if (!emulator_->is_title_open()) {
+    return false;
+  }
+  // Deferred, since the context menu asks from inside a draw. The dashboard's
+  // launch clears the file XeFu found missing, so it's taken first.
+  return app_context_.CallInUIThreadDeferred(
+      [this, missing_xefu_file = emulator_->TakeMissingXeFuFile()]() {
+        RunTitle(GetInstalledDashboardPath());
+        if (!missing_xefu_file.empty()) {
+          ShowMissingXeFuFile(missing_xefu_file);
+        }
+      });
 }
 
 void EmulatorWindow::OnLaunchFailed() {
@@ -2449,16 +2588,159 @@ void EmulatorWindow::InstallContent() {
                                 emulator_->content_root(),
                                 content_installation_status);
   dlg.StartWhenShown([this, content_installation_status] {
-    std::thread([this, content_installation_status] {
+    std::thread([this, content_installation_status, alive = library_fill_alive_,
+                 app_context = &app_context_] {
       for (auto& entry : *content_installation_status) {
         emulator_->InstallContentPackage(entry.path_, entry);
       }
+      // The dialog can close before the packages are in place.
+      app_context->CallInUIThread([this, alive]() {
+        if (alive->load(std::memory_order_relaxed) && game_library_ &&
+            AddInstalledIndieGamesToLibrary() && game_list_panel_ &&
+            !emulator_->is_title_open()) {
+          game_list_panel_->Reload();
+        }
+      });
     }).detach();
   });
   dlg.ShowModal();
 }
 
-void EmulatorWindow::InstallSystemFiles() {
+void EmulatorWindow::DownloadCoverArt() {
+  if (!game_library_) {
+    return;
+  }
+  // One download per game, saved into each of its releases without a cover.
+  std::vector<ui::CoverArtDownload> downloads;
+  std::unordered_map<uint32_t, size_t> by_game;
+  std::error_code ec;
+  for (const auto& entry : game_library_->entries()) {
+    const auto file = game_library_->BoxArtPath(entry.key());
+    if (entry.paths.empty() || std::filesystem::exists(file, ec)) {
+      continue;
+    }
+    const std::vector<uint32_t>* ids = GetTitleIdGroup(entry.title_id);
+    const uint32_t game = ids ? ids->front() : entry.title_id;
+    auto it = by_game.find(game);
+    if (it == by_game.end()) {
+      auto urls = GetBoxArtUrls(entry.title_id);
+      // A game the title database doesn't know has nowhere to get one from.
+      if (urls.empty()) {
+        continue;
+      }
+      it = by_game.emplace(game, downloads.size()).first;
+      downloads.push_back({std::move(urls), {}});
+    }
+    downloads[it->second].files.push_back(file);
+  }
+  if (downloads.empty()) {
+    ShowWindowMessage(window_.get(), _("Download Cover Art"),
+                      _("There's no cover art to download."),
+                      wxICON_INFORMATION);
+    return;
+  }
+
+  auto* wx_window = dynamic_cast<ui::WxWindow*>(window_.get());
+  ui::CoverArtResult result;
+  {
+    wxProgressDialog progress(_("Download Cover Art"),
+                              _("Downloading cover art..."), 100,
+                              wx_window ? wx_window->frame() : nullptr,
+                              wxPD_APP_MODAL | wxPD_CAN_ABORT | wxPD_AUTO_HIDE);
+    result =
+        ui::DownloadCoverArt(downloads, [&progress](size_t done, size_t total) {
+          return progress.Update(int(done * 100 / total));
+        });
+  }
+  if (result.downloaded && game_list_panel_) {
+    game_list_panel_->Reload();
+  }
+  if (result.cancelled) {
+    return;
+  }
+  wxString message =
+      wxString::Format(_("Covers downloaded: %d"), int(result.downloaded));
+  if (result.not_downloaded) {
+    message += "\n";
+    message +=
+        wxString::Format(_("Games whose cover couldn't be downloaded: %d"),
+                         int(result.not_downloaded));
+  }
+  if (result.not_saved) {
+    message += "\n";
+    message += wxString::Format(_("Covers that couldn't be saved: %d"),
+                                int(result.not_saved));
+  }
+  ShowWindowMessage(window_.get(), _("Download Cover Art"), message,
+                    wxICON_INFORMATION);
+}
+
+bool EmulatorWindow::ConfirmReplaceSystemFiles() {
+  if (!ui::HasSystemFiles(emulator_->system_files_path())) {
+    return true;
+  }
+  auto* wx_window = dynamic_cast<ui::WxWindow*>(window_.get());
+  wxMessageDialog prompt(
+      wx_window ? wx_window->frame() : nullptr,
+      _("System files are already installed. Do you want to replace them?"),
+      _("Install System Files"), wxYES_NO | wxNO_DEFAULT | wxICON_WARNING);
+  return prompt.ShowModal() == wxID_YES;
+}
+
+void EmulatorWindow::DownloadSystemFiles() {
+  if (!ConfirmReplaceSystemFiles()) {
+    return;
+  }
+  const auto system_path = emulator_->system_files_path();
+  auto* wx_window = dynamic_cast<ui::WxWindow*>(window_.get());
+  ui::SystemUpdateDownload result;
+  {
+    wxProgressDialog progress(_("Install System Files"),
+                              _("Downloading the system update..."), 100,
+                              wx_window ? wx_window->frame() : nullptr,
+                              wxPD_APP_MODAL | wxPD_CAN_ABORT | wxPD_AUTO_HIDE);
+    result = ui::DownloadSystemUpdate(
+        system_path, [&progress](uint64_t received, uint64_t size) {
+          // The dialog closes itself at 100, which must wait for the update
+          // to be verified.
+          return progress.Update(
+              int(std::min(received * 100 / size, uint64_t(99))));
+        });
+  }
+  switch (result) {
+    case ui::SystemUpdateDownload::kDownloaded:
+      break;
+    case ui::SystemUpdateDownload::kCancelled:
+      return;
+    case ui::SystemUpdateDownload::kFailed:
+      ShowWindowMessage(
+          window_.get(), _("Install System Files"),
+          _("Download failed. Check your internet connection and try again."),
+          wxICON_ERROR);
+      return;
+    case ui::SystemUpdateDownload::kNotVerified:
+      ShowWindowMessage(window_.get(), _("Install System Files"),
+                        _("The downloaded file failed integrity verification "
+                          "and was discarded."),
+                        wxICON_ERROR);
+      return;
+    case ui::SystemUpdateDownload::kWriteFailed:
+      ShowWindowMessage(window_.get(), _("Install System Files"),
+                        _("Failed to write the system files."), wxICON_ERROR);
+      return;
+  }
+  // Kept until it's installed, so a failed install doesn't download it again.
+  const auto zip_path = ui::GetSystemUpdateDownloadPath(system_path);
+  if (InstallSystemFiles(zip_path)) {
+    std::error_code ec;
+    std::filesystem::remove(zip_path, ec);
+  }
+}
+
+void EmulatorWindow::SelectSystemFiles() {
+  if (!ConfirmReplaceSystemFiles()) {
+    return;
+  }
   auto file_picker = xe::ui::FilePicker::Create();
   file_picker->set_mode(ui::FilePicker::Mode::kOpen);
   file_picker->set_type(ui::FilePicker::Type::kFile);
@@ -2471,8 +2753,10 @@ void EmulatorWindow::InstallSystemFiles() {
       file_picker->selected_files().empty()) {
     return;
   }
-  const auto zip_path = file_picker->selected_files().front();
+  InstallSystemFiles(file_picker->selected_files().front());
+}
 
+bool EmulatorWindow::InstallSystemFiles(const std::filesystem::path& zip_path) {
   auto* wx_window = dynamic_cast<ui::WxWindow*>(window_.get());
   ui::SystemFilesResult result;
   {
@@ -2525,6 +2809,7 @@ void EmulatorWindow::InstallSystemFiles() {
           wxICON_ERROR);
       break;
   }
+  return result == ui::SystemFilesResult::kSuccess;
 }
 
 void EmulatorWindow::ShowContentDirectory() {
@@ -2710,10 +2995,6 @@ void EmulatorWindow::PopulateProfileMenu(ui::MenuItem* parent) {
                     m->Login(this_xuid, this_slot);
                   }
                 }
-                if (game_list_panel_ && !emulator_->is_title_open()) {
-                  game_list_panel_->Reload();
-                }
-                RefreshProfileMenu();
               }));
         }
         entry->AddChild(std::move(login));
@@ -2731,10 +3012,6 @@ void EmulatorWindow::PopulateProfileMenu(ui::MenuItem* parent) {
                   }
                 }
               }
-              if (game_list_panel_ && !emulator_->is_title_open()) {
-                game_list_panel_->Reload();
-              }
-              RefreshProfileMenu();
             });
         auto* logout_ptr = logout.get();
         entry->AddChild(std::move(logout));
@@ -3128,18 +3405,8 @@ void EmulatorWindow::RefreshProfileIcon() {
 
   wxBitmapBundle bundle;
   if (signed_in) {
-    // Try the 64-px tile first, fall back to the 32-px tile (decode_to_bundle
-    // upscales as needed) so a profile that only has a small icon still
-    // shows something instead of the default user art.
-    for (auto tile : {kernel::xam::XTileType::kPersonalGamerTile,
-                      kernel::xam::XTileType::kGamerTile,
-                      kernel::xam::XTileType::kPersonalGamerTileSmall,
-                      kernel::xam::XTileType::kGamerTileSmall}) {
-      bundle = decode_to_bundle(signed_in->GetProfileIcon(tile));
-      if (bundle.IsOk()) {
-        break;
-      }
-    }
+    // decode_to_bundle upscales a 32 px picture.
+    bundle = decode_to_bundle(pm->GetAccountIcon(signed_in->xuid()));
   }
   if (!bundle.IsOk()) {
     bundle = wx_toolbar_state_->profile_default_bundle;

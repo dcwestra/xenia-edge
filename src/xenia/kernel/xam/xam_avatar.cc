@@ -19,6 +19,7 @@
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xam/avatar_assets.h"
 #include "xenia/kernel/xam/xam_private.h"
+#include "xenia/kernel/xam/xam_state.h"
 #include "xenia/memory.h"
 
 DEFINE_bool(allow_avatar_initialization, false,

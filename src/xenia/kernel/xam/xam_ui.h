@@ -11,6 +11,7 @@
 #define XENIA_KERNEL_XAM_XAM_UI_H_
 
 #include "xenia/kernel/util/shim_utils.h"
+#include "xenia/kernel/xam/xam.h"
 #include "xenia/ui/imgui_dialog.h"
 #include "xenia/ui/imgui_drawer.h"
 #include "xenia/ui/imgui_gamepad_dialog.h"
@@ -193,10 +194,6 @@ bool xeDrawProfileContent(xe::ui::ImGuiDrawer* imgui_drawer,
                           std::function<bool()> context_menu,
                           std::function<void()> on_profile_change,
                           uint64_t* selected_xuid);
-
-// Picks an installed indie game, or reports that there are none.
-bool xeXamChooseIndieGame(std::string* file_name, uint32_t* device_id,
-                          std::string* display_name);
 
 }  // namespace xam
 }  // namespace kernel

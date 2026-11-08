@@ -333,15 +333,7 @@ void ProfileEditorDialog::LoadProfileData() {
     load_string(UserSettingId::XPROFILE_GAMERCARD_USER_BIO,
                 original_data_.gamer_bio);
 
-    for (auto tile :
-         {XTileType::kPersonalGamerTile, XTileType::kGamerTile,
-          XTileType::kPersonalGamerTileSmall, XTileType::kGamerTileSmall}) {
-      auto data = profile->GetProfileIcon(tile);
-      if (!data.empty()) {
-        original_data_.profile_icon.assign(data.begin(), data.end());
-        break;
-      }
-    }
+    original_data_.profile_icon = pm->GetAccountIcon(xuid_);
   }
 
   current_data_ = original_data_;
@@ -625,6 +617,8 @@ void ProfileEditorDialog::OnSave() {
   auto account = account_original;
   std::u16string gamertag =
       xe::to_utf16(gamertag_edit_->GetValue().utf8_string());
+  // Clear the old gamertag so a shorter one leaves no stale tail.
+  std::ranges::fill(account.gamertag, u'\0');
   string_util::copy_and_swap_truncating(account.gamertag, gamertag,
                                         std::size(account.gamertag));
   account.SetLanguage(static_cast<XLanguage>(
@@ -644,17 +638,14 @@ void ProfileEditorDialog::OnSave() {
   }
 
   if (current_data_.profile_icon != original_data_.profile_icon) {
-    // Drop both on-disk tiles and the cached image map first so a smaller
-    // replacement icon doesn't get masked by a stale larger tile (the
-    // toolbar prefers the 64-px file).
-    auto* fs = kernel_state->file_system();
-    fs->DeletePath(fmt::format("User_{:016X}:\\tile_64.png", xuid_));
-    fs->DeletePath(fmt::format("User_{:016X}:\\tile_32.png", xuid_));
+    // Every old picture goes first so a cleared one stays gone and a new one
+    // isn't hidden behind an old tile.
     if (profile) {
-      profile->ClearProfileIcon(XTileType::kGamerTile);
-      profile->ClearProfileIcon(XTileType::kGamerTileSmall);
-      profile->ClearProfileIcon(XTileType::kPersonalGamerTile);
-      profile->ClearProfileIcon(XTileType::kPersonalGamerTileSmall);
+      for (auto tile : {XTileType::kGamerTile, XTileType::kGamerTileSmall,
+                        XTileType::kPersonalGamerTile,
+                        XTileType::kPersonalGamerTileSmall}) {
+        profile->ClearProfileIcon(tile);
+      }
     }
     if (!current_data_.profile_icon.empty()) {
       xam_state->user_tracker()->UpdateUserIcon(

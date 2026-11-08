@@ -47,12 +47,18 @@
 #include "xenia/hid/input_system.h"
 #include "xenia/kernel/guest_scheduler.h"
 #include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/smc.h"
 #include "xenia/kernel/title_id_utils.h"
 #include "xenia/kernel/user_module.h"
 #include "xenia/kernel/xam/achievement_manager.h"
 #include "xenia/kernel/xam/content_manager.h"
+#include "xenia/kernel/xam/indie_game.h"
+#include "xenia/kernel/xam/system_manifest.h"
+#include "xenia/kernel/xam/title_image_device.h"
 #include "xenia/kernel/xam/ui/disc_swap_ui.h"
+#include "xenia/kernel/xam/xam_content_device.h"
 #include "xenia/kernel/xam/xam_module.h"
+#include "xenia/kernel/xam/xam_state.h"
 #include "xenia/kernel/xam/xdbf/spa_info.h"
 #include "xenia/kernel/xbdm/xbdm_module.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_module.h"
@@ -426,11 +432,13 @@ X_STATUS Emulator::Setup(
   // Bring up the virtual filesystem used by the kernel.
   file_system_ = std::make_unique<xe::vfs::VirtualFileSystem>();
 
-  patcher_ = std::make_unique<xe::patcher::Patcher>(storage_root_ / "patches");
+  patcher_ = std::make_unique<xe::patcher::Patcher>(patches_path());
 
   XELOGI("{}: Initializing Kernel...", __func__);
   // Shared kernel state.
   kernel_state_ = std::make_unique<xe::kernel::KernelState>(this);
+  // Its profile manager signed in the configured profiles without notifying.
+  on_signin_changed();
 #define LOAD_KERNEL_MODULE(t) \
   static_cast<void>(kernel_state_->LoadKernelModule<kernel::t>())
   // HLE kernel modules.
@@ -758,6 +766,7 @@ X_STATUS Emulator::LaunchPath(const std::filesystem::path& path,
   }
   // A file an earlier launch missed says nothing about this one.
   missing_xefu_file_.clear();
+  indie_package_.reset();
   // The drive starts empty.
   {
     std::lock_guard<std::mutex> lock(inserted_disc_mutex_);
@@ -766,6 +775,12 @@ X_STATUS Emulator::LaunchPath(const std::filesystem::path& path,
 
   if (!package_path.empty()) {
     return LaunchDiscPackage(path, package_path);
+  }
+
+  // A folder is an indie game's extracted package.
+  std::error_code ec;
+  if (std::filesystem::is_directory(path, ec)) {
+    return LaunchIndieGame(path);
   }
 
   X_STATUS mount_result = X_STATUS_SUCCESS;
@@ -788,6 +803,13 @@ X_STATUS Emulator::LaunchPath(const std::filesystem::path& path,
       if (header && header->content_metadata.content_type.get() ==
                         XContentType::kXboxTitle) {
         return LaunchXboxOriginal(path, "default.xbe");
+      }
+      if (header &&
+          header->content_metadata.content_type.get() ==
+              XContentType::kMarketplaceContent &&
+          header->content_metadata.execution_info.title_id.get() ==
+              kernel::kXN_2002) {
+        return LaunchIndieGame(path);
       }
       mount_result = MountPath(path, "\\Device\\Package_0");
       return mount_result ? mount_result : LaunchStfsContainer(path);
@@ -905,23 +927,36 @@ bool Emulator::UsesEmulatedDrive() const {
 }
 
 void Emulator::ChangeDisc() {
+  // The tray is open already, waiting on the disc being picked.
+  if (picking_disc_.exchange(true)) {
+    return;
+  }
   EjectDisc();
-  if (!disc_picker_ || !display_window_) {
-    return;
-  }
-  // The fiber parks while the picker is up, so the guest threads sharing its
-  // CPU keep running.
-  std::filesystem::path path;
-  xe::threading::Fence fence;
-  if (!display_window_->app_context().CallInUIThread([this, &path, &fence]() {
-        path = disc_picker_();
-        fence.Signal();
-      })) {
-    return;
-  }
-  kernel::GuestScheduler::WaitOnFence(fence);
-  if (!path.empty()) {
-    InsertDisc(path);
+  // The title runs on while the app picks, so it sees the drive go empty
+  // between the two discs.
+  const uint64_t launch = relaunch_requests_.load();
+  const auto close_tray = [this]() {
+    kernel_state_->smc()->SetTrayState(X_DVD_TRAY_STATE::CLOSED);
+    picking_disc_ = false;
+  };
+  if (!disc_picker_ || !display_window_ ||
+      !display_window_->app_context().CallInUIThread(
+          [this, close_tray, launch]() {
+            const std::filesystem::path path = disc_picker_();
+            // The pick is dropped for a title launched meanwhile. A launch
+            // under way holds the lock while it waits on this thread.
+            std::unique_lock<std::recursive_mutex> lock(launch_mutex_,
+                                                        std::try_to_lock);
+            if (!lock.owns_lock() || relaunch_requests_.load() != launch) {
+              picking_disc_ = false;
+              return;
+            }
+            if (!path.empty()) {
+              InsertDisc(path);
+            }
+            close_tray();
+          })) {
+    close_tray();
   }
 }
 
@@ -1072,6 +1107,70 @@ X_STATUS Emulator::LaunchXboxOriginal(const std::filesystem::path& path,
   loader_data.launch_data_present = true;
 
   InsertXboxGame(path);
+  X_STATUS result = MountPath(launcher, "\\Device\\Package_0");
+  return result ? result : LaunchXexFile(launcher);
+}
+
+X_STATUS Emulator::LaunchIndieGame(const std::filesystem::path& path) {
+  // The XNA title launcher runs the package its launch data names. One outside
+  // the launcher's content, or with a name it can't take, goes by a game
+  // library name.
+  const auto package = path.has_filename() ? path : path.parent_path();
+  auto game = kernel::xam::ReadIndieGame(package);
+  if (!game) {
+    XELOGE("{} isn't an indie game", xe::strip_pii(xe::path_to_utf8(package)));
+    return X_STATUS_NOT_SUPPORTED;
+  }
+  std::error_code ec;
+  const bool installed = std::filesystem::equivalent(
+      package.parent_path(), kernel_state_->content_manager()->IndieGamesPath(),
+      ec);
+  // An extracted package's license is in the header file its install wrote.
+  if (!installed && std::filesystem::is_directory(package, ec)) {
+    XELOGE("The indie game folder {} only runs from where it was installed",
+           xe::strip_pii(xe::path_to_utf8(package)));
+    return X_STATUS_NOT_SUPPORTED;
+  }
+  constexpr uint32_t kDeviceId =
+      static_cast<uint32_t>(kernel::xam::DummyDeviceId::HDD);
+  const std::string file_name = xe::path_to_utf8(package.filename());
+  std::vector<uint8_t> launch_data;
+  if (installed &&
+      kernel::xam::ContentManager::IsValidPackageFileName(file_name)) {
+    launch_data = kernel::xam::MakeIndieGameLaunchData(file_name, kDeviceId);
+  }
+  const bool library_name = launch_data.empty();
+  if (library_name) {
+    launch_data = kernel::xam::MakeIndieGameLaunchData(
+        kernel::xam::ContentManager::LibraryContentFileName(game->title_id, 0),
+        kDeviceId);
+  }
+  constexpr std::string_view kLauncherName = "xna_titlelauncher.xex";
+  const auto sysext = system_files_path() / "sysext";
+  const auto version = kernel::xam::FindSystemManifestFile(
+      xe::filesystem::ReadAllBytes(sysext / kernel::xam::kSystemManifestName),
+      kLauncherName);
+  const std::filesystem::path launcher =
+      version ? xe::filesystem::FindChildIgnoringCase(
+                    sysext / kernel::xam::SystemExtFolderName(*version),
+                    kLauncherName)
+              : std::filesystem::path();
+  if (launcher.empty()) {
+    XELOGE("Indie games run through {}, which comes with the system files",
+           kLauncherName);
+    return X_STATUS_NOT_SUPPORTED;
+  }
+  auto xam = kernel_state_->GetKernelModule<kernel::xam::XamModule>("xam.xex");
+  if (!xam) {
+    return X_STATUS_UNSUCCESSFUL;
+  }
+  auto& loader_data = xam->loader_data();
+  loader_data.launch_data = std::move(launch_data);
+  loader_data.launch_data_present = true;
+  if (library_name) {
+    indie_package_ = std::move(game);
+  }
+
   X_STATUS result = MountPath(launcher, "\\Device\\Package_0");
   return result ? result : LaunchXexFile(launcher);
 }
@@ -2508,6 +2607,19 @@ void Emulator::PrepareSystemTitle() {
   // xam links media: to the flash, which holds the system fonts.
   file_system_->RegisterSymbolicLink("media:", "\\SystemRoot");
 
+  // The dashboard loads box art from under kTitleImageUriRoot.
+  std::string title_images;
+  if (!file_system_->FindSymbolicLink(kernel::xam::kTitleImageSymbolicLink,
+                                      title_images)) {
+    auto device = std::make_unique<kernel::xam::TitleImageDevice>(
+        kernel::xam::kTitleImageMountPath, cache_root_, this);
+    if (device->Initialize() &&
+        file_system_->RegisterDevice(std::move(device))) {
+      file_system_->RegisterSymbolicLink(kernel::xam::kTitleImageSymbolicLink,
+                                         kernel::xam::kTitleImageMountPath);
+    }
+  }
+
   // Only its resources are used, through the resource locators.
   auto module = kernel_state_->LoadUserModule("\\SystemRoot\\xam.xex");
   if (!module) {
@@ -2604,6 +2716,7 @@ void Emulator::ResetTitleState() {
   title_id_ = std::nullopt;
   title_name_ = "";
   title_version_ = "";
+  indie_game_.reset();
   display_window_->SetIcon(nullptr, 0);
 }
 
@@ -2908,6 +3021,31 @@ X_STATUS Emulator::PrepareLaunch(const std::filesystem::path& path,
     if (display_window_ && !xbox_game_->icon_png.empty()) {
       display_window_->SetIcon(xbox_game_->icon_png.data(),
                                xbox_game_->icon_png.size());
+    }
+  }
+
+  // The XNA title launcher goes by the indie game it runs.
+  if (title_id_ == kernel::kXN_2002) {
+    const std::string file_name = xam ? kernel::xam::IndieGameLaunchFileName(
+                                            xam->loader_data().launch_data)
+                                      : std::string();
+    if (indie_package_ &&
+        file_name == kernel::xam::ContentManager::LibraryContentFileName(
+                         indie_package_->title_id, 0)) {
+      indie_game_ = indie_package_;
+    } else if (!file_name.empty()) {
+      const auto package =
+          kernel_state_->content_manager()->IndieGamePackagePath(file_name);
+      if (!package.empty()) {
+        indie_game_ = kernel::xam::ReadIndieGame(package);
+      }
+    }
+    if (indie_game_ && !indie_game_->name.empty()) {
+      title_name_ = indie_game_->name;
+    }
+    if (indie_game_ && display_window_ && !indie_game_->icon.empty()) {
+      display_window_->SetIcon(indie_game_->icon.data(),
+                               indie_game_->icon.size());
     }
   }
 

@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <random>
 #include <tuple>
 
 #include "xenia/base/logging.h"
@@ -482,6 +483,20 @@ void XeCryptMd5Final_entry(pointer_t<XECRYPT_MD5_STATE> md5_state,
 }
 DECLARE_XBOXKRNL_EXPORT1(XeCryptMd5Final, kNone, kImplemented);
 
+// Copies forward a dword at a time so an overlapping destination reads back
+// what was just stored.
+void XeCryptBnDw_Copy_entry(lpdword_t source, lpdword_t dest, dword_t count) {
+  if (source.guest_address() == dest.guest_address()) {
+    return;
+  }
+  const xe::be<uint32_t>* src = source;
+  xe::be<uint32_t>* dst = dest;
+  for (uint32_t i = 0; i < count; ++i) {
+    dst[i] = src[i];
+  }
+}
+DECLARE_XBOXKRNL_EXPORT1(XeCryptBnDw_Copy, kNone, kImplemented);
+
 // Byteswaps each 8 bytes
 void XeCryptBnQw_SwapDwQwLeBe_entry(pointer_t<uint64_t> qw_inp,
                                     pointer_t<uint64_t> qw_out, dword_t size) {
@@ -521,9 +536,16 @@ dword_result_t XeCryptBnDwLePkcs1Verify_entry(lpvoid_t hash, lpvoid_t sig,
 DECLARE_XBOXKRNL_EXPORT1(XeCryptBnDwLePkcs1Verify, kNone, kStub);
 
 void XeCryptRandom_entry(lpvoid_t buf, dword_t buf_size) {
-  std::memset(buf, 0xFD, buf_size);
+  uint8_t* buf_data = buf.as<uint8_t*>();
+
+  thread_local std::mt19937_64 gen(std::random_device{}());
+  std::uniform_int_distribution<uint16_t> dist(
+      0, std::numeric_limits<uint8_t>::max());
+
+  std::generate(buf_data, buf_data + buf_size,
+                [&]() { return static_cast<uint8_t>(dist(gen)); });
 }
-DECLARE_XBOXKRNL_EXPORT1(XeCryptRandom, kNone, kStub);
+DECLARE_XBOXKRNL_EXPORT1(XeCryptRandom, kNone, kImplemented);
 
 void XeCryptDesKey_entry(pointer_t<XECRYPT_DES_STATE> state_ptr, lpvoid_t key) {
   XeCryptDesKey(state_ptr, key.as<uint8_t*>());

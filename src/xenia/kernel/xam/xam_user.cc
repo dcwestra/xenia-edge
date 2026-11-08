@@ -22,6 +22,7 @@
 #include "xenia/kernel/xam/user_profile.h"
 #include "xenia/kernel/xam/user_settings.h"
 #include "xenia/kernel/xam/xam_private.h"
+#include "xenia/kernel/xam/xam_state.h"
 #include "xenia/kernel/xenumerator.h"
 #include "xenia/kernel/xsession.h"
 #include "xenia/xbox.h"
@@ -532,6 +533,43 @@ dword_result_t XamUserCheckPrivilege_entry(dword_t user_index, dword_t mask,
   return result;
 }
 DECLARE_XAM_EXPORT1(XamUserCheckPrivilege, kUserProfiles, kSketchy);
+
+constexpr uint32_t kNetworkStoragePrivilege = 0xD1;
+constexpr uint32_t kNetworkStoragePreference = 0x20;
+
+dword_result_t XamNetworkStorageUserHasPrivilege_entry(dword_t user_index) {
+  uint32_t has_privilege = 0;
+  if (user_index < XUserMaxUserCount) {
+    CheckUserPrivilege(user_index, kNetworkStoragePrivilege, &has_privilege);
+  } else if (user_index == XUserIndexAny) {
+    for (uint32_t i = 0; i < XUserMaxUserCount && !has_privilege; ++i) {
+      CheckUserPrivilege(i, kNetworkStoragePrivilege, &has_privilege);
+    }
+  }
+  return has_privilege;
+}
+DECLARE_XAM_EXPORT1(XamNetworkStorageUserHasPrivilege, kUserProfiles,
+                    kImplemented);
+
+// Storage not yet on is turned on only while network storage reports itself
+// available. It never does here so the preference decides.
+dword_result_t XamNetworkStorageHasUserEnabledStorage_entry(
+    dword_t user_index) {
+  if (user_index >= XUserMaxUserCount) {
+    return false;
+  }
+  const uint32_t value_ptr = kernel_memory()->SystemHeapAlloc(4);
+  auto* value = kernel_memory()->TranslateVirtual<xe::be<uint32_t>*>(value_ptr);
+  *value = 0;
+  const uint32_t result = SendUserPreferenceRequest(
+      0x000B0082, user_index, kNetworkStoragePreference, value_ptr, 0);
+  const bool enabled =
+      result == X_ERROR_SUCCESS && (*value & kNetworkStoragePreference);
+  kernel_memory()->SystemHeapFree(value_ptr);
+  return enabled;
+}
+DECLARE_XAM_EXPORT1(XamNetworkStorageHasUserEnabledStorage, kUserProfiles,
+                    kImplemented);
 
 dword_result_t XamUserContentRestrictionGetFlags_entry(dword_t user_index,
                                                        lpdword_t out_flags) {
@@ -1333,6 +1371,15 @@ dword_result_t XamUserIsParentalControlled_entry(dword_t user_index) {
 }
 DECLARE_XAM_EXPORT1(XamUserIsParentalControlled, kUserProfiles, kImplemented);
 
+dword_result_t XamUserIsGuest_entry(dword_t user_index) {
+  if (user_index >= XUserMaxUserCount) {
+    return false;
+  }
+
+  return false;
+}
+DECLARE_XAM_EXPORT1(XamUserIsGuest, kUserProfiles, kStub);
+
 dword_result_t XamUserCreateStatsEnumerator_entry(
     dword_t title_id, dword_t type, qword_t pivot, dword_t num_rows,
     dword_t num_specs,
@@ -1491,6 +1538,23 @@ dword_result_t XamUserLogon_entry(lpqword_t xuids_ptr, dword_t flags,
       flags, overlapped_ptr.guest_address());
 }
 DECLARE_XAM_EXPORT1(XamUserLogon, kUserProfiles, kImplemented);
+
+// Completes after the sign-ins queued before it, as deferred requests run in
+// order. Without an overlapped it returns at once.
+dword_result_t XamUserFlushLogonQueue_entry(
+    pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
+  if (overlapped_ptr) {
+    kernel_state()->CompleteOverlappedDeferredEx(
+        [](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
+          extended_error = 0;
+          length = 0;
+          return X_ERROR_SUCCESS;
+        },
+        overlapped_ptr.guest_address());
+  }
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamUserFlushLogonQueue, kUserProfiles, kImplemented);
 
 // The console's XamUserLogon puts each XUID in an otherwise empty profile
 // record and logs on with those as this does, so this takes a record per slot

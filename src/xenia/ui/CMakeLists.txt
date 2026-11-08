@@ -23,7 +23,8 @@ if(_ui_exclude AND _ui_srcs)
 endif()
 target_link_libraries(xenia-ui PUBLIC xenia-base)
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Android")
-  target_link_libraries(xenia-ui PUBLIC xe-wxWidgets)
+  # mbedtls: the system update's SHA-256 in system_files_installer_wx.cc.
+  target_link_libraries(xenia-ui PUBLIC xe-wxWidgets PRIVATE mbedtls)
 endif()
 if(WIN32)
   target_link_libraries(xenia-ui PRIVATE dxgi)
@@ -31,7 +32,9 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   # xcb / X11 / X11-xcb: Vulkan surface creation in window_wx.cc.
   # fontconfig: imgui_drawer.cc font lookup.
   # GTK3: XCB handle extraction in window_wx.cc (gtk_widget_realize, etc.).
-  target_link_libraries(xenia-ui PRIVATE xcb X11 X11-xcb fontconfig ${GTK3_LIBRARIES})
+  # curl: root certificates in http_download_wx.cc.
+  find_package(CURL REQUIRED)
+  target_link_libraries(xenia-ui PRIVATE xcb X11 X11-xcb fontconfig ${GTK3_LIBRARIES} CURL::libcurl)
 elseif(APPLE)
   # xe_platform_sources globs *.cc only; .mm sources need explicit listing.
   target_sources(xenia-ui PRIVATE

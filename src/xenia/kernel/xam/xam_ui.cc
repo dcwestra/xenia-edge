@@ -17,6 +17,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "third_party/utfcpp/source/utf8.h"
 #include "xenia/app/emulator_window.h"
 #include "xenia/base/png_utils.h"
 #include "xenia/base/string.h"
@@ -29,9 +30,9 @@
 #include "xenia/kernel/nui/nui_identity.h"
 #include "xenia/kernel/title_id_utils.h"
 #include "xenia/kernel/util/shim_utils.h"
-#include "xenia/kernel/xam/content_manager.h"
 #include "xenia/kernel/xam/xam_content_device.h"
 #include "xenia/kernel/xam/xam_private.h"
+#include "xenia/kernel/xam/xam_state.h"
 #include "xenia/kernel/xmodule.h"
 #include "xenia/kernel/xthread.h"
 #include "xenia/ui/file_picker.h"
@@ -40,7 +41,6 @@
 #include "xenia/ui/imgui_guest_notification.h"
 
 #include "xenia/kernel/xam/ui/create_profile_ui.h"
-#include "xenia/kernel/xam/ui/disc_swap_ui.h"
 #include "xenia/kernel/xam/ui/game_achievements_ui.h"
 #include "xenia/kernel/xam/ui/gamercard_ui.h"
 #include "xenia/kernel/xam/ui/passcode_ui.h"
@@ -1443,58 +1443,6 @@ dword_result_t XamShowEditProfileUI_entry(dword_t user_index) {
 }
 DECLARE_XAM_EXPORT1(XamShowEditProfileUI, kUserProfiles, kImplemented);
 
-bool xeXamChooseIndieGame(std::string* file_name, uint32_t* device_id,
-                          std::string* display_name) {
-  const Emulator* emulator = kernel_state()->emulator();
-  if (!emulator->display_window() || !emulator->imgui_drawer()) {
-    return false;
-  }
-
-  auto games = kernel_state()->content_manager()->ListContent(
-      static_cast<uint32_t>(DummyDeviceId::HDD), 0, kXN_2002,
-      XContentType::kMarketplaceContent);
-  std::sort(
-      games.begin(), games.end(),
-      [](const XCONTENT_AGGREGATE_DATA& a, const XCONTENT_AGGREGATE_DATA& b) {
-        return a.display_name() < b.display_name();
-      });
-  std::vector<ui::DiscSwapUI::DiscInfo> items;
-  for (const auto& game : games) {
-    const std::string name = xe::to_utf8(game.display_name());
-    items.push_back({name.empty() ? game.file_name() : name,
-                     xe::to_path(game.file_name())});
-  }
-
-  const bool none_installed = items.empty();
-  const std::string message =
-      none_installed ? "ERROR: No indie games are installed. Install one with "
-                       "Tools > Install Content, then try again."
-                     : std::string();
-  std::filesystem::path chosen;
-  auto close = [&chosen](ui::DiscSwapUI* dialog) -> X_RESULT {
-    if (dialog->result() == ui::DiscSwapResult::kSelected) {
-      chosen = dialog->selected_path();
-    }
-    return X_ERROR_SUCCESS;
-  };
-  kernel_state()->xam_state()->is_xam_dialog_present_.store(true);
-  xeXamDispatchDialog<ui::DiscSwapUI>(
-      new ui::DiscSwapUI(emulator->imgui_drawer(), emulator->input_system(),
-                         message, items, none_installed, "Indie Games",
-                         "Select a game to play:", /*allow_browse=*/false),
-      close, /*overlapped=*/0);
-
-  for (size_t i = 0; i < games.size(); ++i) {
-    if (!chosen.empty() && items[i].path == chosen) {
-      *file_name = games[i].file_name();
-      *device_id = games[i].device_id;
-      *display_name = items[i].label;
-      return true;
-    }
-  }
-  return false;
-}
-
 // UI
 dword_result_t XamShowNuiTroubleshooterUI_entry(dword_t user_index,
                                                 dword_t tracking_id,
@@ -1611,11 +1559,17 @@ static std::optional<std::u16string> ReadXuiString(
 }
 
 // A file in an XUIZ package, the archive XUI resources keep their files in.
+// Version 1 names the files in UTF-16 and version 3 in UTF-8, with the same
+// entries otherwise.
 static std::optional<std::span<const uint8_t>> FindXuiPackageFile(
     std::span<const uint8_t> package, const std::string_view name) {
   constexpr uint32_t kXuiPackageMagic = 0x5855495A;  // XUIZ
   if (package.size() < 0x16 ||
       xe::load_and_swap<uint32_t>(package.data()) != kXuiPackageMagic) {
+    return std::nullopt;
+  }
+  const uint32_t version = xe::load_and_swap<uint32_t>(package.data() + 4);
+  if (version != 1 && version != 3) {
     return std::nullopt;
   }
   const size_t data_start =
@@ -1632,11 +1586,25 @@ static std::optional<std::span<const uint8_t>> FindXuiPackageFile(
         xe::load_and_swap<uint32_t>(package.data() + offset + 4);
     const size_t name_length = package[offset + 8];
     offset += 9;
-    auto file_name = ReadXuiString(package, &offset, name_length);
-    if (!file_name) {
-      return std::nullopt;
+    std::string file_name;
+    if (version == 3) {
+      if (offset + name_length > package.size()) {
+        return std::nullopt;
+      }
+      file_name.assign(reinterpret_cast<const char*>(package.data() + offset),
+                       name_length);
+      if (!::utf8::is_valid(file_name)) {
+        return std::nullopt;
+      }
+      offset += name_length;
+    } else {
+      auto wide_name = ReadXuiString(package, &offset, name_length);
+      if (!wide_name) {
+        return std::nullopt;
+      }
+      file_name = xe::to_utf8(*wide_name);
     }
-    if (xe::utf8::equal_case(xe::to_utf8(*file_name), name)) {
+    if (xe::utf8::equal_case(file_name, name)) {
       if (data_start + file_offset + size > package.size()) {
         return std::nullopt;
       }
@@ -1646,8 +1614,8 @@ static std::optional<std::span<const uint8_t>> FindXuiPackageFile(
   return std::nullopt;
 }
 
-// An XUIS string table, empty strings stand for missing ones. Version 1 is the
-// 2005 xam's and version 2 later ones', with the same entries.
+// An XUIS string table, empty strings stand for missing ones. Version 1 has
+// UTF-16 strings after their length and version 2 NUL-terminated UTF-8 ones.
 static std::optional<std::vector<std::u16string>> ParseXuiStringTable(
     std::span<const uint8_t> data, uint8_t* out_flags) {
   constexpr uint32_t kXuiStringTableMagic = 0x58554953;  // XUIS
@@ -1656,11 +1624,30 @@ static std::optional<std::vector<std::u16string>> ParseXuiStringTable(
       (data[4] != 1 && data[4] != 2)) {
     return std::nullopt;
   }
+  const uint8_t version = data[4];
   const uint8_t flags = data[5];
   std::vector<std::u16string> strings(
       xe::load_and_swap<uint16_t>(data.data() + 0xA));
   size_t offset = 0xC;
   auto read_string = [&]() -> std::optional<std::u16string> {
+    if (version == 2) {
+      if (offset >= data.size()) {
+        return std::nullopt;
+      }
+      const auto start = data.begin() + offset;
+      const auto end = std::find(start, data.end(), uint8_t(0));
+      if (end == data.end()) {
+        return std::nullopt;
+      }
+      const size_t length = size_t(end - start);
+      const std::string_view text(
+          reinterpret_cast<const char*>(data.data() + offset), length);
+      if (!::utf8::is_valid(text)) {
+        return std::nullopt;
+      }
+      offset += length + 1;
+      return xe::to_utf16(text);
+    }
     if (offset + 2 > data.size()) {
       return std::nullopt;
     }
@@ -1691,42 +1678,12 @@ static std::optional<std::vector<std::u16string>> ParseXuiStringTable(
   return strings;
 }
 
-dword_result_t XuiLoadStringTableFromFile_entry(lpu16string_t path,
-                                                lpdword_t table_ptr) {
-  if (!path || !table_ptr) {
-    return X_E_INVALIDARG;
-  }
-  // section://<module handle>,<section>#<file in its package>
-  const std::string url = xe::to_utf8(path.value());
-  constexpr std::string_view kSectionScheme = "section://";
-  if (!xe::utf8::starts_with_case(url, kSectionScheme)) {
-    XELOGW("XuiLoadStringTableFromFile: unsupported path {}", url);
-    return X_E_FAIL;
-  }
-  std::string_view location =
-      std::string_view(url).substr(kSectionScheme.size());
-  const size_t comma = location.find(',');
-  uint32_t hmodule = 0;
-  if (comma == std::string_view::npos ||
-      std::from_chars(location.data(), location.data() + comma, hmodule, 16)
-              .ptr != location.data() + comma ||
-      !hmodule) {
-    return X_E_FAIL;
-  }
-  location.remove_prefix(comma + 1);
-  const size_t hash = location.find('#');
-  const std::string section(location.substr(0, hash));
-  const std::string_view file_name = hash == std::string_view::npos
-                                         ? std::string_view()
-                                         : location.substr(hash + 1);
-
+X_HRESULT LoadXuiStringTable(XModule& module, std::string_view section,
+                             std::string_view file_name, uint32_t* table_ptr) {
   auto memory = kernel_state()->memory();
-  auto module = XModule::GetFromHModule(kernel_state(),
-                                        memory->TranslateVirtual(hmodule));
   uint32_t section_data = 0;
   uint32_t section_size = 0;
-  if (!module ||
-      XFAILED(module->GetSection(section, &section_data, &section_size))) {
+  if (XFAILED(module.GetSection(section, &section_data, &section_size))) {
     return X_E_FAIL;
   }
   const std::span<const uint8_t> resource(
@@ -1807,10 +1764,8 @@ dword_result_t XuiLoadStringTableFromFile_entry(lpu16string_t path,
   *table_ptr = table;
   return X_E_SUCCESS;
 }
-DECLARE_XAM_EXPORT1(XuiLoadStringTableFromFile, kUI, kSketchy);
 
-pointer_result_t XuiLookupStringTableByIndex_entry(dword_t table,
-                                                   dword_t index) {
+uint32_t LookupXuiStringTable(uint32_t table, uint32_t index) {
   {
     std::lock_guard<std::mutex> lock(xui_lock);
     if (!xui_string_tables.contains(table)) {
@@ -1822,6 +1777,53 @@ pointer_result_t XuiLookupStringTableByIndex_entry(dword_t table,
     return 0;
   }
   return xe::load_and_swap<uint32_t>(table_data + 4 + index * 4);
+}
+
+dword_result_t XuiLoadStringTableFromFile_entry(lpu16string_t path,
+                                                lpdword_t table_ptr) {
+  if (!path || !table_ptr) {
+    return X_E_INVALIDARG;
+  }
+  // section://<module handle>,<section>#<file in its package>
+  const std::string url = xe::to_utf8(path.value());
+  constexpr std::string_view kSectionScheme = "section://";
+  if (!xe::utf8::starts_with_case(url, kSectionScheme)) {
+    XELOGW("XuiLoadStringTableFromFile: unsupported path {}", url);
+    return X_E_FAIL;
+  }
+  std::string_view location =
+      std::string_view(url).substr(kSectionScheme.size());
+  const size_t comma = location.find(',');
+  uint32_t hmodule = 0;
+  if (comma == std::string_view::npos ||
+      std::from_chars(location.data(), location.data() + comma, hmodule, 16)
+              .ptr != location.data() + comma ||
+      !hmodule) {
+    return X_E_FAIL;
+  }
+  location.remove_prefix(comma + 1);
+  const size_t hash = location.find('#');
+  const std::string section(location.substr(0, hash));
+  const std::string_view file_name = hash == std::string_view::npos
+                                         ? std::string_view()
+                                         : location.substr(hash + 1);
+
+  auto module = XModule::GetFromHModule(
+      kernel_state(), kernel_state()->memory()->TranslateVirtual(hmodule));
+  if (!module) {
+    return X_E_FAIL;
+  }
+  uint32_t table = *table_ptr;
+  const X_HRESULT result =
+      LoadXuiStringTable(*module, section, file_name, &table);
+  *table_ptr = table;
+  return result;
+}
+DECLARE_XAM_EXPORT1(XuiLoadStringTableFromFile, kUI, kSketchy);
+
+pointer_result_t XuiLookupStringTableByIndex_entry(dword_t table,
+                                                   dword_t index) {
+  return LookupXuiStringTable(table, index);
 }
 DECLARE_XAM_EXPORT1(XuiLookupStringTableByIndex, kUI, kImplemented);
 

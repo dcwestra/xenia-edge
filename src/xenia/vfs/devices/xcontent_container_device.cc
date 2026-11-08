@@ -30,25 +30,8 @@ XContentContainerDevice::CreateContentDevice(
     return nullptr;
   }
 
-  FILE* host_file = xe::filesystem::OpenFile(host_path, "rb");
-  if (!host_file) {
-    XELOGE("Error opening XContent file.");
-    return nullptr;
-  }
-
-  const uint64_t package_size = std::filesystem::file_size(host_path, ec);
-  if (ec || package_size < sizeof(XContentContainerHeader)) {
-    return nullptr;
-  }
-
-  const auto header = XContentContainerDevice::ReadContainerHeader(host_file);
-  if (header == nullptr) {
-    return nullptr;
-  }
-
-  fclose(host_file);
-
-  if (!header->content_header.is_magic_valid()) {
+  const auto header = ReadContainerHeader(host_path);
+  if (!header || !header->content_header.is_magic_valid()) {
     return nullptr;
   }
 
@@ -178,6 +161,18 @@ XContentContainerDevice::ReadContainerHeader(
   auto header = ReadContainerHeader(header_file);
   fclose(header_file);
   return header;
+}
+
+bool XContentContainerDevice::IsContainerFile(
+    const std::filesystem::path& host_path) {
+  FILE* host_file = xe::filesystem::OpenFile(host_path, "rb");
+  if (!host_file) {
+    return false;
+  }
+  XContentHeader header;
+  const bool read = fread(&header, sizeof(header), 1, host_file) == 1;
+  fclose(host_file);
+  return read && header.is_magic_valid();
 }
 
 std::unique_ptr<XContentContainerHeader>

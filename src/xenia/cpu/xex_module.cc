@@ -55,8 +55,6 @@ UPDATE_from_bool(enable_early_precompilation, 2026, 9, 14, 13, false);
 
 DECLARE_bool(allow_plugins);
 
-DECLARE_bool(disable_context_promotion);
-
 static constexpr uint8_t xe_xex1_retail_key[16] = {
     0xA2, 0x6C, 0x10, 0xF7, 0x1F, 0xD9, 0x35, 0xE9,
     0x8B, 0x99, 0x92, 0x2C, 0xE9, 0x32, 0x15, 0x72};
@@ -519,6 +517,17 @@ bool XexModule::is_valid_executable() const {
   return nt_headers->Signature == XIMAGE_NT_SIGNATURE;
 }
 
+bool XexModule::has_code() const {
+  for (uint32_t i = 0; i < xex_security_info()->page_descriptor_count; i++) {
+    xex2_page_descriptor desc;
+    desc.value = xe::byte_swap(xex_security_info()->page_descriptors[i].value);
+    if (desc.info == XEX_SECTION_CODE) {
+      return true;
+    }
+  }
+  return false;
+}
+
 int XexModule::ReadImage(const void* xex_addr, size_t xex_length,
                          const uint8_t* key) {
   if (!opt_file_format_info()) {
@@ -565,7 +574,8 @@ int XexModule::ReadImage(const void* xex_addr, size_t xex_length,
     return result_code;
   }
 
-  if (is_patch() || is_valid_executable()) {
+  // Without code there's no PE header to tell the key by.
+  if (is_patch() || is_valid_executable() || !has_code()) {
     return 0;
   }
 
@@ -1069,7 +1079,7 @@ bool XexModule::LoadContinue() {
 
   finished_load_ = true;
 
-  if (ReadPEHeaders()) {
+  if (has_code() && ReadPEHeaders()) {
     XELOGE("Failed to load XEX PE headers!");
     return false;
   }
@@ -1110,7 +1120,11 @@ bool XexModule::LoadContinue() {
   }
 
   // Notify backend that we have an executable range.
-  processor_->backend()->CommitExecutableRange(low_address_, high_address_);
+  if (has_code()) {
+    processor_->backend()->CommitExecutableRange(low_address_, high_address_);
+  } else {
+    low_address_ = 0;
+  }
 
   // Add all imports (variables/functions).
   xex2_opt_import_libraries* opt_import_libraries = nullptr;
@@ -1228,6 +1242,9 @@ bool XexModule::LoadContinue() {
 }
 
 void XexModule::Precompile() {
+  if (!has_code()) {
+    return;
+  }
   unsigned high_code = this->high_address_ - this->low_address_;
 
   mbedtls_sha1(memory()->TranslateVirtual(this->low_address_), high_code,
@@ -1491,10 +1508,7 @@ std::unique_ptr<Function> XexModule::CreateFunction(uint32_t address) {
       processor_->backend()->CreateGuestFunction(this, address));
 }
 void XexInfoCache::Init(XexModule* xexmod) {
-  // If context promotion is disabled then disable instruction info cache as
-  // well, otherwise XMA will write to unknown registers.
-  if (cvars::disable_instruction_infocache ||
-      cvars::disable_context_promotion) {
+  if (cvars::disable_instruction_infocache) {
     return;
   }
 

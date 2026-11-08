@@ -10,6 +10,7 @@
 #include "xenia/kernel/xam/apps/xlivebase_app.h"
 
 #include "xenia/base/logging.h"
+#include "xenia/kernel/xam/xam_state.h"
 #include "xenia/kernel/xenumerator.h"
 
 #include <asio.hpp>
@@ -122,6 +123,13 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message,
           "unimplemented",
           buffer_ptr, buffer_length);
       return X_E_FAIL;
+    }
+    case 0x00058024: {
+      // A Live service request. The 17559 dashboard polls its unread message
+      // count with one every few seconds.
+      XELOGD("XLiveBaseServiceRequest({:08X}, {:08X})", buffer_ptr,
+             buffer_length);
+      return 0x80151802;  // X_ONLINE_E_LOGON_NOT_LOGGED_ON
     }
     case 0x00058037: {
       XELOGD("XPresenceInitialize({:08X}, {:08X})", buffer_ptr, buffer_length);

@@ -36,20 +36,12 @@ PatchesPanel::PatchesPanel(wxWindow* parent, EmulatorWindow* emulator_window,
     : wxPanel(parent, wxID_ANY), emulator_window_(emulator_window) {
   std::filesystem::path storage_path;
   if (emulator_window_ && emulator_window_->emulator()) {
-    storage_path = emulator_window_->emulator()->storage_root() / "patches" /
+    storage_path = emulator_window_->emulator()->patches_path() /
                    xe::to_path(file.filename);
   }
 
-  std::string source_text;
-  if (!storage_path.empty()) {
-    source_text = xe::filesystem::ReadAllText(storage_path);
-  }
-  if (source_text.empty()) {
-    source_text = std::move(file.toml_content);
-  }
-
-  editor_ =
-      std::make_unique<patcher::PatchFileEditor>(source_text, storage_path);
+  editor_ = std::make_unique<patcher::PatchFileEditor>(file.toml_content,
+                                                       storage_path);
 
   Build();
 }

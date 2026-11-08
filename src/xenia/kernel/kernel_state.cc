@@ -24,9 +24,11 @@
 #include "xenia/kernel/nui/nui_identity.h"
 #include "xenia/kernel/nui/nui_microphones.h"
 #include "xenia/kernel/nui/pscam_device.h"
+#include "xenia/kernel/smc.h"
 #include "xenia/kernel/title_id_utils.h"
 #include "xenia/kernel/user_module.h"
 #include "xenia/kernel/util/shim_utils.h"
+#include "xenia/kernel/xam/xam_state.h"
 #include "xenia/kernel/xam/xam_system_link.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_memory.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_module.h"
@@ -262,6 +264,18 @@ void KernelState::ShutdownDispatchThread() {
 }
 
 KernelState* KernelState::shared() { return shared_kernel_state_; }
+
+xam::AchievementManager* KernelState::achievement_manager() const {
+  return xam_state()->achievement_manager();
+}
+
+xam::AppManager* KernelState::app_manager() const {
+  return xam_state()->app_manager();
+}
+
+xam::ContentManager* KernelState::content_manager() const {
+  return xam_state()->content_manager();
+}
 
 uint32_t KernelState::title_id() const {
   if (!executable_module_) {
@@ -600,9 +614,10 @@ object_ref<XThread> KernelState::LaunchModule(object_ref<UserModule> module) {
 
   // Create a thread to run in.
   // We start suspended so we can run the debugger prep.
-  auto thread = object_ref<XThread>(
-      new XThread(kernel_state(), module->stack_size(), 0,
-                  module->entry_point(), 0, X_CREATE_SUSPENDED, true, true));
+  // The console's XexStartExecutable always starts it on CPU 0.
+  auto thread = object_ref<XThread>(new XThread(
+      kernel_state(), module->stack_size(), 0, module->entry_point(), 0,
+      X_CREATE_SUSPENDED | xboxkrnl::AffinityCpu0, true, true));
 
   // We know this is the 'main thread'.
   thread->set_name("Main XThread");
@@ -1072,20 +1087,28 @@ void KernelState::TerminateTitle() {
   std::quick_exit(EXIT_SUCCESS);
 }
 
-void KernelState::ExitToDashboard() {
-  XELOGI("KernelState::ExitToDashboard");
-  if (auto on_exit_to_dashboard = emulator_->on_exit_to_dashboard()) {
-    if (on_exit_to_dashboard()) {
-      // Park off guest code until the in-process reset terminates us; Suspend
-      // can return on POSIX, so loop rather than fall through to
-      // TerminateTitle.
-      auto* current_thread = XThread::GetCurrentThread();
-      current_thread->Suspend(nullptr);
-      while (true) {
-        xe::threading::NanoSleep(int64_t(1'000'000'000));
-      }
+// Doesn't return when the host UI's handler took the title down.
+static void HandOffToHostUI(const Emulator::ExitToDashboardCallback& handler) {
+  if (handler && handler()) {
+    // Park off guest code until the host's reset or exit ends us; Suspend can
+    // return on POSIX, so loop rather than fall through to TerminateTitle.
+    auto* current_thread = XThread::GetCurrentThread();
+    current_thread->Suspend(nullptr);
+    while (true) {
+      xe::threading::NanoSleep(int64_t(1'000'000'000));
     }
   }
+}
+
+void KernelState::ExitToDashboard() {
+  XELOGI("KernelState::ExitToDashboard");
+  HandOffToHostUI(emulator_->on_exit_to_dashboard());
+  TerminateTitle();
+}
+
+void KernelState::PowerOff() {
+  XELOGI("KernelState::PowerOff");
+  HandOffToHostUI(emulator_->on_power_off());
   TerminateTitle();
 }
 

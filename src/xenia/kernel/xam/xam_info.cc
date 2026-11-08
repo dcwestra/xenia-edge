@@ -8,6 +8,7 @@
  */
 
 #include <algorithm>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -25,11 +26,13 @@
 #include "xenia/kernel/title_id_utils.h"
 #include "xenia/kernel/user_module.h"
 #include "xenia/kernel/util/shim_utils.h"
+#include "xenia/kernel/xam/system_manifest.h"
+#include "xenia/kernel/xam/title_image_device.h"
 #include "xenia/kernel/xam/xam.h"
 #include "xenia/kernel/xam/xam_content_device.h"
 #include "xenia/kernel/xam/xam_module.h"
 #include "xenia/kernel/xam/xam_private.h"
-#include "xenia/kernel/xam/xam_ui.h"
+#include "xenia/kernel/xam/xam_state.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_error.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_memory.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_modules.h"
@@ -158,6 +161,26 @@ dword_result_t XamGetLiveHiveValueA_entry(
 }
 DECLARE_XAM_EXPORT1(XamGetLiveHiveValueA, kMisc, kStub);
 
+// Telemetry for Microsoft's servers. No report is made and the other calls skip
+// a null one.
+void XamWebInstrumentationCreateReport_entry(lpstring_t name,
+                                             lpdword_t report_ptr) {
+  if (report_ptr) {
+    *report_ptr = 0;
+  }
+}
+DECLARE_XAM_EXPORT1(XamWebInstrumentationCreateReport, kMisc, kStub);
+
+void XamWebInstrumentationSetUserVar_entry(dword_t report, dword_t var,
+                                           lpvoid_t value) {}
+DECLARE_XAM_EXPORT1(XamWebInstrumentationSetUserVar, kMisc, kStub);
+
+void XamWebInstrumentationSendReport_entry(dword_t report) {}
+DECLARE_XAM_EXPORT1(XamWebInstrumentationSendReport, kMisc, kStub);
+
+void XamWebInstrumentationDestroyReport_entry(lpdword_t report_ptr) {}
+DECLARE_XAM_EXPORT1(XamWebInstrumentationDestroyReport, kMisc, kStub);
+
 dword_result_t XamQueryLiveHiveW_entry(
     lpu16string_t feature_name, lpu16string_t value_ptr,
     dword_t value_buffer_size, pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
@@ -166,6 +189,15 @@ dword_result_t XamQueryLiveHiveW_entry(
   X_RESULT extended_error = 0x80151802;  // X_ONLINE_E_LOGON_NOT_LOGGED_ON
   if (!feature_name || !value_ptr || !value_buffer_size) {
     extended_error = X_E_INVALIDARG;
+  } else if (std::string target;
+             feature_name.value() == u"GameImageAssetUriRoot" &&
+             kernel_state()->file_system()->FindSymbolicLink(
+                 kTitleImageSymbolicLink, target)) {
+    // Title images come from the TitleImages: device rather than Xbox Live.
+    string_util::copy_and_swap_truncating(static_cast<char16_t*>(value_ptr),
+                                          kTitleImageUriRoot,
+                                          value_buffer_size);
+    extended_error = X_E_SUCCESS;
   }
 
   if (overlapped_ptr) {
@@ -458,36 +490,22 @@ static std::string HexBytes(const std::vector<uint8_t>& data,
 
 static constexpr size_t kLaunchDataLogBytes = 64;
 
-dword_result_t XamLoaderSetLaunchData_entry(lpvoid_t data, dword_t size) {
+static void SetLaunchData(const void* data, uint32_t size) {
   auto xam = kernel_state()->GetKernelModule<XamModule>("xam.xex");
   auto& loader_data = xam->loader_data();
-  const uint32_t copy_size = std::min(size.value(), MAX_LAUNCH_DATA_SIZE);
+  const uint32_t copy_size = std::min(size, MAX_LAUNCH_DATA_SIZE);
   loader_data.launch_data_present = size ? true : false;
   loader_data.launch_data.resize(copy_size);
   std::memcpy(loader_data.launch_data.data(), data, copy_size);
-  XELOGI("XamLoaderSetLaunchData: size={} data={}", uint32_t(size),
+  XELOGI("XamLoaderSetLaunchData: size={} data={}", size,
          HexBytes(loader_data.launch_data, kLaunchDataLogBytes));
+}
+
+dword_result_t XamLoaderSetLaunchData_entry(lpvoid_t data, dword_t size) {
+  SetLaunchData(data, size);
   return 0;
 }
 DECLARE_XAM_EXPORT1(XamLoaderSetLaunchData, kNone, kSketchy);
-
-// Stands in for the dashboard, which names the game in launch data.
-static void ChooseIndieGameLaunchData(XamModule::LoaderData& loader_data) {
-  std::string file_name;
-  uint32_t device_id = 0;
-  std::string display_name;
-  if (!xeXamChooseIndieGame(&file_name, &device_id, &display_name)) {
-    return;
-  }
-  auto& data = loader_data.launch_data;
-  data.assign(0x34, 0);
-  xe::store_and_swap<uint32_t>(data.data(), 0xCAFEBABE);
-  std::memcpy(data.data() + 4, file_name.data(),
-              std::min<size_t>(file_name.size(), 0x2A));
-  xe::store_and_swap<uint32_t>(data.data() + 0x30, device_id);
-  loader_data.launch_data_present = true;
-  kernel_state()->emulator()->SetTitleName(display_name);
-}
 
 dword_result_t XamLoaderGetLaunchDataSize_entry(lpdword_t size_ptr) {
   if (!size_ptr) {
@@ -496,10 +514,6 @@ dword_result_t XamLoaderGetLaunchDataSize_entry(lpdword_t size_ptr) {
 
   auto xam = kernel_state()->GetKernelModule<XamModule>("xam.xex");
   auto& loader_data = xam->loader_data();
-  if (loader_data.launch_data.empty() &&
-      kernel_state()->title_id() == kXN_2002) {
-    ChooseIndieGameLaunchData(loader_data);
-  }
   if (loader_data.launch_data.empty()) {
     *size_ptr = 0;
     XELOGI("XamLoaderGetLaunchDataSize: none");
@@ -545,12 +559,8 @@ static std::filesystem::path ResolveHostFileName(
   if (dir.empty() || name.empty()) {
     return path;
   }
-  for (const auto& info : xe::filesystem::ListFiles(dir)) {
-    if (xe::utf8::equal_case(xe::path_to_utf8(info.name), name)) {
-      return dir / info.name;
-    }
-  }
-  return path;
+  const auto found = xe::filesystem::FindChildIgnoringCase(dir, name);
+  return found.empty() ? path : found;
 }
 
 // Whether |path| names a device rather than a file next to the title.
@@ -791,6 +801,27 @@ void XamLoaderLaunchTitleEx_entry(lpstring_t raw_name_ptr,
               flags);
 }
 DECLARE_XAM_EXPORT1(XamLoaderLaunchTitleEx, kNone, kSketchy);
+
+// Launches a system extended partition file, which is how the dashboard starts
+// the Indie Player with an indie game in the launch data.
+X_HRESULT_result_t XdfLaunchNewImageFromCache_entry(lpstring_t name_ptr,
+                                                    lpvoid_t data_ptr,
+                                                    dword_t data_size,
+                                                    dword_t flags) {
+  if (!name_ptr || (data_ptr && !data_size)) {
+    return X_E_INVALIDARG;
+  }
+  const std::string name = name_ptr.value();
+  const std::string path = FindSystemExtFile(name);
+  if (path.empty() || !kernel_state()->file_system()->ResolvePath(path)) {
+    XELOGW("XdfLaunchNewImageFromCache: {} isn't in the system files", name);
+    return X_HRESULT_FROM_WIN32(X_ERROR_NOT_FOUND);
+  }
+  SetLaunchData(data_ptr, data_size);
+  LaunchTitle(path, {}, flags);
+  return X_E_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XdfLaunchNewImageFromCache, kNone, kImplemented);
 
 void XamLoaderTerminateTitle_entry() { kernel_state()->ExitToDashboard(); }
 DECLARE_XAM_EXPORT1(XamLoaderTerminateTitle, kNone, kSketchy);
@@ -1212,7 +1243,7 @@ DECLARE_XAM_EXPORT1(GetLastError, kNone, kImplemented);
 dword_result_t GetModuleHandleA_entry(lpstring_t module_name) {
   xe::be<uint32_t> module_ptr = 0;
   const X_STATUS error_code = xe::kernel::xboxkrnl::XexGetModuleHandle(
-      module_name.value(), &module_ptr);
+      module_name ? module_name.value() : "", &module_ptr);
 
   if (XFAILED(error_code)) {
     RtlSetLastNTError_entry(error_code);
@@ -1297,36 +1328,47 @@ dword_result_t GetCurrentThreadId_entry() {
 }
 DECLARE_XAM_EXPORT1(GetCurrentThreadId, kNone, kImplemented);
 
-qword_result_t XapiFormatTimeOut_entry(lpqword_t result,
-                                       dword_t dwMilliseconds) {
-  if (dwMilliseconds == -1) {
+// Returns timeout, or null for INFINITE.
+static uint64_t* XapiFormatTimeOut(uint64_t* timeout, uint32_t milliseconds) {
+  if (milliseconds == UINT32_MAX) {
+    return nullptr;
+  }
+  *timeout = static_cast<int64_t>(-10000) * milliseconds;
+  return timeout;
+}
+
+// Returns r3 as the caller passed it, upper half included.
+qword_result_t XapiFormatTimeOut_entry(lpqword_t result, dword_t dwMilliseconds,
+                                       const ppc_context_t& ctx) {
+  uint64_t timeout;
+  if (!XapiFormatTimeOut(&timeout, dwMilliseconds)) {
     return 0;
   }
-
-  *result = static_cast<int64_t>(-10000) * dwMilliseconds;
-  return result.host_address();
+  *result = timeout;
+  return ctx->r[3];
 }
 DECLARE_XAM_EXPORT1(XapiFormatTimeOut, kNone, kImplemented);
 
 dword_result_t WaitForSingleObjectEx_entry(dword_t hHandle,
                                            dword_t dwMilliseconds,
                                            dword_t bAlertable) {
-  // TODO(Gliniak): Figure it out to be less janky.
   uint64_t timeout;
-  uint64_t* timeout_ptr = reinterpret_cast<uint64_t*>(
-      static_cast<uint64_t>(XapiFormatTimeOut_entry(&timeout, dwMilliseconds)));
+  uint64_t* timeout_ptr = XapiFormatTimeOut(&timeout, dwMilliseconds);
+  // The kernel takes alertable as a BOOLEAN.
+  const uint8_t alertable = uint8_t(bAlertable);
 
   X_STATUS result =
-      xboxkrnl::NtWaitForSingleObjectEx(hHandle, 1, bAlertable, timeout_ptr);
+      xboxkrnl::NtWaitForSingleObjectEx(hHandle, 1, alertable, timeout_ptr);
 
   while (bAlertable && result == X_STATUS_ALERTED) {
     result =
-        xboxkrnl::NtWaitForSingleObjectEx(hHandle, 1, bAlertable, timeout_ptr);
+        xboxkrnl::NtWaitForSingleObjectEx(hHandle, 1, alertable, timeout_ptr);
   }
 
-  RtlSetLastNTError_entry(result);
-  result = -1;
-
+  if (int32_t(result) < 0) {
+    RtlSetLastNTError_entry(result);
+    return -1;
+  }
   return result;
 }
 DECLARE_XAM_EXPORT1(WaitForSingleObjectEx, kNone, kImplemented);
@@ -1530,9 +1572,26 @@ dword_result_t XamSetDvrStorage_entry(
 DECLARE_XAM_EXPORT1(XamSetDvrStorage, kNone, kStub);
 
 dword_result_t XamLookupCommonStringByIndex_entry(dword_t string_index) {
-  return 0;
+  static std::mutex lock;
+  std::lock_guard<std::mutex> guard(lock);
+  auto& table = kernel_state()->xam_state()->common_string_table_;
+  if (!table) {
+    // They're in the xam section of the system UI skin.
+    constexpr std::string_view kSkinPath = "\\SystemRoot\\huduiskin.xex";
+    uint32_t loaded = 0;
+    object_ref<XModule> skin;
+    if (xboxkrnl::xeXexLoadImage(kSkinPath)) {
+      skin = kernel_state()->GetModule(kSkinPath, true);
+    }
+    if (!skin ||
+        XFAILED(LoadXuiStringTable(*skin, "xam", "xamstrings.xus", &loaded))) {
+      XELOGW("XamLookupCommonStringByIndex: no xam string table to read");
+    }
+    table = loaded;
+  }
+  return *table ? LookupXuiStringTable(*table, string_index) : 0;
 }
-DECLARE_XAM_EXPORT1(XamLookupCommonStringByIndex, kNone, kStub);
+DECLARE_XAM_EXPORT1(XamLookupCommonStringByIndex, kNone, kImplemented);
 
 dword_result_t XamLogLocalizationEtx_entry(dword_t error_code, dword_t unk) {
   if (error_code == 0x80300034) {

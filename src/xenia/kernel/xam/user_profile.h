@@ -143,9 +143,8 @@ class UserProfile {
   };
   bool IsLiveEnabled() const { return account_info_.IsLiveEnabled(); }
 
-  void ClearProfileIcon(XTileType icon_type) {
-    profile_images_.erase(icon_type);
-  }
+  // Removes the picture from the profile on disk and from memory.
+  void ClearProfileIcon(XTileType icon_type);
 
   std::span<const uint8_t> GetProfileIcon(XTileType icon_type) {
     // First check if the requested type exists
@@ -179,16 +178,6 @@ class UserProfile {
 
   // Public accessor for dashboard GPD (for getting title paths)
   const GpdInfoProfile& dashboard_gpd() const { return dashboard_gpd_; }
-
-  // Public accessor for getting title icon from title GPD
-  std::vector<uint8_t> GetTitleIcon(uint32_t title_id) const {
-    const GpdInfo* gpd = GetGpd(title_id);
-    if (!gpd) {
-      return {};
-    }
-    auto icon_data = gpd->GetImage(kXdbfIdTitle);
-    return std::vector<uint8_t>(icon_data.begin(), icon_data.end());
-  }
 
   // Public accessor for getting achievement stats from title GPD
   struct TitleAchievementStats {
@@ -240,6 +229,7 @@ class UserProfile {
 
   void LoadProfileGpds();
   void LoadProfileIcon(XTileType tile_type);
+  void AddMissingIconSize(XTileType large_type, XTileType small_type);
   void WriteProfileIcon(XTileType tile_type,
                         std::span<const uint8_t> icon_data);
   std::vector<uint8_t> LoadGpd(const uint32_t title_id);
