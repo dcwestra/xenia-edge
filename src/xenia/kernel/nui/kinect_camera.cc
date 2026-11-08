@@ -41,7 +41,7 @@ namespace nui {
 
 // Each frame of a recording: a header, then the frame as the sensor sent it.
 struct KinectRecordingFrame {
-  uint32_t stream;   // 0 for depth, 1 for color.
+  uint32_t stream;   // KinectRecorder::Stream.
   uint32_t time_ms;  // Since the recording started.
   uint32_t size;
 };
@@ -62,13 +62,13 @@ KinectRecorder::~KinectRecorder() {
   }
 }
 
-void KinectRecorder::AddFrame(bool color, const uint8_t* data, size_t size) {
+void KinectRecorder::AddFrame(Stream stream, const uint8_t* data, size_t size) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (!file_) {
     return;
   }
   KinectRecordingFrame header;
-  header.stream = color ? 1 : 0;
+  header.stream = uint32_t(stream);
   header.time_ms =
       uint32_t(std::chrono::duration_cast<std::chrono::milliseconds>(
                    std::chrono::steady_clock::now() - start_)
@@ -115,6 +115,8 @@ class KinectCameraPlayback : public KinectCamera {
   }
 
   bool IsColorStreaming() const override { return bool(color_callback_); }
+  // From the first color frame read: recordings hold one kind.
+  bool IsColorRegistered() const override { return color_registered_; }
 
   void Stop() override {
     if (!running_.exchange(false)) {
@@ -153,8 +155,13 @@ class KinectCameraPlayback : public KinectCamera {
         std::this_thread::sleep_for(std::min<clock::duration>(
             due - clock::now(), std::chrono::milliseconds(50)));
       }
-      const FrameCallback& callback =
-          header.stream ? color_callback_ : depth_callback_;
+      const bool color =
+          header.stream != uint32_t(KinectRecorder::Stream::kDepth);
+      if (color) {
+        color_registered_ =
+            header.stream == uint32_t(KinectRecorder::Stream::kRegisteredColor);
+      }
+      const FrameCallback& callback = color ? color_callback_ : depth_callback_;
       if (running_ && callback) {
         callback(frame.data(), frame.size(), header.time_ms);
       }
@@ -165,6 +172,7 @@ class KinectCameraPlayback : public KinectCamera {
   FrameCallback depth_callback_;
   FrameCallback color_callback_;
   std::atomic<bool> running_ = false;
+  std::atomic<bool> color_registered_ = false;
   std::thread thread_;
 };
 

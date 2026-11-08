@@ -103,11 +103,15 @@ constexpr float kColorOffsetX = -12.5f;
 constexpr float kColorOffsetY = 26.5f;
 
 // Makes the sensor's 8-bit Bayer (GRBG) color frame the one a title is
-// handed, the same format: registered to depth, with the window on the
-// quarter of it around the window's center at twice the size, and with the
-// title's gains.
+// handed, the same format: registered to depth (unless it is already), with
+// the window on the quarter of it around the window's center at twice the
+// size, and with the title's gains.
 void ViewColorFrame(const uint8_t* in,
-                    const PsCamDevice::ColorSettings& settings, uint8_t* out) {
+                    const PsCamDevice::ColorSettings& settings, bool registered,
+                    uint8_t* out) {
+  const float scale = registered ? 1.0f : kColorScale;
+  const float offset_x = registered ? 0.0f : kColorOffsetX;
+  const float offset_y = registered ? 0.0f : kColorOffsetY;
   constexpr int kWidth = int(KinectCamera::kColorWidth);
   constexpr int kHeight = int(KinectCamera::kColorHeight);
   // The two pixels either side of where an output column or row comes from,
@@ -117,8 +121,9 @@ void ViewColorFrame(const uint8_t* in,
     int32_t i0, i1;
     float weight;
   };
-  auto taps = [](int size, bool window, int32_t window_offset, float offset,
-                 std::vector<Tap>& phase0, std::vector<Tap>& phase1) {
+  auto taps = [scale](int size, bool window, int32_t window_offset,
+                      float offset, std::vector<Tap>& phase0,
+                      std::vector<Tap>& phase1) {
     phase0.resize(size);
     phase1.resize(size);
     const float center = (size - 1) * 0.5f;
@@ -128,7 +133,7 @@ void ViewColorFrame(const uint8_t* in,
       const float depth = window ? size * 0.25f + window_offset * 0.5f +
                                        (i + 0.5f) * 0.5f - 0.5f
                                  : float(i);
-      const float color = kColorScale * (depth - center) + center + offset;
+      const float color = scale * (depth - center) + center + offset;
       for (int phase = 0; phase < 2; ++phase) {
         const int count = size / 2;
         const float f = (color - phase) * 0.5f;
@@ -147,10 +152,9 @@ void ViewColorFrame(const uint8_t* in,
     }
   };
   std::vector<Tap> columns[2], rows[2];
-  taps(kWidth, settings.window, settings.window_x, kColorOffsetX, columns[0],
+  taps(kWidth, settings.window, settings.window_x, offset_x, columns[0],
        columns[1]);
-  taps(kHeight, settings.window, settings.window_y, kColorOffsetY, rows[0],
-       rows[1]);
+  taps(kHeight, settings.window, settings.window_y, offset_y, rows[0], rows[1]);
   auto sample = [&](int column_phase, int row_phase, int x, int y) {
     const Tap& column = columns[column_phase][x];
     const Tap& row = rows[row_phase][y];
@@ -306,7 +310,7 @@ void PsCamDevice::StartStreaming() {
 
 void PsCamDevice::OnDepthFrame(const uint8_t* data, size_t size) {
   if (recorder_) {
-    recorder_->AddFrame(false, data, size);
+    recorder_->AddFrame(KinectRecorder::Stream::kDepth, data, size);
   }
   std::lock_guard<std::mutex> lock(mutex_);
   std::memcpy(frame_.data(), data, std::min(size, frame_.size()));
@@ -329,7 +333,10 @@ void PsCamDevice::OnDepthFrame(const uint8_t* data, size_t size) {
 
 void PsCamDevice::OnColorFrame(const uint8_t* data, size_t size) {
   if (recorder_) {
-    recorder_->AddFrame(true, data, size);
+    recorder_->AddFrame(camera_->IsColorRegistered()
+                            ? KinectRecorder::Stream::kRegisteredColor
+                            : KinectRecorder::Stream::kColor,
+                        data, size);
   }
   std::lock_guard<std::mutex> lock(mutex_);
   color_frame_.assign(data, data + size);
@@ -371,6 +378,7 @@ void PsCamDevice::WorkerMain() {
     uint32_t color_number = 0;
     uint64_t color_time_ms = 0;
     bool view_color = false;
+    bool color_registered = false;
     ColorSettings color_settings;
     std::deque<uint32_t> async_requests;
     {
@@ -427,6 +435,7 @@ void PsCamDevice::WorkerMain() {
           if (!view_color) {
             color = sensor_color;
           }
+          color_registered = camera_ && camera_->IsColorRegistered();
           color_settings = color_settings_;
         } else {
           next_color =
@@ -458,7 +467,8 @@ void PsCamDevice::WorkerMain() {
     if (color_request) {
       if (view_color) {
         color.resize(sensor_color.size());
-        ViewColorFrame(sensor_color.data(), color_settings, color.data());
+        ViewColorFrame(sensor_color.data(), color_settings, color_registered,
+                       color.data());
         // A frame as handed over every 10 seconds, beside the sensor's.
         if (cvars::log_kinect && !(color_number % 300)) {
           const std::filesystem::path path =

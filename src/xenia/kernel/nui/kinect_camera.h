@@ -57,6 +57,10 @@ class KinectCamera {
   virtual bool Start(FrameCallback depth_callback,
                      FrameCallback color_callback) = 0;
   virtual bool IsColorStreaming() const = 0;
+  // Whether color comes registered to depth already, each color pixel showing
+  // what the depth pixel in its place does, rather than as the Kinect's color
+  // camera, beside its depth camera, sees it.
+  virtual bool IsColorRegistered() const { return false; }
   virtual void Stop() = 0;
 };
 
@@ -115,9 +119,17 @@ class KinectMotor {
 // kinect_playback_path - to test titles without anyone in front of the sensor.
 class KinectRecorder {
  public:
+  // The stream a recorded frame is from.
+  enum class Stream : uint32_t {
+    kDepth = 0,
+    kColor = 1,
+    // Color registered to depth (KinectCamera::IsColorRegistered).
+    kRegisteredColor = 2,
+  };
+
   explicit KinectRecorder(const std::filesystem::path& path);
   ~KinectRecorder();
-  void AddFrame(bool color, const uint8_t* data, size_t size);
+  void AddFrame(Stream stream, const uint8_t* data, size_t size);
 
  private:
   std::mutex mutex_;
