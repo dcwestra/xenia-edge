@@ -66,7 +66,7 @@ Kinect games do their own skeletal tracking and Kinect ID face matching, in code
 
 1. Plug the Kinect in with its power and USB adapter. `libusb-1.0` must be installed; most distributions have it.
 2. Give your user access to the sensor with the udev rule in [`tools/kinect/`](tools/kinect/). The file explains how to install it. Then replug the Kinect.
-3. Copy the game configs from [`game-configs/`](game-configs/) (`4D530A1A` for *Fable: The Journey*, `4D5308C9` for *Kinect Sports*, `4D5308ED` for *Kinect Adventures!*, `4D53090E` for *Kinect Star Wars*, `373307D2` for *Dance Central 2*) into your Xenia `config/` folder. They turn on `allow_nui_initialization`, plus `allow_avatar_initialization` for *Kinect Sports* and *Kinect Adventures!*.
+3. Copy the game configs from [`game-configs/`](game-configs/) (`4D530A1A` for *Fable: The Journey*, `4D5308C9` for *Kinect Sports*, `4D5308ED` for *Kinect Adventures!*, `4D53090E` for *Kinect Star Wars*, `373307D2` for *Dance Central 2*) into your Xenia `config/` folder. They turn on `allow_nui_initialization`, plus `allow_avatar_initialization` for *Kinect Sports* and *Kinect Adventures!*. On Batocera, the game's **KINECT** and **XBOX AVATARS** advanced options do this instead (see [Installing on Batocera](#installing-on-batocera)).
 4. For voice commands, the Kinect's microphones need its audio firmware, which isn't on game discs. Download the Xbox 360 USB system update from Microsoft (`SystemUpdate_17559_USB.zip`) and set `kinect_audio_firmware_path` to the `$SystemUpdate/FFFE07DF00000001` file in it. The sensor forgets the firmware when it loses power, so it's uploaded again whenever a game first listens.
 5. Stand about 2-3 m in front of the sensor. *Kinect Sports* doesn't track seated players.
 
@@ -105,7 +105,7 @@ Related settings:
 - **Five games tested, all playable.** Other Kinect games may reach parts that aren't implemented yet.
 - **The microphones skip the sensor's own processing.** Games get the four microphones and their average, not the sensor's beamformed mix, which needs the console's Kinect audio calibration. Dance Central 2's voice commands work with this.
 - **Avatars are still missing some details.** Height and weight aren't applied yet. The editor only offers the items in the avatar pack, not marketplace or award items.
-- **Not yet tried with Kinect on Batocera.**
+- **On Batocera, the Kinect camera works.** Its microphones and the webcam stand-in haven't been tried there yet.
 
 ## Key changes
 
@@ -144,6 +144,8 @@ Unless noted, every new behavior is controlled by a configuration option (cvar),
 - **Batocera integration** ([`tools/batocera/`](tools/batocera/)). It adds **xenia-edge** as a third Xbox 360 emulator choice in EmulationStation, next to Batocera's Wine-based Xenia builds.
   - It goes through Batocera's own launcher, so controllers, the hotkey exit, power and video modes all keep working.
   - Everything is installed under `/userdata`, so it survives Batocera updates, and saves are shared with the Wine builds.
+  - **One command installs it** from this fork's releases; see [Installing on Batocera](#installing-on-batocera).
+  - **Advanced game options.** Hold A on a game and choose *Advanced game options*: Xenia Edge gets its own menu (resolution and scaling, anti-aliasing, frame rate limit, MangoHud, render target path, occlusion queries, texture cache limits, and Kinect and avatars, to turn on per game). Options that mean the same as for Batocera's Xenia Canary share its settings.
 - **X11-only GTK builds work.** Batocera's GTK has no Wayland backend, and the window code called a Wayland function on startup.
 - **The picture no longer freezes while the game keeps running.** Repaint requests from the GPU thread could race with the UI thread whenever an overlay, such as an achievement pop-up, was on screen, and get lost for good.
 - **Starting in fullscreen hides the menu bar** on Linux.
@@ -178,6 +180,22 @@ These are separate from the code, and every patch is **off by default**. Copy wh
 - AMD/RADV can't map the emulator's guest memory directly (`VK_EXT_external_memory_host` rejects shared memory). Readback therefore goes through an extra copy, which is safe but slower than on NVIDIA.
 - These changes were tested on the games listed above only. Everything else is as upstream left it, for better or worse.
 
+## Installing on Batocera
+
+For Batocera 43 on an x86-64 PC with a Vulkan GPU. On the Batocera machine, as root (log in over SSH, or open a terminal on it), run:
+
+```sh
+curl -fsSL https://github.com/dcwestra/xenia-edge/releases/latest/download/install-batocera.sh | sh
+```
+
+It downloads the latest [release](https://github.com/dcwestra/xenia-edge/releases) and checks that every library the emulator needs is on the system and that it fits Batocera's launcher. Then it adds **xenia-edge** as an Xbox 360 emulator. If a check fails, nothing is changed. Restart EmulationStation afterwards (**Main menu → Quit → Restart EmulationStation**) for it to show up.
+
+- **Choosing it.** For one game, set *Emulator* to **xenia-edge** in the game's advanced options. For every Xbox 360 game, set it under **Game settings → Per system advanced configuration → Xbox 360**.
+- **Kinect games.** In the game's advanced options, set **KINECT** to *Enabled*, and **XBOX AVATARS** too for *Kinect Sports* and *Kinect Adventures!*. Batocera runs games as root, so the udev rule isn't needed. For voice commands, put the firmware file from step 4 of [Setting it up](#setting-it-up) on the machine and set `kinect_audio_firmware_path` to it in `/userdata/system/configs/xenia-edge/xenia-edge.config.toml`.
+- **Updating.** Run the same command again. The binary it replaces is kept as `xenia_edge.previous`.
+- **Options**, after `sh -s --` (for example `... | sh -s -- --check`): `--check` checks everything but changes nothing, `--restart-es` restarts EmulationStation when done, `--release <tag>` installs an older release, and `--uninstall` removes it again, keeping settings, saves and caches.
+- **Where things are.** Settings and patches: `/userdata/system/configs/xenia-edge`. Logs: `/userdata/system/logs/xenia-edge`. Saves: `/userdata/saves/xbox360`, shared with Batocera's own Xenia builds.
+
 ## Building
 
 Linux needs clang. See [docs/building.md](docs/building.md) for dependencies.
@@ -210,6 +228,8 @@ Linux needs clang. See [docs/building.md](docs/building.md) for dependencies.
     The script first checks that the binary will load there: glibc 2.40 at most, and a static C++ runtime. Files it would replace are kept as backups.
 
 3. Restart EmulationStation, then choose **xenia-edge** as the emulator for a game or for the whole Xbox 360 system.
+
+To make a release for [`install.sh`](tools/batocera/install.sh) instead, commit, build, and run `tools/batocera/package.sh`. It writes the archive, its checksum and `install-batocera.sh` into `build-batocera/release/`, to attach to a GitHub release.
 
 ## Credits
 
