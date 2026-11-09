@@ -21,6 +21,7 @@
 // _GNU_SOURCE. XENIA_PORTABLE_LINUX only targets glibc.
 #if defined(__linux__) && defined(__x86_64__)
 __asm__(".symver acosf,acosf@GLIBC_2.2.5");
+__asm__(".symver atan2f,atan2f@GLIBC_2.2.5");
 __asm__(".symver log10f,log10f@GLIBC_2.2.5");
 __asm__(".symver sqrtf,sqrtf@GLIBC_2.2.5");
 #endif
