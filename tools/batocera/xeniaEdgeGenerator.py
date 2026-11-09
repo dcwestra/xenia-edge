@@ -18,6 +18,7 @@ Layout under /userdata, all of it persistent across Batocera updates:
 from __future__ import annotations
 
 import logging
+import tomllib
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -41,6 +42,31 @@ XENIA_EDGE_LOGS = LOGS / 'xenia-edge'
 
 def _flag(value: bool) -> str:
     return 'true' if value else 'false'
+
+
+# EmulationStation's advanced game options (es_features_xenia-edge.cfg) and
+# the setting each sets: (option, Xenia Edge cvar, type). Only options that
+# are set go on the command line; a game's own config/<title id>.config.toml
+# still wins over them, as it does over any command line setting.
+_OPTIONS: tuple[tuple[str, str, type], ...] = (
+    ('xenia_resolution', 'internal_display_resolution', int),
+    ('xenia_edge_scaling', 'postprocess_scaling_and_sharpening', str),
+    ('xenia_edge_antialiasing', 'postprocess_antialiasing', str),
+    ('xenia_vsync_fps', 'framerate_limit', int),
+    ('xenia_edge_mangohud', 'use_mangohud', bool),
+    ('xenia_achievement', 'show_achievement_notification', bool),
+    ('xenia_edge_render_target_path', 'render_target_path', str),
+    ('xenia_edge_occlusion_query', 'occlusion_query', str),
+    ('xenia_page_state', 'clear_memory_page_state', bool),
+    ('xenia_limit_hard', 'texture_cache_memory_limit_hard', int),
+    ('xenia_limit_render_to_texture',
+     'texture_cache_memory_limit_render_to_texture', int),
+    ('xenia_limit_soft', 'texture_cache_memory_limit_soft', int),
+    ('xenia_limit_soft_lifetime', 'texture_cache_memory_limit_soft_lifetime',
+     int),
+    ('xenia_edge_kinect', 'allow_nui_initialization', bool),
+    ('xenia_edge_avatars', 'allow_avatar_initialization', bool),
+)
 
 
 class XeniaEdgeGenerator(Generator):
@@ -73,6 +99,15 @@ class XeniaEdgeGenerator(Generator):
             return target
         _logger.error('%s names %s, which does not exist', rom, target)
         return rom
+
+    @staticmethod
+    def _xenia_setting(section: str, name: str, default):
+        # A setting from xenia-edge.config.toml, as Xenia Edge itself has it.
+        try:
+            with (XENIA_EDGE_STORAGE / 'xenia-edge.config.toml').open('rb') as settings:
+                return tomllib.load(settings).get(section, {}).get(name, default)
+        except (OSError, tomllib.TOMLDecodeError):
+            return default
 
     @staticmethod
     def _raise_max_map_count(minimum: int = 1048576) -> None:
@@ -110,7 +145,7 @@ class XeniaEdgeGenerator(Generator):
             '--gpu=vulkan',
             '--hid=sdl',
             '--apu=sdl',
-            '--mount_cache=true',
+            f'--mount_cache={_flag(config.get_bool("xenia_cache", True))}',
             '--mount_scratch=true',
             '--discord=false',
             f'--fullscreen={_flag(config.get_bool("xenia_fullscreen", True))}',
@@ -119,23 +154,39 @@ class XeniaEdgeGenerator(Generator):
             f'--user_language={config.get_int("xenia_language", 1)}',
             f'--user_country={config.get_int("xenia_country", 103)}',
         ]
-        # Batocera's Wine Xenia settings that mean the same here. Not
-        # xenia_readback_resolve: for the Wine builds it's D3D12's optional,
-        # costly readback, often turned off per game for speed, while here
-        # readback_resolve is how GPU output reaches the CPU at all - off, a
-        # game that reads it back, such as Fable II for its texture morphs,
-        # gets nothing.
-        if 'xenia_vsync_fps' in config:
-            command.append(f'--framerate_limit={config.get_int("xenia_vsync_fps", 0)}')
+        # Not xenia_readback_resolve, which Batocera's Wine Xenia also has: for
+        # those builds it's D3D12's optional, costly readback, often turned off
+        # per game for speed, while here readback_resolve is how GPU output
+        # reaches the CPU at all - off, a game that reads it back, such as
+        # Fable II for its texture morphs, gets nothing.
+        for option, cvar, kind in _OPTIONS:
+            if option not in config:
+                continue
+            if kind is bool:
+                value = _flag(config.get_bool(option))
+            elif kind is int:
+                value = str(config.get_int(option, 0))
+            else:
+                value = config.get_str(option, '')
+            command.append(f'--{cvar}={value}')
+        if 'xenia_edge_resolution_scale' in config:
+            scale = config.get_int('xenia_edge_resolution_scale', 1)
+            command += [f'--draw_resolution_scale_x={scale}',
+                        f'--draw_resolution_scale_y={scale}']
 
         if not configure_emulator(rom):
             command.append(self._resolve_playlist(rom))
 
-        return Command.Command(
-            array=command,
-            env={
-                'SDL_GAMECONTROLLERCONFIG': generate_sdl_game_controller_config(playersControllers),
-                # Batocera's session is X11, and Xenia's window is GTK.
-                'GDK_BACKEND': 'x11',
-            },
-        )
+        env = {
+            'SDL_GAMECONTROLLERCONFIG': generate_sdl_game_controller_config(playersControllers),
+            # Batocera's session is X11, and Xenia's window is GTK.
+            'GDK_BACKEND': 'x11',
+        }
+        # Xenia Edge turns MangoHud on only for games it starts in a process of
+        # their own, not one given on its command line, and Batocera's own HUD
+        # is off for xbox360 (hud_support), so the layer is turned on here.
+        if config.get_bool('xenia_edge_mangohud',
+                           self._xenia_setting('Linux', 'use_mangohud', False)):
+            env['MANGOHUD'] = '1'
+
+        return Command.Command(array=command, env=env)

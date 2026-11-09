@@ -47,7 +47,8 @@ objcopy --strip-debug "$BIN" "$STAGE/xenia-edge/xenia_edge"
 cp "$ROOT/tools/batocera/emulatorlauncher-edge" \
    "$ROOT/tools/batocera/xeniaEdgeGenerator.py" "$STAGE/xenia-edge/"
 chmod 755 "$STAGE/xenia-edge/xenia_edge" "$STAGE/xenia-edge/emulatorlauncher-edge"
-cp "$ROOT/tools/batocera/es_systems_xbox360.cfg" "$STAGE/"
+cp "$ROOT/tools/batocera/es_systems_xbox360.cfg" \
+   "$ROOT/tools/batocera/es_features_xenia-edge.cfg" "$STAGE/"
 if [ -n "$LOCAL_STORAGE" ]; then
   for sub in patches config; do
     if [ -d "$LOCAL_STORAGE/$sub" ]; then
@@ -79,6 +80,13 @@ if [ -f "$ES/es_systems_xbox360.cfg" ] &&
   cp -a "$ES/es_systems_xbox360.cfg" "$ES/es_systems_xbox360.cfg.bak-$STAMP"
 fi
 cp "$S/es_systems_xbox360.cfg" "$ES/"
+# The advanced game options EmulationStation offers for xenia-edge.
+if [ -f "$ES/es_features_xenia-edge.cfg" ] &&
+   ! cmp -s "$ES/es_features_xenia-edge.cfg" "$S/es_features_xenia-edge.cfg"; then
+  cp -a "$ES/es_features_xenia-edge.cfg" \
+        "$ES/es_features_xenia-edge.cfg.bak-$STAMP"
+fi
+cp "$S/es_features_xenia-edge.cfg" "$ES/"
 
 # The community patches Batocera ships with Xenia Canary, without replacing
 # any already here, which may have been edited.
