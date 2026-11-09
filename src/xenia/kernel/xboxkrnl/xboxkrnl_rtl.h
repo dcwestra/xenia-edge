@@ -53,6 +53,9 @@ void StoreContextRecord(uint8_t* record, const cpu::ppc::PPCContext* context,
 uint32_t LoadContextRecord(const uint8_t* record,
                            cpu::ppc::PPCContext* context);
 
+void xeRtlGetStackLimits(cpu::ppc::PPCContext* context, uint32_t* out_end,
+                         uint32_t* out_base);
+
 struct X_RTL_CRITICAL_SECTION;
 
 void xeRtlInitializeCriticalSection(X_RTL_CRITICAL_SECTION* cs,

@@ -2192,6 +2192,58 @@ bool Emulator::ExceptionCallbackThunk(Exception* ex, void* data) {
   }
 }
 
+// The crash dump of a guest thread, with the registers in its context.
+static std::string FormatGuestCrashDump(kernel::XThread* thread,
+                                        std::string_view pc,
+                                        std::string_view fault) {
+  auto context = thread->thread_state()->context();
+  std::string crash_msg;
+  crash_msg.append("==== CRASH DUMP ====\n");
+  // Fiber-backed guest threads have no host thread, so report 0 for the host id
+  // and avoid null-dereferencing thread() inside the crash handler.
+  crash_msg.append(
+      fmt::format("Thread ID (Host: 0x{:08X} / Guest: 0x{:08X})\n",
+                  thread->thread() ? thread->thread()->system_id() : 0,
+                  thread->thread_id()));
+  crash_msg.append(fmt::format("Thread Handle: 0x{:08X}\n", thread->handle()));
+  crash_msg.append(fmt::format("PC: {}\n", pc));
+  // Usually the caller, which a crash in a shared stub needs.
+  crash_msg.append(fmt::format("LR: 0x{:08X}\n", uint32_t(context->lr)));
+  if (!fault.empty()) {
+    crash_msg.append(fmt::format("{}\n", fault));
+  }
+  crash_msg.append("Registers:\n");
+  for (int i = 0; i < 32; i++) {
+    crash_msg.append(fmt::format(" r{:<3} = {:016X}\n", i, context->r[i]));
+  }
+  for (int i = 0; i < 32; i++) {
+    crash_msg.append(fmt::format(" f{:<3} = {:016X} = (double){} = (float){}\n",
+                                 i,
+                                 *reinterpret_cast<uint64_t*>(&context->f[i]),
+                                 context->f[i], *(float*)&context->f[i]));
+  }
+  for (int i = 0; i < 128; i++) {
+    crash_msg.append(
+        fmt::format(" v{:<3} = [0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}]\n", i,
+                    context->v[i].u32[0], context->v[i].u32[1],
+                    context->v[i].u32[2], context->v[i].u32[3]));
+  }
+  return crash_msg;
+}
+
+void Emulator::HaltCrashedGuestThread(uint32_t pc, std::string_view fault) {
+  auto* thread = kernel::XThread::GetCurrentThread();
+  ReportGuestCrash(
+      FormatGuestCrashDump(thread, fmt::format("0x{:08X}", pc), fault));
+  if (thread->fiber()) {
+    HaltCrashedFiberThunk();
+  }
+  thread->Suspend(nullptr);
+  while (true) {
+    xe::threading::NanoSleep(int64_t(1'000'000'000));
+  }
+}
+
 // A guest load or store that faulted, handed from the exception handler to the
 // thunk below on the same thread.
 struct PendingDataFault {
@@ -2199,7 +2251,7 @@ struct PendingDataFault {
   uint32_t pc;
   bool is_store;
   uint32_t address;
-  std::string crash_msg;
+  uint64_t host_address;
 };
 static thread_local PendingDataFault pending_data_fault;
 
@@ -2209,7 +2261,7 @@ static thread_local PendingDataFault pending_data_fault;
 // NullReferenceException, continues the thread wherever that lands. Otherwise
 // the thread is halted as a crash.
 [[noreturn]] static void GuestDataFaultThunk() {
-  PendingDataFault fault = std::move(pending_data_fault);
+  const PendingDataFault fault = pending_data_fault;
   auto* thread = kernel::XThread::GetCurrentThread();
   auto* context = thread->thread_state()->context();
   auto* processor = fault.emulator->processor();
@@ -2226,14 +2278,10 @@ static thread_local PendingDataFault pending_data_fault;
         "{:08X}, returned",
         fault.pc, resume_address);
   }
-  fault.emulator->ReportGuestCrash(fault.crash_msg);
-  if (thread->fiber()) {
-    HaltCrashedFiberThunk();
-  }
-  thread->Suspend(nullptr);
-  while (true) {
-    xe::threading::NanoSleep(int64_t(1'000'000'000));
-  }
+  fault.emulator->HaltCrashedGuestThread(
+      fault.pc,
+      fmt::format("Access Violation: {} at 0x{:016X}",
+                  fault.is_store ? "write" : "read", fault.host_address));
 }
 
 bool Emulator::ExceptionCallback(Exception* ex) {
@@ -2342,59 +2390,6 @@ bool Emulator::ExceptionCallback(Exception* ex) {
 
   auto guest_function = code_cache->LookupFunction(ex->pc());
 
-  auto context = current_thread->thread_state()->context();
-
-  std::string crash_msg;
-  crash_msg.append("==== CRASH DUMP ====\n");
-  // Fiber-backed guest threads have no host thread, so report 0 for the host id
-  // and avoid null-dereferencing thread() inside the crash handler.
-  crash_msg.append(fmt::format(
-      "Thread ID (Host: 0x{:08X} / Guest: 0x{:08X})\n",
-      current_thread->thread() ? current_thread->thread()->system_id() : 0,
-      current_thread->thread_id()));
-  crash_msg.append(
-      fmt::format("Thread Handle: 0x{:08X}\n", current_thread->handle()));
-  if (guest_function) {
-    crash_msg.append(
-        fmt::format("PC: 0x{:08X}\n",
-                    guest_function->MapMachineCodeToGuestAddress(ex->pc())));
-  } else {
-    crash_msg.append(fmt::format(
-        "PC: unavailable (unmapped host JIT address 0x{:016X})\n", ex->pc()));
-  }
-  // Usually the caller, which a crash in a shared stub needs.
-  crash_msg.append(fmt::format("LR: 0x{:08X}\n", uint32_t(context->lr)));
-  if (ex->code() == Exception::Code::kAccessViolation) {
-    const char* op_str = "unknown";
-    if (ex->access_violation_operation() ==
-        Exception::AccessViolationOperation::kRead) {
-      op_str = "read";
-    } else if (ex->access_violation_operation() ==
-               Exception::AccessViolationOperation::kWrite) {
-      op_str = "write";
-    }
-    crash_msg.append(fmt::format("Access Violation: {} at 0x{:016X}\n", op_str,
-                                 ex->fault_address()));
-  } else if (ex->code() == Exception::Code::kIllegalInstruction) {
-    crash_msg.append("Illegal Instruction\n");
-  }
-  crash_msg.append("Registers:\n");
-  for (int i = 0; i < 32; i++) {
-    crash_msg.append(fmt::format(" r{:<3} = {:016X}\n", i, context->r[i]));
-  }
-  for (int i = 0; i < 32; i++) {
-    crash_msg.append(fmt::format(" f{:<3} = {:016X} = (double){} = (float){}\n",
-                                 i,
-                                 *reinterpret_cast<uint64_t*>(&context->f[i]),
-                                 context->f[i], *(float*)&context->f[i]));
-  }
-  for (int i = 0; i < 128; i++) {
-    crash_msg.append(
-        fmt::format(" v{:<3} = [0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}]\n", i,
-                    context->v[i].u32[0], context->v[i].u32[1],
-                    context->v[i].u32[2], context->v[i].u32[3]));
-  }
-
   // A load or store whose address the guest can be told: the console's kernel
   // dispatches the access violation to the frame-based handlers on the stack,
   // and the CLR, for one, turns a read through a null reference into a
@@ -2410,12 +2405,35 @@ bool Emulator::ExceptionCallback(Exception* ex) {
     XELOGW("Guest {} at {:08X} faulted at {:08X}, delivering it to the guest",
            is_store ? "store" : "load", pc, uint32_t(fault_offset));
     pending_data_fault = {this, pc, is_store, uint32_t(fault_offset),
-                          std::move(crash_msg)};
+                          ex->fault_address()};
     DivertToThunk(ex, &GuestDataFaultThunk);
     return true;
   }
 
-  ReportGuestCrash(crash_msg);
+  std::string pc;
+  if (guest_function) {
+    pc = fmt::format("0x{:08X}",
+                     guest_function->MapMachineCodeToGuestAddress(ex->pc()));
+  } else {
+    pc = fmt::format("unavailable (unmapped host JIT address 0x{:016X})",
+                     ex->pc());
+  }
+  std::string fault;
+  if (ex->code() == Exception::Code::kAccessViolation) {
+    const char* op_str = "unknown";
+    if (ex->access_violation_operation() ==
+        Exception::AccessViolationOperation::kRead) {
+      op_str = "read";
+    } else if (ex->access_violation_operation() ==
+               Exception::AccessViolationOperation::kWrite) {
+      op_str = "write";
+    }
+    fault = fmt::format("Access Violation: {} at 0x{:016X}", op_str,
+                        ex->fault_address());
+  } else if (ex->code() == Exception::Code::kIllegalInstruction) {
+    fault = "Illegal Instruction";
+  }
+  ReportGuestCrash(FormatGuestCrashDump(current_thread, pc, fault));
 
   // Halt the crashed thread without unwinding the rest of the emulator. Host
   // mode suspends self. Fiber mode diverts the resume PC to a halt thunk, since
@@ -2446,18 +2464,12 @@ void Emulator::ReportGuestCrash(const std::string& crash_msg) {
       "Xenia has now paused itself.\n\n"
       "{}",
       crash_msg);
-  // Display a dialog telling the user the guest has crashed. Each crashed
-  // thread gets its own, and ImGui takes a window's title as its ID, so the
-  // thread's handle goes after "##", where ImGui doesn't show it.
+  // Display a dialog telling the user the guest has crashed.
   if (display_window_ && imgui_drawer_) {
-    auto* current_thread = kernel::XThread::GetCurrentThread();
-    const std::string crash_title = fmt::format(
-        "Uh-oh!##{:08X}", current_thread ? current_thread->handle() : 0);
-    display_window_->app_context().CallInUIThreadSynchronous(
-        [this, &crash_dlg, &crash_title]() {
-          xe::ui::ImGuiDialog::ShowMessageBox(imgui_drawer_, crash_title,
-                                              crash_dlg);
-        });
+    display_window_->app_context().CallInUIThreadSynchronous([this,
+                                                              &crash_dlg]() {
+      xe::ui::ImGuiDialog::ShowMessageBox(imgui_drawer_, "Uh-oh!", crash_dlg);
+    });
   }
 }
 

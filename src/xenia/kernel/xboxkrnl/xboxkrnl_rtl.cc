@@ -848,20 +848,23 @@ static void RtlRip_entry(const ppc_context_t& ctx) {
 }
 DECLARE_XBOXKRNL_EXPORT1(RtlRip, kNone, kImportant);
 
+void xeRtlGetStackLimits(PPCContext* context, uint32_t* out_end,
+                         uint32_t* out_base) {
+  auto kpcr = context->TranslateVirtualGPR<X_KPCR*>(context->r[13]);
+  if (kpcr->use_alternative_stack) {
+    *out_base = kpcr->alt_stack_base_ptr;
+    *out_end = kpcr->alt_stack_end_ptr;
+  } else {
+    *out_base = kpcr->stack_base_ptr;
+    *out_end = kpcr->stack_end_ptr;
+  }
+}
+
 void RtlGetStackLimits_entry(lpdword_t out_end, lpdword_t out_base,
                              const ppc_context_t& ctx) {
-  auto kpcr = ctx->TranslateVirtualGPR<X_KPCR*>(ctx->r[13]);
-
   uint32_t stack_base;
   uint32_t stack_end;
-
-  if (kpcr->use_alternative_stack) {
-    stack_base = kpcr->alt_stack_base_ptr;
-    stack_end = kpcr->alt_stack_end_ptr;
-  } else {
-    stack_base = kpcr->stack_base_ptr;
-    stack_end = kpcr->stack_end_ptr;
-  }
+  xeRtlGetStackLimits(ctx, &stack_end, &stack_base);
   *out_base = stack_base;
   *out_end = stack_end;
 }

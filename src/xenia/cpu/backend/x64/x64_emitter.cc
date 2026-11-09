@@ -687,20 +687,12 @@ uint64_t ResolveFunction(void* raw_context, uint64_t target_address) {
     }
   }
 
-  auto processor = thread_state->processor();
-  auto fn = processor->ResolveFunction(static_cast<uint32_t>(target_address));
-  if (!fn || !fn->is_guest()) {
-    // No code there, so the call faults on the instruction fetch, which the
-    // guest can handle by continuing elsewhere.
-    auto hook = processor->code_fault_hook();
-    const uint32_t resume_address =
-        hook ? hook(guest_context, static_cast<uint32_t>(target_address)) : 0;
-    fn = resume_address ? processor->ResolveFunction(resume_address) : nullptr;
-    if (!fn || !fn->is_guest()) {
-      XELOGE("No guest code at {:08X} for a call",
-             static_cast<uint32_t>(target_address));
-      return 0;
-    }
+  uint32_t address = static_cast<uint32_t>(target_address);
+  auto fn =
+      thread_state->processor()->ResolveCallTarget(guest_context, &address);
+  if (!fn) {
+    XELOGE("No guest code at {:08X} for a call", address);
+    return 0;
   }
   auto x64_fn = static_cast<X64Function*>(fn);
   uint64_t addr = reinterpret_cast<uint64_t>(x64_fn->machine_code());
@@ -855,30 +847,18 @@ static uint64_t ResolveDynamicFunction(void* raw_context,
     }
   }
   const uint64_t sweep_count = guest_context->processor->code_sweep_count();
-  auto function = guest_context->processor->ResolveFunction(
-      static_cast<uint32_t>(target_address));
-  bool redirected = false;
-  if (!function || !function->is_guest()) {
-    // The guest can handle the fetch fault and continue the call elsewhere.
-    if (auto hook = guest_context->processor->code_fault_hook()) {
-      if (const uint32_t resume_address =
-              hook(guest_context, static_cast<uint32_t>(target_address))) {
-        target_address = resume_address;
-        function = guest_context->processor->ResolveFunction(resume_address);
-        redirected = true;
-      }
-    }
-  }
-  if (!function || !function->is_guest()) {
-    XELOGE("No guest code at {:08X} for a dynamic call",
-           static_cast<uint32_t>(target_address));
+  uint32_t address = static_cast<uint32_t>(target_address);
+  auto function =
+      guest_context->processor->ResolveCallTarget(guest_context, &address);
+  if (!function) {
+    XELOGE("No guest code at {:08X} for a dynamic call", address);
     return 0;
   }
   const uint64_t host_address = reinterpret_cast<uint64_t>(
       static_cast<X64Function*>(function)->machine_code());
   // A redirect isn't cached, since the checks above were for the original
   // target.
-  if (redirected) {
+  if (address != static_cast<uint32_t>(target_address)) {
     return host_address;
   }
   auto backend = static_cast<X64Backend*>(guest_context->processor->backend());
@@ -1258,6 +1238,22 @@ void X64Emitter::CallIndirect(const hir::Instr* instr,
           });
       jae(resolve_natively, T_NEAR);
     }
+    // Without dynamic code, a target the table doesn't cover goes to the
+    // resolve thunk, since its slot would be read from whatever the host maps
+    // there. Returns, the most common sites, are left to RedirectUncoveredCall.
+    Xbyak::Label table_slot;
+    Xbyak::Label slot_ready;
+    const bool check_range = !processor()->dynamic_code_enabled() &&
+                             !(instr->flags & hir::CALL_POSSIBLE_RETURN);
+    if (check_range) {
+      mov(eax, edx);
+      sub(eax, code_cache_->indirection_guest_base());
+      cmp(eax, code_cache_->indirection_guest_size());
+      jb(table_slot, T_SHORT);
+      mov(rax, reinterpret_cast<uint64_t>(backend()->resolve_function_thunk()));
+      jmp(slot_ready, code_cache_->encoded_indirection() ? T_NEAR : T_SHORT);
+      L(table_slot);
+    }
     if (!code_cache_->encoded_indirection()) {
       // Fast path: table mapped at host VA == guest addr; slot holds raw
       // 32-bit host target.
@@ -1284,6 +1280,9 @@ void X64Emitter::CallIndirect(const hir::Instr* instr,
       mov(rax, qword[r8 + rax * 8]);
 
       L(indirection_ready);
+    }
+    if (check_range) {
+      L(slot_ready);
     }
     if (target_ready) {
       L(*target_ready);

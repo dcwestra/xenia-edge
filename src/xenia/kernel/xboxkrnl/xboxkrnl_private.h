@@ -23,7 +23,8 @@ xe::cpu::Export* RegisterExport_xboxkrnl(xe::cpu::Export* export_entry);
 // Delivers a guest call to an address with no code to the guest's frame-based
 // exception handlers, as the console's kernel does for the instruction fetch
 // fault the call raises there. Returns the address a handler continued at, with
-// the context loaded from its CONTEXT record, or 0 if none did.
+// the context loaded from its CONTEXT record, and halts the thread as crashed
+// if none did.
 uint32_t DispatchCodeFetchFault(xe::cpu::ppc::PPCContext* context,
                                 uint32_t address);
 
