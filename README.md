@@ -44,7 +44,7 @@ Tested by the owner with a Kinect for Xbox 360 (model 1414) on Fedora 44:
 - ***Kinect Sports*** is playable. The hand-cursor menus, signing in, bowling and the stadium crowd area all work, and **players appear as their Xbox avatars**, fully dressed and with animated faces.
 - ***Kinect Adventures!*** plays River Rush: jumping and steering the raft by side-stepping both work, and **players appear as their Xbox avatars**.
 - ***Kinect Star Wars*** plays.
-- ***Dance Central 2*** is playable: menus, songs and scoring all work, and so do its voice commands.
+- ***Dance Central 2*** is playable: menus, songs and scoring all work, and so do its voice commands. Its music needs a [title keys file](#title-keys-file) you supply. Without one it stays on its loading screen after you sign in.
 
 ### How it works
 
@@ -135,7 +135,7 @@ Unless noted, every new behavior is controlled by a configuration option (cvar),
 
 ### Compatibility
 
-- **Title keys.** Games can decrypt with keys they hand the console (`XeKeysSetKey`, `XeKeysAesCbc`). The console's hypervisor turns Harmonix's song keys into different ones before using them, in a way that isn't known, so the four *Dance Central 2* hands over are translated to the keys their songs decrypt with. The songs then play from an unmodified disc.
+- **Title keys.** Games can decrypt with keys they hand the console (`XeKeysSetKey`, `XeKeysAesCbc`). Where the console uses a different key from the one handed over, as for *Dance Central 2*'s songs, you supply both in a [title keys file](#title-keys-file). This fork includes no keys.
 
 ### Linux and Batocera
 
@@ -172,6 +172,26 @@ These are separate from the code, and every patch is **off by default**. Copy wh
   - A *Fable III* Limited Collector's Edition unlock. It is new, and its in-game result is not yet confirmed.
   - The *Fable II* Realtime Texture Morphing patch, from himdo's research. In this fork it is only needed if `readback_resolve` is off.
 - [`game-configs/`](game-configs/) holds recommended per-game settings for *Fable II* and the Kinect games.
+
+### Title keys file
+
+Some games hand the console a key, then decrypt their own data with a different key that the console's hypervisor makes from it. How the hypervisor does that isn't known, so Xenia can't. *Dance Central 2* works this way for its music. Without the right keys its menu music never decodes, and it stays on its loading screen.
+
+**This fork doesn't include these keys or say where to get them.** If you have them, list them in a title keys file and Xenia uses them when a game sets one. Whether you may obtain and use them depends on the law where you live.
+
+- **Where:** `keys/title_keys.toml` in your Xenia storage folder (on Linux, usually `~/.local/share/Xenia/keys/title_keys.toml`), or any file named by the `title_keys_path` option.
+- **Format:** TOML, with one `[[title_key]]` entry per key:
+
+  ```toml
+  [[title_key]]
+  set = "000102030405060708090A0B0C0D0E0F"  # the key the game hands the console
+  use = "F0E0D0C0B0A090807060504030201000"  # the key the console uses instead
+  ```
+
+  Each value is the key's 16 bytes as 32 hexadecimal digits, first byte first, with no spaces or `0x`. Upper and lower case both work. The values above are placeholders. *Dance Central 2* needs four entries.
+- **Finding a game's `set` values:** when a game sets a key the file doesn't list, the Xenia log shows the value, for example `XeKeysSetKey: the title set key 0xE0 to 000102…, which the title keys file doesn't list.`
+- **Checking the file:** the log says how many keys Xenia read from it, and names the line of any entry it couldn't use.
+- Xenia reads the file the first time a game sets a key, so restart Xenia after changing it.
 
 ## Known issues
 

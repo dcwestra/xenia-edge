@@ -1,5 +1,7 @@
 # Dance Central 2 (373307D2) - recommended per-game settings for the
 # edge-linux fork. Copy to <Xenia storage root>/config/373307D2.config.toml.
+# Its music also needs a title keys file you supply, which this fork doesn't
+# include: see "Title keys file" in the README.
 
 [Console]
 # A Kinect game: lets its Kinect (NUI) runtime start. Needs a Kinect for Xbox
