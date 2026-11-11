@@ -14,8 +14,10 @@
 
 #if XE_PLATFORM_LINUX
 #include <dlfcn.h>
-#include <libusb-1.0/libusb.h>
 
+// Only the declarations: the system's libusb is loaded at run time, so a
+// build doesn't need its development package.
+#include "third_party/libusb/libusb/libusb.h"
 #include "xenia/base/logging.h"
 
 namespace xe {
