@@ -1257,6 +1257,19 @@ bool EmulatorWindow::Initialize() {
           [this](bool checked) { SetToolbarVisible(checked); });
       view_show_toolbar_item_ = show_toolbar_item.get();
       view_menu->AddChild(std::move(show_toolbar_item));
+      // Checked while the Kinect view is shown, however it was shown. The
+      // menu says F9 in its text: as an accelerator it would take F9 from
+      // OnKeyDown.
+      auto kinect_view_item = WxMenuItem::CreateCheck(
+          _("&Kinect View (F9)"), false, [this](bool checked) {
+            if (checked != bool(kinect_view_)) {
+              ToggleKinectView();
+            } else if (view_kinect_view_item_) {
+              view_kinect_view_item_->SetChecked(checked);
+            }
+          });
+      view_kinect_view_item_ = kinect_view_item.get();
+      view_menu->AddChild(std::move(kinect_view_item));
     }
     main_menu->AddChild(std::move(view_menu));
 
@@ -2939,11 +2952,12 @@ void EmulatorWindow::ToggleDebugSettingsDialog() {
 void EmulatorWindow::ToggleKinectView() {
   if (kinect_view_) {
     kinect_view_.reset();
-    return;
-  }
-  if (imgui_drawer_) {
+  } else if (imgui_drawer_) {
     kinect_view_ = std::make_unique<kernel::nui::KinectViewOverlay>(
         imgui_drawer_.get(), emulator_->kernel_state());
+  }
+  if (view_kinect_view_item_) {
+    view_kinect_view_item_->SetChecked(bool(kinect_view_));
   }
 }
 

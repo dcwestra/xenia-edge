@@ -321,6 +321,7 @@ class EmulatorWindow {
   int audio_icon_key_ = -1;
   uint32_t pre_mute_volume_ = 100;
   ui::MenuItem* view_show_toolbar_item_ = nullptr;
+  ui::MenuItem* view_kinect_view_item_ = nullptr;
   bool show_toolbar_ = true;
   void RefreshProfileMenu();
   void PopulateProfileMenu(ui::MenuItem* parent);
