@@ -149,10 +149,11 @@ std::unique_ptr<OnnxModel> OnnxModel::Load(
     return nullptr;
   }
   auto impl = std::make_unique<Impl>();
-  const std::string path = xe::path_to_utf8(model_path);
-  const bool failed = Failed(
-      api->CreateSession(runtime.env, path.c_str(), options, &impl->session),
-      "load a model");
+  // A path's native characters are the ones ONNX Runtime takes (ORTCHAR_T):
+  // wchar_t on Windows, char elsewhere.
+  const bool failed = Failed(api->CreateSession(runtime.env, model_path.c_str(),
+                                                options, &impl->session),
+                             "load a model");
   api->ReleaseSessionOptions(options);
   if (failed) {
     impl->session = nullptr;
