@@ -451,6 +451,11 @@ class XThread : public XObject, public cpu::Thread {
   X_STATUS Exit(int exit_code);
   X_STATUS Terminate(int exit_code);
 
+  // Counts the requests this thread issued that pend on an I/O worker, which
+  // its exit waits for.
+  void AddPostedIo() { posted_io_.fetch_add(1, std::memory_order_relaxed); }
+  void RemovePostedIo() { posted_io_.fetch_sub(1, std::memory_order_release); }
+
   virtual void Execute();
 
   virtual void Reenter(uint32_t address);
@@ -613,14 +618,10 @@ class XThread : public XObject, public cpu::Thread {
   // continued the thread elsewhere instead of returning stays here until the
   // next dispatch on the thread finds it gone.
   struct ExceptionDispatch {
-    // Where the handlers run and return to, on the back chain of whatever a
-    // handler runs.
+    // Where the handlers run, below the trap frame, and return to, which
+    // unwinding a handler's frame leads to.
     uint32_t handler_sp;
     uint32_t handler_return;
-    // A load or store at handler_return - 4 made with this lr, else a call
-    // that returns to handler_return.
-    bool data_fault;
-    uint32_t fault_lr;
     // Its CONTEXT, EXCEPTION_RECORD and DISPATCHER_CONTEXT in the system heap.
     uint32_t records;
   };
@@ -848,6 +849,7 @@ class XThread : public XObject, public cpu::Thread {
   SchedulerLinks scheduler_links_;
   // Set by the first ReclaimExited so both terminal paths reclaim once.
   std::atomic<bool> self_reference_dropped_{false};
+  std::atomic<uint32_t> posted_io_{0};
   // Owned by XObject::Enter/LeaveCooperativeWait.
   std::atomic<XObject*> cooperative_wait_object_{nullptr};
   // Signaled when a fiber-backed thread exits, so waits on the thread object

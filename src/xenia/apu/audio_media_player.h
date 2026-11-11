@@ -10,6 +10,10 @@
 #ifndef XENIA_APU_AUDIO_MEDIA_PLAYER_H_
 #define XENIA_APU_AUDIO_MEDIA_PLAYER_H_
 
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+
 #include "xenia/apu/audio_driver.h"
 #include "xenia/apu/audio_system.h"
 #include "xenia/apu/xmp_state.h"
@@ -22,11 +26,19 @@ using XmpApp = kernel::xam::apps::XmpApp;
 
 enum ProcessAudioResult { Successful = 0, ForcedFinish = 1, Failure = 2 };
 
-class AudioMediaPlayer {
+// XMP renders as an audio driver client: each pass takes one frame of 48 kHz
+// stereo from the decoder, hands it to the title's capture callback and plays
+// it unless the title renders it.
+class AudioMediaPlayer : public AudioSystem::HostClient {
  public:
+  static constexpr uint32_t kSampleRate = 48000;
+  static constexpr uint32_t kChannels = 2;
+  static constexpr uint32_t kFrameSamples =
+      kChannels * AudioDriver::kChannelSamplesDefault;
+
   AudioMediaPlayer(apu::AudioSystem* audio_system,
                    kernel::KernelState* kernel_state);
-  ~AudioMediaPlayer();
+  ~AudioMediaPlayer() override;
 
   void Setup();
 
@@ -52,7 +64,6 @@ class AudioMediaPlayer {
   bool IsLastSongInPlaylist() const;
 
   X_STATUS SetVolume(float volume);
-  const std::atomic<float>* GetVolume() const { return &volume_; }
 
   void SetPlaybackMode(XmpApp::PlaybackMode playback_mode) {
     playback_mode_ = playback_mode;
@@ -69,12 +80,14 @@ class AudioMediaPlayer {
   }
   XmpApp::PlaybackFlags GetPlaybackFlags() const { return playback_flags_; }
 
+  // Every client's volume before anything sets it, -12 dB (10^(-12/20)).
+  static constexpr float kDefaultVolume = 0.25118864f;
+
   struct ControllerSettings {
     XmpApp::PlaybackMode playback_mode = XmpApp::PlaybackMode::kInOrder;
     XmpApp::RepeatMode repeat_mode = XmpApp::RepeatMode::kPlaylist;
     XmpApp::PlaybackFlags playback_flags = XmpApp::PlaybackFlags::kDefault;
-    // Initial return before anything sets it, -12 dB (10^(-12/20)).
-    float volume = 0.25118864f;
+    float volume = kDefaultVolume;
   };
   ControllerSettings& GetControllerSettings(XmpClient xmp_client);
 
@@ -98,12 +111,11 @@ class AudioMediaPlayer {
       return false;
     }
 
-    const bool game_control = xmp_client_ == XmpClient::kGame &&
-                              playback_controller_ == PlaybackController::kGame;
-
-    return game_control || is_title_rendering_enabled_;
+    return xmp_client_ == XmpClient::kGame &&
+           playback_controller_ == PlaybackController::kGame;
   }
 
+  // Waits for a call of the previous callback in flight before returning.
   void SetCaptureCallback(uint32_t callback, uint32_t context,
                           bool title_render);
 
@@ -112,14 +124,25 @@ class AudioMediaPlayer {
 
   XmpApp::Song* GetCurrentSong() const { return active_song_; }
 
-  void ProcessAudioBuffer(std::vector<float>* buffer);
+  // Queues decoded interleaved 48 kHz stereo, waiting while the queue is full.
+  // False once the song is unloaded.
+  bool PushSamples(const float* samples, size_t frames);
+
+  void Pump(cpu::ThreadState* thread_state) override;
 
  private:
+  // About 200 ms decoded ahead.
+  static constexpr size_t kQueuedSamplesMax = kSampleRate / 5 * kChannels;
+
   void OnStateChanged();
 
   void Play();
   void WorkerThreadMain();
   std::span<uint8_t> LoadSongToMemory();
+
+  // Waits until the pump has taken the whole song.
+  void WaitForDrain();
+  void FlushSamples();
 
   XmpApp::State state_ = XmpApp::State::kIdle;
   bool xmp_override_ = false;
@@ -129,7 +152,7 @@ class AudioMediaPlayer {
   PlaybackController playback_controller_ = PlaybackController::kGame;
   XmpClient xmp_client_ = XmpClient::kGame;
   ControllerSettings controller_settings_[4];
-  std::atomic<float> volume_ = 0.0f;
+  std::atomic<float> volume_ = kDefaultVolume;
   uint32_t dash_init_state = 0;
 
   std::unordered_map<uint32_t, std::unique_ptr<XmpApp::Playlist>> playlists_;
@@ -138,10 +161,25 @@ class AudioMediaPlayer {
 
   size_t current_song_handle_ = 0;
 
-  uint32_t callback_ = 0;
-  uint32_t callback_context_ = 0;
-  uint32_t sample_buffer_ptr_ = 0;
-  bool is_title_rendering_enabled_ = false;
+  // Guards the capture fields, never held while guest code runs.
+  std::mutex capture_mutex_;
+  uint32_t capture_callback_ = 0;
+  uint32_t capture_context_ = 0;
+  bool capture_title_render_ = false;
+  bool capture_in_flight_ = false;
+  bool capture_waiter_ = false;
+  xe::threading::Fence capture_done_fence_;
+  // One buffer for every call.
+  uint32_t capture_buffer_ = 0;
+
+  // Decoded samples the pump hasn't taken yet.
+  std::mutex samples_mutex_;
+  std::condition_variable samples_cv_;
+  std::deque<float> samples_;
+  bool song_decoded_ = false;
+
+  size_t client_index_ = 0;
+  bool client_registered_ = false;
 
   AudioSystem* audio_system_ = nullptr;
   kernel::KernelState* kernel_state_ = nullptr;
@@ -151,15 +189,6 @@ class AudioMediaPlayer {
   std::unique_ptr<threading::Thread> worker_thread_;
   xe::threading::Fence resume_fence_;  // Signaled when resume requested.
   xe::threading::Fence processing_end_fence_;
-
-  // Driver part - This should be integrated into audio_system, but it isn't
-  // really compatible with it.
-  std::unique_ptr<AudioDriver> driver_ = nullptr;
-  std::unique_ptr<xe::threading::Semaphore> driver_semaphore_ = {};
-  xe_mutex driver_mutex_ = {};
-
-  bool SetupDriver(uint32_t sample_rate, uint32_t channels);
-  void DeleteDriver();
 };
 
 }  // namespace apu

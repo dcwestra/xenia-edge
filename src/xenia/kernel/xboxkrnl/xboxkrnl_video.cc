@@ -9,6 +9,8 @@
 
 #include "xenia/kernel/xboxkrnl/xboxkrnl_video.h"
 
+#include <atomic>
+
 #include "xenia/base/logging.h"
 #include "xenia/emulator.h"
 #include "xenia/gpu/command_processor.h"
@@ -348,11 +350,11 @@ DECLARE_XBOXKRNL_EXPORT1(VdSetSystemCommandBufferGpuIdentifierAddress, kVideo,
 // no op?
 
 dword_result_t VdInitializeScalerCommandBuffer_entry(
-    dword_t scaler_source_xy,      // ((uint16_t)y << 16) | (uint16_t)x
-    dword_t scaler_source_wh,      // ((uint16_t)h << 16) | (uint16_t)w
-    dword_t scaled_output_xy,      // ((uint16_t)y << 16) | (uint16_t)x
-    dword_t scaled_output_wh,      // ((uint16_t)h << 16) | (uint16_t)w
-    dword_t front_buffer_wh,       // ((uint16_t)h << 16) | (uint16_t)w
+    dword_t scaler_source_xy,      // ((uint16_t)x << 16) | (uint16_t)y
+    dword_t scaler_source_wh,      // ((uint16_t)w << 16) | (uint16_t)h
+    dword_t scaled_output_xy,      // ((uint16_t)x << 16) | (uint16_t)y
+    dword_t scaled_output_wh,      // ((uint16_t)w << 16) | (uint16_t)h
+    dword_t front_buffer_wh,       // ((uint16_t)w << 16) | (uint16_t)h
     dword_t vertical_filter_type,  // 7?
     pointer_t<X_D3DFILTER_PARAMETERS> vertical_filter_params,    //
     dword_t horizontal_filter_type,                              // 7?
@@ -362,12 +364,19 @@ dword_result_t VdInitializeScalerCommandBuffer_entry(
                         // sources from.
     dword_t dest_count  // Count in words.
 ) {
-  // We could fake the commands here, but I'm not sure the game checks for
-  // anything but success (non-zero ret).
-  // For now, we just fill it with NOPs.
+  // The console fills this with scaler register writes the title submits to the
+  // GPU, so the source rect travels the same way.
+  namespace xenos = xe::gpu::xenos;
   auto dest = dest_ptr.as_array<uint32_t>();
-  for (size_t i = 0; i < dest_count; ++i) {
-    dest[i] = 0x80000000;
+  uint32_t offset = 0;
+  if (dest_count >= 4) {
+    dest[offset++] = xenos::MakePacketType3(xenos::PM4_XE_SET_SCALER, 3);
+    dest[offset++] = xenos::kScalerSignature;
+    dest[offset++] = scaler_source_xy.value();
+    dest[offset++] = scaler_source_wh.value();
+  }
+  for (uint32_t i = offset; i < dest_count; ++i) {
+    dest[i] = xenos::MakePacketType2();
   }
 
   uint32_t fb_x = (scaled_output_wh >> 16) & 0xFFFF;
@@ -481,11 +490,16 @@ void VdSwap_entry(
   gpu_fetch.base_address = frontbuffer_physical_address >> 12;
   XE_MAYBE_UNUSED
   auto texture_format = gpu::xenos::TextureFormat(texture_format_ptr.value());
-  auto color_space = *color_space_ptr;
+  uint32_t color_space = *color_space_ptr;
   assert_true(texture_format == gpu::xenos::TextureFormat::k_8_8_8_8 ||
               texture_format ==
                   gpu::xenos::TextureFormat::k_2_10_10_10_AS_16_16_16_16);
-  assert_true(color_space == 0);  // RGB(0)
+  // RGB(0), or YCbCr taken as BT.601(1) and BT.709(2).
+  assert_true(color_space <= 2);
+  static std::atomic<uint32_t> last_color_space{0};
+  if (last_color_space.exchange(color_space) != color_space) {
+    XELOGI("VdSwap: front buffer color space {}", color_space);
+  }
   assert_true(*width == 1 + gpu_fetch.size_2d.width);
   assert_true(*height == 1 + gpu_fetch.size_2d.height);
 
@@ -509,12 +523,13 @@ void VdSwap_entry(
   dwords[offset++] = gpu_fetch.dword_4;
   dwords[offset++] = gpu_fetch.dword_5;
 
-  dwords[offset++] = xenos::MakePacketType3(xenos::PM4_XE_SWAP, 4);
+  dwords[offset++] = xenos::MakePacketType3(xenos::PM4_XE_SWAP, 5);
   dwords[offset++] = xe::gpu::xenos::kSwapSignature;
   dwords[offset++] = frontbuffer_physical_address;
 
   dwords[offset++] = *width;
   dwords[offset++] = *height;
+  dwords[offset++] = color_space;
 
   // Fill the rest of the buffer with NOP packets.
   for (uint32_t i = offset; i < 64; i++) {

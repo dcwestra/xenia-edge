@@ -144,10 +144,7 @@ static X_STATUS SubmitRequest(const object_ref<XFile>& file,
     return status;
   };
   if (pends) {
-    if (status_block) {
-      status_block->status = X_STATUS_PENDING;
-      status_block->information = 0;
-    }
+    // The status block is left alone until the request completes.
     file->PostIo(thread.get(),
                  [complete = std::move(complete)](bool cancelled) {
                    complete(true, cancelled);
@@ -484,16 +481,8 @@ dword_result_t NtReadFile_entry(dword_t file_handle, dword_t event_handle,
         CompletesAsync(file.get(), length, byte_offset, false),
         [file, buffer_address, length, byte_offset,
          apc_context_address](uint32_t* bytes_read) {
-          X_STATUS status = file->Read(buffer_address, length, byte_offset,
-                                       bytes_read, apc_context_address, false);
-          if (XSUCCEEDED(status)) {
-            if (auto patch = kernel_state()->xmp_volume_patch()) {
-              auto host_buf = kernel_memory()->TranslateVirtual(buffer_address);
-              patch->OnFileRead(file->entry()->name(), host_buf, length,
-                                buffer_address);
-            }
-          }
-          return status;
+          return file->Read(buffer_address, length, byte_offset, bytes_read,
+                            apc_context_address, false);
         });
   }
 
@@ -575,17 +564,8 @@ dword_result_t NtWriteFile_entry(dword_t file_handle, dword_t event_handle,
         CompletesAsync(file.get(), length, byte_offset, true),
         [file, buffer_address, length, byte_offset,
          apc_context_address](uint32_t* bytes_written) {
-          X_STATUS status =
-              file->Write(buffer_address, length, byte_offset, bytes_written,
-                          apc_context_address, false);
-          if (XSUCCEEDED(status)) {
-            if (auto patch = kernel_state()->xmp_volume_patch()) {
-              auto host_buf = kernel_memory()->TranslateVirtual(buffer_address);
-              patch->OnFileWrite(file->entry()->name(), host_buf, length,
-                                 buffer_address);
-            }
-          }
-          return status;
+          return file->Write(buffer_address, length, byte_offset, bytes_written,
+                             apc_context_address, false);
         });
   }
 
@@ -639,11 +619,11 @@ dword_result_t NtRemoveIoCompletion_entry(
   auto port =
       kernel_state()->object_table()->LookupObject<XIOCompletion>(handle);
   if (!port) {
-    status = X_STATUS_INVALID_HANDLE;
+    return X_STATUS_INVALID_HANDLE;
   }
 
   uint64_t timeout_ticks =
-      timeout ? static_cast<uint32_t>(*timeout)
+      timeout ? static_cast<uint64_t>(*timeout)
               : static_cast<uint64_t>(std::numeric_limits<int64_t>::min());
   XIOCompletion::IONotification notification;
   if (port->WaitForNotification(timeout_ticks, &notification)) {
