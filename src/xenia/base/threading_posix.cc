@@ -818,6 +818,13 @@ class PosixCondition<Event> : public PosixConditionBase {
     signal_ = false;
   }
 
+  // As NtQueryEvent reports it: the type is 0 for a manual-reset
+  // (notification) event and 1 for an auto-reset (synchronization) one.
+  EventInfo Query() {
+    auto lock = std::unique_lock(mutex_);
+    return {manual_reset_ ? 0u : 1u, signal_ ? 1u : 0u};
+  }
+
  private:
   [[nodiscard]] bool signaled() const override { return signal_; }
   void post_execution() override {
@@ -1671,11 +1678,7 @@ class PosixEvent final : public PosixConditionHandle<Event> {
   ~PosixEvent() override = default;
   void Set() override { handle_.Signal(); }
   void Reset() override { handle_.Reset(); }
-  EventInfo Query() override {
-    EventInfo result{};
-    assert_always();
-    return result;
-  }
+  EventInfo Query() override { return handle_.Query(); }
   void Pulse() override {
     using namespace std::chrono_literals;
     handle_.Signal();

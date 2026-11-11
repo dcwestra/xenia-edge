@@ -413,6 +413,31 @@ TEST_CASE("Reset Event", "[event]") {
   REQUIRE(result == WaitResult::kSuccess);
 }
 
+TEST_CASE("Query Event", "[event]") {
+  // NtQueryEvent's type: 0 for a notification (manual-reset) event, 1 for a
+  // synchronization (auto-reset) one.
+  auto manual = Event::CreateManualResetEvent(false);
+  REQUIRE(manual);
+  REQUIRE(manual->Query().type == 0);
+  REQUIRE(manual->Query().state == 0);
+  manual->Set();
+  REQUIRE(manual->Query().state == 1);
+  // A wait doesn't take a manual-reset event's signal.
+  REQUIRE(Wait(manual.get(), false, 0ms) == WaitResult::kSuccess);
+  REQUIRE(manual->Query().state == 1);
+  manual->Reset();
+  REQUIRE(manual->Query().state == 0);
+
+  auto automatic = Event::CreateAutoResetEvent(true);
+  REQUIRE(automatic);
+  REQUIRE(automatic->Query().type == 1);
+  REQUIRE(automatic->Query().state == 1);
+  // Querying doesn't take the signal either, but a wait does.
+  REQUIRE(automatic->Query().state == 1);
+  REQUIRE(Wait(automatic.get(), false, 0ms) == WaitResult::kSuccess);
+  REQUIRE(automatic->Query().state == 0);
+}
+
 TEST_CASE("Multi-object wait wakes on signal, not on a poll", "[event]") {
   // A parked WaitAny has to be woken by the signal itself. The POSIX park
   // only has a backstop timeout, well above the bound checked here, so a lost
