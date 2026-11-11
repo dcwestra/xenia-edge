@@ -238,6 +238,8 @@ Linux needs clang. See [docs/building.md](docs/building.md) for dependencies.
 
     If your toolchain has no static `libstdc++.a` (Fedora: package `libstdc++-static`), unpack one somewhere and pass `-DXENIA_PORTABLE_LINUX_STATIC_LIB_DIR=<directory>`.
 
+    [`tools/batocera/build.sh`](tools/batocera/build.sh) does all of this step, with the static `libstdc++.a`'s directory in `STATIC_LIB_DIR`.
+
 2. Install it on a Batocera machine reachable over SSH:
 
     ```sh
