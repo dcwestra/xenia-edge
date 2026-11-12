@@ -327,6 +327,8 @@ class EmulatorWindow {
   void PopulateProfileMenu(ui::MenuItem* parent);
   void RefreshControllersMenu();
   void PopulateControllersMenu(ui::MenuItem* parent);
+  // The webcam that stands in for a Kinect, for players without one.
+  void PopulateKinectWebcamMenu(ui::MenuItem* parent);
   void RefreshControllerToolbar();
   void ShowControllersPopupMenu();
   // Native wx prompt for first-run (no profiles); shown before any render

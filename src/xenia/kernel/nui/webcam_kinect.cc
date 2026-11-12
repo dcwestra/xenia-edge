@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstring>
 #include <deque>
+#include <mutex>
 #include <thread>
 #include <tuple>
 #include <vector>
@@ -44,7 +45,8 @@
 
 DEFINE_string(kinect_webcam, "",
               "The webcam that stands in for a Kinect without one, by part "
-              "of its name. Empty uses the first.",
+              "of its name. Empty uses the first. Controllers > Kinect Webcam "
+              "chooses one.",
               "Kernel");
 DEFINE_double(kinect_webcam_fov, 70.0,
               "The webcam's horizontal field of view in degrees, all of its "
@@ -120,6 +122,20 @@ constexpr float kMaxDistance = 3.2f;
 constexpr int kPoseThreads = 2;
 
 using L = PoseLandmarks;
+
+// The webcam chosen with ChooseWebcam, which the camera thread reads in place
+// of kinect_webcam so it never reads the cvar while the UI writes it.
+struct WebcamChoice {
+  std::mutex mutex;
+  bool chosen = false;
+  std::string part_of_name;
+  // Bumped by each choice, for a streaming webcam to switch.
+  std::atomic<uint32_t> generation{0};
+};
+WebcamChoice& webcam_choice() {
+  static WebcamChoice choice;
+  return choice;
+}
 
 // The One Euro filter: smooth while still, little lag while moving.
 class OneEuroFilter {
@@ -253,20 +269,27 @@ class SdlCameraSource : public FrameSource {
     int count = 0;
     SDL_CameraID* ids = SDL_GetCameras(&count);
     SDL_CameraID chosen = 0;
-    const std::string wanted = xe::utf8::lower_ascii(cvars::kinect_webcam);
-    for (int i = 0; i < count && !chosen; ++i) {
+    const std::string wanted_name = ChosenWebcam();
+    const std::string wanted = xe::utf8::lower_ascii(wanted_name);
+    std::string all_names;
+    for (int i = 0; i < count; ++i) {
       const char* name = SDL_GetCameraName(ids[i]);
-      if (wanted.empty() || (name && xe::utf8::lower_ascii(name).find(wanted) !=
-                                         std::string::npos)) {
+      const std::string shown = name ? name : "camera";
+      all_names += (i ? ", " : "") + shown;
+      if (!chosen && (wanted.empty() || xe::utf8::lower_ascii(shown).find(
+                                            wanted) != std::string::npos)) {
         chosen = ids[i];
-        name_ = name ? name : "camera";
+        name_ = shown;
       }
     }
     SDL_free(ids);
+    if (count > 1) {
+      XELOGI("Kinect: webcams: {}", all_names);
+    }
     if (!chosen) {
       XELOGW(
           "Kinect: no webcam{} (SDL camera driver: {})",
-          wanted.empty() ? "" : " named " + cvars::kinect_webcam,
+          wanted.empty() ? "" : " named " + wanted_name,
           SDL_GetCurrentCameraDriver() ? SDL_GetCurrentCameraDriver() : "none");
       return false;
     }
@@ -499,6 +522,7 @@ class KinectCameraWebcam : public KinectCamera {
       }
       source_ = std::move(source);
     } else {
+      webcam_generation_ = webcam_choice().generation;
       auto source = std::make_unique<SdlCameraSource>();
       if (!source->Initialize()) {
         return false;
@@ -558,6 +582,15 @@ class KinectCameraWebcam : public KinectCamera {
     double pose_seconds = 0.0;
     auto report = start;
     while (running_) {
+      if (cvars::kinect_webcam_test_recording.empty() &&
+          webcam_generation_ != webcam_choice().generation) {
+        SwitchWebcam();
+      }
+      if (!source_) {
+        // The chosen webcam couldn't be opened; another may be chosen.
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        continue;
+      }
       if (!source_->Next(frame)) {
         continue;
       }
@@ -653,6 +686,20 @@ class KinectCameraWebcam : public KinectCamera {
     for (OneEuroFilter& filter : position_filters_) {
       filter.Reset();
     }
+  }
+
+  // Streams from the webcam ChooseWebcam chose instead. A webcam can only be
+  // opened once, so the one streaming is closed first. The player settles
+  // afresh in front of the new one.
+  void SwitchWebcam() {
+    webcam_generation_ = webcam_choice().generation;
+    source_.reset();
+    auto source = std::make_unique<SdlCameraSource>();
+    if (source->Initialize()) {
+      source_ = std::move(source);
+    }
+    ResetTracking();
+    have_rest_ = false;
   }
 
   // The hip center's position from the webcam, by least squares over the
@@ -957,6 +1004,8 @@ class KinectCameraWebcam : public KinectCamera {
   }
 
   std::unique_ptr<FrameSource> source_;
+  // webcam_choice().generation when source_ was opened.
+  uint32_t webcam_generation_ = 0;
   std::unique_ptr<PoseEstimator> pose_estimator_;
   BodyRenderer renderer_;
   FrameCallback depth_callback_;
@@ -989,6 +1038,42 @@ std::unique_ptr<KinectCamera> OpenWebcamKinectCamera(
     return nullptr;
   }
   return camera;
+}
+
+std::vector<std::string> ListWebcams() {
+  std::vector<std::string> names;
+  // Started once and kept: SDL counts its subsystems' users without a lock,
+  // and a streaming webcam's thread starts and quits the camera subsystem
+  // too, so this doesn't add to or take from the count again.
+  static const bool camera_subsystem = xe::helper::sdl::SDLHelper::Prepare() &&
+                                       SDL_InitSubSystem(SDL_INIT_CAMERA);
+  if (!camera_subsystem) {
+    return names;
+  }
+  int count = 0;
+  SDL_CameraID* ids = SDL_GetCameras(&count);
+  for (int i = 0; i < count; ++i) {
+    const char* name = SDL_GetCameraName(ids[i]);
+    names.push_back(name ? name : "camera");
+  }
+  SDL_free(ids);
+  return names;
+}
+
+std::string ChosenWebcam() {
+  WebcamChoice& choice = webcam_choice();
+  std::lock_guard<std::mutex> lock(choice.mutex);
+  return choice.chosen ? choice.part_of_name : cvars::kinect_webcam;
+}
+
+void ChooseWebcam(const std::string& part_of_name) {
+  WebcamChoice& choice = webcam_choice();
+  std::lock_guard<std::mutex> lock(choice.mutex);
+  choice.chosen = true;
+  choice.part_of_name = part_of_name;
+  // Under the lock, as ChosenWebcam reads kinect_webcam until now.
+  OVERRIDE_PERSIST_string(kinect_webcam, part_of_name);
+  ++choice.generation;
 }
 
 }  // namespace nui

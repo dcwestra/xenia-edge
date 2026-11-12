@@ -55,6 +55,7 @@
 #include "xenia/base/utf8.h"
 #include "xenia/config.h"
 #include "xenia/kernel/nui/kinect_view.h"
+#include "xenia/kernel/nui/webcam_kinect.h"
 #include "xenia/ui/imgui_audio_dialog.h"
 #include "xenia/ui/imgui_confirm_dialog.h"
 #include "xenia/ui/imgui_context_menu.h"
@@ -3153,6 +3154,7 @@ void EmulatorWindow::RefreshControllersMenu() {
     controllers_menu_->RemoveChild(controllers_menu_->child(0));
   }
   PopulateControllersMenu(controllers_menu_);
+  PopulateKinectWebcamMenu(controllers_menu_);
   window_->CompleteMainMenuItemsUpdate();
   RefreshControllerToolbar();
 }
@@ -3407,6 +3409,50 @@ void EmulatorWindow::PopulateControllersMenu(ui::MenuItem* parent) {
 
     parent->AddChild(std::move(slot_entry));
   }
+}
+
+void EmulatorWindow::PopulateKinectWebcamMenu(ui::MenuItem* parent) {
+#if XE_PLATFORM_LINUX
+  if (!parent) {
+    return;
+  }
+  const std::vector<std::string> webcams = kernel::nui::ListWebcams();
+  if (webcams.empty()) {
+    return;
+  }
+  // The one streaming is the first whose name holds the choice.
+  const std::string chosen = kernel::nui::ChosenWebcam();
+  const std::string chosen_lower = xe::utf8::lower_ascii(chosen);
+  size_t current = webcams.size();
+  for (size_t i = 0; !chosen.empty() && i < webcams.size(); ++i) {
+    if (xe::utf8::lower_ascii(webcams[i]).find(chosen_lower) !=
+        std::string::npos) {
+      current = i;
+      break;
+    }
+  }
+  // Applies at once, and is saved as kinect_webcam. The menu is rebuilt
+  // after its event, so the check marks follow.
+  auto choose = [this](const std::string& part_of_name) {
+    kernel::nui::ChooseWebcam(part_of_name);
+    config::SaveConfig();
+    app_context_.CallInUIThreadDeferred([this]() { RefreshControllersMenu(); });
+  };
+  auto menu =
+      ui::WxMenuItem::Create(ui::MenuItem::Type::kPopup, _("Kinect &Webcam"));
+  menu->AddChild(ui::WxMenuItem::CreateCheck(_("First Found"), chosen.empty(),
+                                             [choose](bool) { choose(""); }));
+  for (size_t i = 0; i < webcams.size(); ++i) {
+    // wxWidgets takes "&" as a mnemonic; "&&" shows one.
+    wxString label = wxString::FromUTF8(webcams[i]);
+    label.Replace("&", "&&");
+    const std::string name = webcams[i];
+    menu->AddChild(ui::WxMenuItem::CreateCheck(
+        label, i == current, [choose, name](bool) { choose(name); }));
+  }
+  parent->AddChild(ui::WxMenuItem::Create(ui::MenuItem::Type::kSeparator));
+  parent->AddChild(std::move(menu));
+#endif  // XE_PLATFORM_LINUX
 }
 
 void EmulatorWindow::RefreshProfileIcon() {
