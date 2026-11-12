@@ -18,6 +18,7 @@
 #include <cstring>
 #include <deque>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include "xenia/base/cvar.h"
@@ -99,6 +100,19 @@ constexpr double kMaxSettleSeconds = 3.0;
 constexpr double kForgetSeconds = 3.0;
 constexpr float kHeightFollowSeconds = 4.0f;
 constexpr float kMinVisibility = 0.5f;
+// The drawn body's bones, in meters for a player 1.70 m tall, scaled to
+// kinect_webcam_player_height: the proportions of the bodies titles' trackers
+// were tested with (tools' kbodyrender.py). The hips are 0.49 m below the
+// shoulders' center.
+constexpr float kHeadLength = 0.22f;  // Shoulders' center to the head's.
+constexpr float kShoulderHalfWidth = 0.19f;
+constexpr float kUpperArmLength = 0.35f;
+constexpr float kForearmLength = 0.27f;
+constexpr float kHandLength = 0.08f;  // Wrist to the hand's center.
+constexpr float kHipHalfWidth = 0.09f;
+constexpr float kThighLength = 0.42f;
+constexpr float kShinLength = 0.41f;
+constexpr float kFootLength = 0.14f;  // Ankle to toes.
 // The players' range in front of the virtual Kinect.
 constexpr float kMinDistance = 1.5f;
 constexpr float kMaxDistance = 3.2f;
@@ -711,56 +725,83 @@ class KinectCameraWebcam : public KinectCamera {
       hip_left = hips + left * (0.12f * s);
       hip_right = hips - left * (0.12f * s);
     }
-    // Around the drawn hips.
-    auto at = [&](int i) { return world(i) - hips; };
+    // Around the drawn hips: MediaPipe's bones' directions, at the lengths of
+    // a body of the player's height. MediaPipe's own lengths come out about a
+    // fifth short, its limbs most (a forward swing then doesn't reach as far
+    // as titles look for), and they change with how much of the player the
+    // webcam sees.
+    auto bone = [&](const Vec3& from, const Vec3& to, float length) {
+      return (to - from).Normalized() * (length * s);
+    };
+    // Perpendicular to the torso, toward the player's left.
+    auto across = [&](const Vec3& left_side, const Vec3& up) {
+      return (left_side - up * left_side.Dot(up)).Normalized();
+    };
+    const Vec3 up = (shoulders - hips).Normalized();
+    const Vec3 shoulder_side =
+        across(world(L::kShoulderLeft) - world(L::kShoulderRight), up);
+    const Vec3 hip_side = across(hip_left - hip_right, up);
     body[J::kHipCenter] = Vec3();
-    body[J::kShoulderLeft] = at(L::kShoulderLeft);
-    body[J::kShoulderRight] = at(L::kShoulderRight);
-    body[J::kShoulderCenter] = shoulders - hips;
+    body[J::kShoulderCenter] = up * (0.49f * s);
     body[J::kSpine] = body[J::kShoulderCenter] * 0.2f;
-    body[J::kHead] = mid(L::kEarLeft, L::kEarRight) - hips;
-    body[J::kElbowLeft] = at(L::kElbowLeft);
-    body[J::kElbowRight] = at(L::kElbowRight);
-    body[J::kWristLeft] = at(L::kWristLeft);
-    body[J::kWristRight] = at(L::kWristRight);
-    body[J::kHandLeft] = mid(L::kPinkyLeft, L::kIndexLeft) - hips;
-    body[J::kHandRight] = mid(L::kPinkyRight, L::kIndexRight) - hips;
-    // MediaPipe's hips are the outside of the pelvis; the joints are further
-    // in.
-    body[J::kHipLeft] = (hip_left - hips) * 0.75f;
-    body[J::kHipRight] = (hip_right - hips) * 0.75f;
+    body[J::kHead] =
+        body[J::kShoulderCenter] +
+        bone(shoulders, mid(L::kEarLeft, L::kEarRight), kHeadLength);
+    for (auto [shoulder, elbow, wrist, hand, sign, mp_shoulder, mp_elbow,
+               mp_wrist, mp_pinky, mp_index] :
+         {std::tuple{J::kShoulderLeft, J::kElbowLeft, J::kWristLeft,
+                     J::kHandLeft, 1.0f, L::kShoulderLeft, L::kElbowLeft,
+                     L::kWristLeft, L::kPinkyLeft, L::kIndexLeft},
+          std::tuple{J::kShoulderRight, J::kElbowRight, J::kWristRight,
+                     J::kHandRight, -1.0f, L::kShoulderRight, L::kElbowRight,
+                     L::kWristRight, L::kPinkyRight, L::kIndexRight}}) {
+      body[shoulder] = body[J::kShoulderCenter] +
+                       shoulder_side * (sign * kShoulderHalfWidth * s) -
+                       up * (0.03f * s);
+      body[elbow] = body[shoulder] +
+                    bone(world(mp_shoulder), world(mp_elbow), kUpperArmLength);
+      body[wrist] =
+          body[elbow] + bone(world(mp_elbow), world(mp_wrist), kForearmLength);
+      body[hand] = body[wrist] +
+                   bone(world(mp_wrist), mid(mp_pinky, mp_index), kHandLength);
+    }
+    body[J::kHipLeft] = hip_side * (kHipHalfWidth * s) - up * (0.05f * s);
+    body[J::kHipRight] = hip_side * (-kHipHalfWidth * s) - up * (0.05f * s);
     const bool legs_seen =
         std::min({pose.visibility[L::kKneeLeft], pose.visibility[L::kKneeRight],
                   pose.visibility[L::kAnkleLeft],
                   pose.visibility[L::kAnkleRight]}) > 0.6f;
-    float hip_height;
-    if (legs_seen) {
-      body[J::kKneeLeft] = at(L::kKneeLeft);
-      body[J::kKneeRight] = at(L::kKneeRight);
-      body[J::kAnkleLeft] = at(L::kAnkleLeft);
-      body[J::kAnkleRight] = at(L::kAnkleRight);
-      body[J::kFootLeft] = at(L::kFootLeft);
-      body[J::kFootRight] = at(L::kFootRight);
-      float floor = 0.0f;
-      for (int i : {int(L::kHeelLeft), int(L::kHeelRight), int(L::kFootLeft),
-                    int(L::kFootRight)}) {
-        floor = std::min(floor, at(i).y);
-      }
-      hip_height = 0.03f - floor;
-    } else {
-      // Out of the webcam's view, as they are for a seated player: standing
-      // legs, which titles' trackers want.
-      for (auto [hip, knee, ankle, foot] :
-           {std::array<J, 4>{J::kHipLeft, J::kKneeLeft, J::kAnkleLeft,
-                             J::kFootLeft},
-            std::array<J, 4>{J::kHipRight, J::kKneeRight, J::kAnkleRight,
-                             J::kFootRight}}) {
-        body[knee] = body[hip] + Vec3(0.0f, -0.42f * s, -0.02f);
-        body[ankle] = body[knee] + Vec3(0.0f, -0.41f * s, 0.02f);
+    for (auto [hip, knee, ankle, foot, mp_hip, mp_knee, mp_ankle, mp_foot] :
+         {std::tuple{J::kHipLeft, J::kKneeLeft, J::kAnkleLeft, J::kFootLeft,
+                     L::kHipLeft, L::kKneeLeft, L::kAnkleLeft, L::kFootLeft},
+          std::tuple{J::kHipRight, J::kKneeRight, J::kAnkleRight, J::kFootRight,
+                     L::kHipRight, L::kKneeRight, L::kAnkleRight,
+                     L::kFootRight}}) {
+      if (legs_seen) {
+        body[knee] =
+            body[hip] + bone(world(mp_hip), world(mp_knee), kThighLength);
+        body[ankle] =
+            body[knee] + bone(world(mp_knee), world(mp_ankle), kShinLength);
+        body[foot] =
+            body[ankle] + bone(world(mp_ankle), world(mp_foot), kFootLength);
+      } else {
+        // Out of the webcam's view, as they are for a seated player: standing
+        // legs, which titles' trackers want.
+        body[knee] = body[hip] + Vec3(0.0f, -kThighLength * s, -0.02f);
+        body[ankle] = body[knee] + Vec3(0.0f, -kShinLength * s, 0.02f);
         body[foot] = body[ankle] + Vec3(0.0f, -0.05f * s, -0.13f * s);
       }
-      hip_height = 0.91f * s;
     }
+    // Standing on the lower of the feet, the heel just under the ankle, with a
+    // little room so the floor and the soles stay apart.
+    float floor = 0.0f;
+    for (J joint : {J::kFootLeft, J::kFootRight}) {
+      floor = std::min(floor, body[joint].y);
+    }
+    for (J joint : {J::kAnkleLeft, J::kAnkleRight}) {
+      floor = std::min(floor, body[joint].y - 0.05f * s);
+    }
+    const float hip_height = 0.03f - floor;
     // At the play distance, moved by their steps toward the webcam or away
     // from where they settled; sideways as they are; and rising above where
     // they stand (jumping). Crouches come through the legs.
