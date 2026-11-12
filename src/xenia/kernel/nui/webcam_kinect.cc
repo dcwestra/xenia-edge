@@ -101,6 +101,9 @@ constexpr double kSettleSeconds = 1.0;
 constexpr float kSettleRange = 0.08f;
 constexpr double kMaxSettleSeconds = 3.0;
 constexpr double kForgetSeconds = 3.0;
+// Nearer the webcam than this, as when aiming or moving it, the player isn't
+// playing: they settle afresh once they're back.
+constexpr float kAtWebcamDistance = 0.8f;
 constexpr float kHeightFollowSeconds = 4.0f;
 constexpr float kMinVisibility = 0.5f;
 // The drawn body's bones, in meters for a player 1.70 m tall, scaled to
@@ -913,6 +916,15 @@ class KinectCameraWebcam : public KinectCamera {
   void UpdateRest(const float t[3], double time) {
     const double since_seen = time - last_seen_;
     last_seen_ = time;
+    if (t[2] < kAtWebcamDistance) {
+      // At the webcam, which may be aimed or placed afresh, so where they
+      // stood before means nothing now. Until they're back and settled,
+      // they stay at the play distance.
+      have_rest_ = false;
+      settled_ = false;
+      std::memcpy(rest_, t, sizeof(rest_));
+      return;
+    }
     if (!have_rest_ || since_seen > kForgetSeconds) {
       have_rest_ = true;
       settled_ = false;
