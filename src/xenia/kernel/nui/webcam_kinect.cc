@@ -47,8 +47,9 @@ DEFINE_string(kinect_webcam, "",
               "of its name. Empty uses the first.",
               "Kernel");
 DEFINE_double(kinect_webcam_fov, 70.0,
-              "The webcam's horizontal field of view in degrees, for "
-              "placing the player from its picture.",
+              "The webcam's horizontal field of view in degrees, all of its "
+              "picture across, for placing the player from it. A narrower mode "
+              "cut from it is allowed for.",
               "Kernel");
 DEFINE_double(kinect_webcam_distance, 2.6,
               "How far from the Kinect a webcam player stands, in meters, "
@@ -225,6 +226,10 @@ class FrameSource {
   // The next frame, waiting a little for it. False if none came.
   virtual bool Next(RgbFrame& frame) = 0;
   virtual std::string name() const = 0;
+  // How much of the webcam's full view across the frames show, as the
+  // tangent of half of it: 0.75 for a 4:3 mode cut from a 16:9 sensor.
+  // kinect_webcam_fov is the full view's.
+  virtual float field_fraction() const { return 1.0f; }
 };
 
 class SdlCameraSource : public FrameSource {
@@ -265,20 +270,38 @@ class SdlCameraSource : public FrameSource {
           SDL_GetCurrentCameraDriver() ? SDL_GetCurrentCameraDriver() : "none");
       return false;
     }
-    // The mode nearest 640x480 at 25 frames a second or more, uncompressed
-    // if there's a choice; SDL converts it to RGB.
+    // Webcams often make modes of another shape than their sensor's by
+    // cutting its sides or top and bottom off, so the mode of the shape of
+    // the largest one, which is the whole sensor, sees most of the player.
+    // Of those, the one nearest 640x480 at 25 frames a second or more,
+    // uncompressed if there's a choice; SDL converts it to RGB.
     SDL_CameraSpec spec = {};
     int formats = 0;
     SDL_CameraSpec** specs = SDL_GetCameraSupportedFormats(chosen, &formats);
+    float sensor_aspect = 0.0f;
+    int sensor_area = 0;
+    for (int i = 0; specs && i < formats; ++i) {
+      const SDL_CameraSpec& s = *specs[i];
+      if (s.width * s.height > sensor_area && s.height > 0) {
+        sensor_area = s.width * s.height;
+        sensor_aspect = float(s.width) / float(s.height);
+      }
+    }
     int best_score = INT32_MAX;
     for (int i = 0; specs && i < formats; ++i) {
       const SDL_CameraSpec& s = *specs[i];
+      if (s.width <= 0 || s.height <= 0) {
+        continue;
+      }
       const float fps = s.framerate_denominator ? float(s.framerate_numerator) /
                                                       s.framerate_denominator
                                                 : 0.0f;
+      const float aspect = float(s.width) / float(s.height);
+      const bool whole_sensor =
+          std::abs(aspect - sensor_aspect) < 0.02f * sensor_aspect;
       int score = std::abs(s.width * s.height - kWidth * kHeight) / 1000 +
                   (s.format == SDL_PIXELFORMAT_MJPG ? 50 : 0) +
-                  (fps < 25.0f ? 10000 : 0);
+                  (whole_sensor ? 0 : 1000) + (fps < 25.0f ? 10000 : 0);
       if (score < best_score) {
         best_score = score;
         spec = s;
@@ -287,6 +310,10 @@ class SdlCameraSource : public FrameSource {
     SDL_free(specs);
     const bool chose_spec = best_score != INT32_MAX;
     if (chose_spec) {
+      // A mode narrower than the sensor has its sides cut off.
+      const float aspect = float(spec.width) / float(spec.height);
+      field_fraction_ =
+          sensor_aspect > 0.0f ? std::min(1.0f, aspect / sensor_aspect) : 1.0f;
       spec.format = SDL_PIXELFORMAT_RGB24;
       spec.colorspace = SDL_COLORSPACE_SRGB;
     }
@@ -295,10 +322,19 @@ class SdlCameraSource : public FrameSource {
       XELOGW("Kinect: can't open the webcam {}: {}", name_, SDL_GetError());
       return false;
     }
-    XELOGI("Kinect: a webcam stands in for the Kinect: {}", name_);
+    if (chose_spec) {
+      XELOGI(
+          "Kinect: a webcam stands in for the Kinect: {}, {}x{}, {:.0f}% of "
+          "its view across",
+          name_, spec.width, spec.height, field_fraction_ * 100.0f);
+    } else {
+      XELOGI("Kinect: a webcam stands in for the Kinect: {}", name_);
+    }
     keep_frame_rate_.Apply(name_);
     return true;
   }
+
+  float field_fraction() const override { return field_fraction_; }
 
   bool Next(RgbFrame& frame) override {
     using clock = std::chrono::steady_clock;
@@ -353,6 +389,7 @@ class SdlCameraSource : public FrameSource {
   bool initialized_ = false;
   SDL_Camera* camera_ = nullptr;
   std::string name_;
+  float field_fraction_ = 1.0f;
   KeepFrameRate keep_frame_rate_;
 };
 
@@ -683,10 +720,16 @@ class KinectCameraWebcam : public KinectCamera {
     return t[2] > 0.3f;
   }
 
+  // The webcam's focal length in pixels, for its frames this wide.
+  float WebcamFocal(int width) const {
+    return width * 0.5f /
+           (std::tan(float(cvars::kinect_webcam_fov) * kPi / 360.0f) *
+            source_->field_fraction());
+  }
+
   bool PlaceBody(const PoseLandmarks& raw_pose, int width, int height,
                  double time, Body& body, Placement& placement) {
-    const float focal =
-        width * 0.5f / std::tan(float(cvars::kinect_webcam_fov) * kPi / 360.0f);
+    const float focal = WebcamFocal(width);
     float t[3];
     if (!SolvePosition(raw_pose, width, height, focal, t)) {
       return false;
@@ -870,9 +913,7 @@ class KinectCameraWebcam : public KinectCamera {
   void MakeColor(const RgbFrame& frame, const Body* body,
                  const Placement& placement, uint8_t* out) {
     const float focal =
-        body ? placement.webcam_focal
-             : frame.width * 0.5f /
-                   std::tan(float(cvars::kinect_webcam_fov) * kPi / 360.0f);
+        body ? placement.webcam_focal : WebcamFocal(frame.width);
     float pv_x = BodyRenderer::kCenterX, pv_y = BodyRenderer::kCenterY;
     float pw_x = frame.width * 0.5f, pw_y = frame.height * 0.5f;
     float scale = BodyRenderer::kFocalLength / focal;
