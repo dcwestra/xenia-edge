@@ -64,6 +64,13 @@ DEFINE_double(kinect_webcam_player_height, 1.70,
               "The webcam player's height in meters, for the body Kinect "
               "titles see.",
               "Kernel");
+DEFINE_double(kinect_webcam_depth_gain, 1.5,
+              "How much deeper than the pose found in the webcam's picture "
+              "the arms and legs reach toward or away from it: the picture "
+              "shows depth least, and the pose comes out flattened, so a "
+              "rein pulled back or an arm swung forward moves less than the "
+              "player's. 1 takes the pose as found.",
+              "Kernel");
 DEFINE_path(kinect_webcam_models_path, "",
             "The folder with the webcam Kinect's pose models "
             "(pose_detector.onnx and pose_landmarks_detector.onnx). Empty is "
@@ -823,8 +830,13 @@ class KinectCameraWebcam : public KinectCamera {
     // fifth short, its limbs most (a forward swing then doesn't reach as far
     // as titles look for), and they change with how much of the player the
     // webcam sees.
+    // Limbs reach deeper toward or away from the webcam than found
+    // (kinect_webcam_depth_gain).
+    const float depth_gain = float(cvars::kinect_webcam_depth_gain);
     auto bone = [&](const Vec3& from, const Vec3& to, float length) {
-      return (to - from).Normalized() * (length * s);
+      Vec3 v = to - from;
+      v.z *= depth_gain;
+      return v.Normalized() * (length * s);
     };
     // Perpendicular to the torso, toward the player's left.
     auto across = [&](const Vec3& left_side, const Vec3& up) {
@@ -837,9 +849,9 @@ class KinectCameraWebcam : public KinectCamera {
     body[J::kHipCenter] = Vec3();
     body[J::kShoulderCenter] = up * (0.49f * s);
     body[J::kSpine] = body[J::kShoulderCenter] * 0.2f;
-    body[J::kHead] =
-        body[J::kShoulderCenter] +
-        bone(shoulders, mid(L::kEarLeft, L::kEarRight), kHeadLength);
+    body[J::kHead] = body[J::kShoulderCenter] +
+                     (mid(L::kEarLeft, L::kEarRight) - shoulders).Normalized() *
+                         (kHeadLength * s);
     for (auto [shoulder, elbow, wrist, hand, sign, mp_shoulder, mp_elbow,
                mp_wrist, mp_pinky, mp_index] :
          {std::tuple{J::kShoulderLeft, J::kElbowLeft, J::kWristLeft,
