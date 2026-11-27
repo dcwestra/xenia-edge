@@ -130,6 +130,8 @@ constexpr float kFootLength = 0.14f;  // Ankle to toes.
 constexpr float kMinDistance = 1.5f;
 constexpr float kMaxDistance = 3.2f;
 constexpr int kPoseThreads = 2;
+// A recorded webcam picture's header (KinectRecorder::Stream::kWebcam).
+constexpr size_t kWebcamHeaderBytes = 8;
 
 using L = PoseLandmarks;
 
@@ -433,7 +435,8 @@ class SdlCameraSource : public FrameSource {
   KeepFrameRate keep_frame_rate_;
 };
 
-// A Kinect recording's color frames, demosaiced, at their own pace, looping.
+// A Kinect recording's color frames, demosaiced, at their own pace, looping;
+// or, if it has them, the webcam's own pictures a webcam stand-in recorded.
 class RecordingSource : public FrameSource {
  public:
   ~RecordingSource() override {
@@ -470,8 +473,12 @@ class RecordingSource : public FrameSource {
         loop_start_ = clock::now();
         continue;
       }
-      if ((header.stream != 1 && header.stream != 2) ||
-          header.size != uint32_t(kWidth * kHeight)) {
+      if (header.stream == uint32_t(KinectRecorder::Stream::kWebcam) &&
+          header.size > kWebcamHeaderBytes) {
+        webcam_pictures_ = true;
+      } else if (webcam_pictures_ ||
+                 (header.stream != 1 && header.stream != 2) ||
+                 header.size != uint32_t(kWidth * kHeight)) {
         std::fseek(file_, header.size, SEEK_CUR);
         continue;
       }
@@ -487,6 +494,20 @@ class RecordingSource : public FrameSource {
     }
     std::this_thread::sleep_until(loop_start_ +
                                   std::chrono::milliseconds(header.time_ms));
+    if (header.stream == uint32_t(KinectRecorder::Stream::kWebcam)) {
+      uint16_t size[2];
+      std::memcpy(size, bayer.data(), sizeof(size));
+      std::memcpy(&field_fraction_, bayer.data() + 4, sizeof(float));
+      const size_t pixels = size_t(size[0]) * size[1] * 3;
+      if (bayer.size() < kWebcamHeaderBytes + pixels) {
+        return false;
+      }
+      frame.width = size[0];
+      frame.height = size[1];
+      frame.pixels.assign(bayer.begin() + kWebcamHeaderBytes,
+                          bayer.begin() + kWebcamHeaderBytes + pixels);
+      return true;
+    }
     // GRBG at half the resolution, then doubled.
     frame.width = kWidth;
     frame.height = kHeight;
@@ -507,9 +528,12 @@ class RecordingSource : public FrameSource {
   }
 
   std::string name() const override { return "a recording"; }
+  float field_fraction() const override { return field_fraction_; }
 
  private:
   FILE* file_ = nullptr;
+  bool webcam_pictures_ = false;
+  float field_fraction_ = 1.0f;
   bool started_ = false;
   std::chrono::steady_clock::time_point loop_start_;
 };
@@ -565,6 +589,7 @@ class KinectCameraWebcam : public KinectCamera {
   bool IsColorStreaming() const override { return bool(color_callback_); }
   bool IsColorRegistered() const override { return true; }
   bool NeedsSimulatedMotor() const override { return true; }
+  void SetRecorder(KinectRecorder* recorder) override { recorder_ = recorder; }
 
   void Stop() override {
     if (!running_.exchange(false)) {
@@ -614,6 +639,9 @@ class KinectCameraWebcam : public KinectCamera {
       const auto now = clock::now();
       const double time = std::chrono::duration<double>(now - start).count();
       LogKinectTiming("capture", source_->frame_age_ms());
+      if (recorder_) {
+        RecordPicture(frame);
+      }
       // The view as titles have tilted the (simulated) sensor: they find the
       // floor and frame their players by tilting it.
       renderer_.SetCamera(kCameraHeight, KinectMotor::SimulatedTiltDegrees());
@@ -669,6 +697,18 @@ class KinectCameraWebcam : public KinectCamera {
         pose_seconds = 0.0;
       }
     }
+  }
+
+  void RecordPicture(const RgbFrame& frame) {
+    const uint16_t size[2] = {uint16_t(frame.width), uint16_t(frame.height)};
+    const float field = source_->field_fraction();
+    picture_.resize(kWebcamHeaderBytes + frame.pixels.size());
+    std::memcpy(picture_.data(), size, sizeof(size));
+    std::memcpy(picture_.data() + 4, &field, sizeof(field));
+    std::memcpy(picture_.data() + kWebcamHeaderBytes, frame.pixels.data(),
+                frame.pixels.size());
+    recorder_->AddFrame(KinectRecorder::Stream::kWebcam, picture_.data(),
+                        picture_.size());
   }
 
   // For the Kinect view: the picture, what was found in it, and how fast.
@@ -1041,6 +1081,10 @@ class KinectCameraWebcam : public KinectCamera {
   }
 
   std::unique_ptr<FrameSource> source_;
+  // Records the webcam's pictures (kinect_record_path), and the buffer for
+  // one.
+  KinectRecorder* recorder_ = nullptr;
+  std::vector<uint8_t> picture_;
   // webcam_choice().generation when source_ was opened.
   uint32_t webcam_generation_ = 0;
   std::unique_ptr<PoseEstimator> pose_estimator_;

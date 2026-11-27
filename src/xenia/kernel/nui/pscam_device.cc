@@ -292,6 +292,7 @@ void PsCamDevice::StartStreaming() {
   frame_.assign(KinectCamera::kDepthFrameBytes, 0xFF);
   if (camera_ && !cvars::kinect_record_path.empty()) {
     recorder_ = std::make_unique<KinectRecorder>(cvars::kinect_record_path);
+    camera_->SetRecorder(recorder_.get());
   }
   if (camera_ &&
       !camera_->Start([this](const uint8_t* data, size_t size,

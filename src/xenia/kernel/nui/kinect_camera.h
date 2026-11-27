@@ -28,6 +28,8 @@ namespace nui {
 // than one from the sensor's own calibration.
 uint16_t KinectRawDepthToMillimeters(uint32_t raw);
 
+class KinectRecorder;
+
 // A Kinect for Xbox 360 (model 1414) on the host, read over USB with libusb,
 // which is loaded when first needed so it isn't a dependency otherwise.
 // Streams in the sensor's own formats, which is what the console's camera
@@ -68,6 +70,9 @@ class KinectCamera {
   // Whether titles should be given a simulated tilt motor, the camera having
   // none of its own.
   virtual bool NeedsSimulatedMotor() const { return false; }
+  // For recording frames of its own beside the ones titles get, such as a
+  // webcam's pictures. Set before Start.
+  virtual void SetRecorder(KinectRecorder* recorder) {}
   virtual void Stop() = 0;
 };
 
@@ -143,6 +148,11 @@ class KinectRecorder {
     kColor = 1,
     // Color registered to depth (KinectCamera::IsColorRegistered).
     kRegisteredColor = 2,
+    // A webcam's picture as it came, which a webcam standing in for the
+    // Kinect makes its depth and color from: its width and height (16 bits
+    // each) and how much of the webcam's view it shows (a float, see
+    // kinect_webcam_fov), then RGB, 3 bytes a pixel. Not for titles.
+    kWebcam = 3,
   };
 
   explicit KinectRecorder(const std::filesystem::path& path);

@@ -202,6 +202,10 @@ class KinectCameraPlayback : public KinectCamera {
         std::this_thread::sleep_for(std::min<clock::duration>(
             due - clock::now(), std::chrono::milliseconds(50)));
       }
+      // A webcam's own pictures aren't for titles.
+      if (header.stream == uint32_t(KinectRecorder::Stream::kWebcam)) {
+        continue;
+      }
       const bool color =
           header.stream != uint32_t(KinectRecorder::Stream::kDepth);
       if (color) {
