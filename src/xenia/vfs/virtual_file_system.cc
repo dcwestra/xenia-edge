@@ -167,6 +167,13 @@ bool MountPathMatches(const std::string_view path,
 
 }  // namespace
 
+X_STATUS VirtualFileSystem::MissingPathStatus(const std::string_view path) {
+  const auto base_path = xe::utf8::find_base_guest_path(path);
+  return !base_path.empty() && !ResolvePath(base_path)
+             ? X_STATUS_OBJECT_PATH_NOT_FOUND
+             : X_STATUS_OBJECT_NAME_NOT_FOUND;
+}
+
 Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
   auto global_lock = global_critical_region_.Acquire();
 
@@ -310,16 +317,15 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry,
   if (!base_path.empty()) {
     parent_entry = !root_entry ? ResolvePath(base_path)
                                : root_entry->ResolvePath(base_path);
-    if (!parent_entry) {
-      *out_action = FileAction::kDoesNotExist;
-      return X_STATUS_OBJECT_PATH_NOT_FOUND;
+    if (parent_entry) {
+      auto file_name = xe::utf8::find_name_from_guest_path(path);
+      entry = parent_entry->GetChild(file_name);
     }
-
-    auto file_name = xe::utf8::find_name_from_guest_path(path);
-    entry = parent_entry->GetChild(file_name);
-    // A device mounted on a folder of a host device is what the folder's path
-    // names. A raw partition's stand-in in a NullDevice stays what it is.
-    if (!root_entry && dynamic_cast<HostPathEntry*>(parent_entry)) {
+    // A device mounted on a folder of a host device, or on a path whose parent
+    // no device holds, is what the path names. A raw partition's stand-in in a
+    // NullDevice stays what it is.
+    if (!root_entry &&
+        (!parent_entry || dynamic_cast<HostPathEntry*>(parent_entry))) {
       if (Entry* mount_root = ResolveMountRoot(path)) {
         // Replacing it would delete the whole device.
         if (creation_disposition == FileDisposition::kSuperscede ||
@@ -330,6 +336,10 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry,
         }
         entry = mount_root;
       }
+    }
+    if (!parent_entry && !entry) {
+      *out_action = FileAction::kDoesNotExist;
+      return X_STATUS_OBJECT_PATH_NOT_FOUND;
     }
   } else if (path.empty() && root_entry) {
     // An empty relative path is the root entry itself. Replacing it would
@@ -442,9 +452,15 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry,
     }
   }
   if (!entry) {
-    // Create if needed (either new or as a replacement).
-    entry = CreatePath(
-        path, !is_directory ? kFileAttributeNormal : kFileAttributeDirectory);
+    // Create if needed (either new or as a replacement), under the parent
+    // resolved above. CreatePath resolves from the top, which a name relative
+    // to a root handle isn't.
+    const uint32_t attributes =
+        !is_directory ? kFileAttributeNormal : kFileAttributeDirectory;
+    entry = parent_entry
+                ? parent_entry->CreateEntry(
+                      xe::utf8::find_name_from_guest_path(path), attributes)
+                : CreatePath(path, attributes);
     if (!entry) {
       return X_STATUS_ACCESS_DENIED;
     }
@@ -513,8 +529,14 @@ X_STATUS VirtualFileSystem::ExtractContentFile(
 
     while (remaining_size > 0) {
       size_t bytes_read = 0;
-      in_file->ReadSync(std::span<uint8_t>(buffer, write_buffer_size), offset,
-                        &bytes_read);
+      // A package cut short reads back nothing past its end.
+      if (XFAILED(
+              in_file->ReadSync(std::span<uint8_t>(buffer, write_buffer_size),
+                                offset, &bytes_read)) ||
+          !bytes_read) {
+        result = X_STATUS_END_OF_FILE;
+        break;
+      }
       fwrite(buffer, bytes_read, 1, file);
       offset += bytes_read;
       remaining_size -= bytes_read;
@@ -528,7 +550,7 @@ X_STATUS VirtualFileSystem::ExtractContentFile(
   if (buffer) {
     delete[] buffer;
   }
-  return 0;
+  return result;
 }
 
 X_STATUS VirtualFileSystem::ExtractContentFiles(
@@ -551,7 +573,10 @@ X_STATUS VirtualFileSystem::ExtractContentFiles(
       queue.push(entry.get());
     }
 
-    ExtractContentFile(entry, base_path, progress);
+    if (const X_STATUS result = ExtractContentFile(entry, base_path, progress);
+        result != X_STATUS_SUCCESS) {
+      return result;
+    }
   }
   return X_STATUS_SUCCESS;
 }

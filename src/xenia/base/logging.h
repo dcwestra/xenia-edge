@@ -90,6 +90,24 @@ bool IsLogWriterThread();
 // and always on Windows.
 int GetLogFileDescriptor();
 
+// Logs a message box, dialog or notification an unattended run doesn't show or
+// nobody answers, for the log to hold what a user would have seen.
+void LogUIElement(const std::string_view kind, const std::string_view title,
+                  const std::string_view text);
+
+// When unattended, logs a ShowSimpleMessageBox box in place of showing it and
+// returns true.
+enum class SimpleMessageBoxType;
+bool SkipSimpleMessageBox(SimpleMessageBoxType type,
+                          const std::string_view message);
+
+// Whether nobody is there to answer the UI.
+bool IsUnattended();
+
+// When unattended, states why the run is over and ends the process with
+// exit_code, as nobody is there to close it.
+[[noreturn]] void ExitUnattended(int exit_code, const std::string_view reason);
+
 // The result of path_to_utf8, in filesystem.h.
 class Utf8Path;
 
@@ -186,9 +204,11 @@ struct LoggerBatch {
   void operator()(const char (&fmt)[fmtlen], Ts&&... args) {
     auto tmpres =
         fmt::format_to_n(thrd_buf, thrd_buf_rem, fmt::runtime(fmt), args...);
-    thrd_buf_rem -= tmpres.size;
+    // tmpres.size is the untruncated length.
+    const size_t written = static_cast<size_t>(tmpres.out - thrd_buf);
+    thrd_buf_rem -= written;
     thrd_buf = tmpres.out;
-    total_size += tmpres.size;
+    total_size += written;
   }
 
   void submit(char prefix_char) {

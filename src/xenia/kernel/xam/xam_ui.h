@@ -10,6 +10,9 @@
 #ifndef XENIA_KERNEL_XAM_XAM_UI_H_
 #define XENIA_KERNEL_XAM_XAM_UI_H_
 
+#include <algorithm>
+#include <string_view>
+
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xam/xam.h"
 #include "xenia/ui/imgui_dialog.h"
@@ -26,29 +29,8 @@ namespace xe {
 namespace kernel {
 namespace xam {
 
-class XamDialog : public xe::ui::ImGuiDialog {
- public:
-  void set_close_callback(std::function<void()> close_callback) {
-    close_callback_ = close_callback;
-  }
-
- protected:
-  XamDialog(xe::ui::ImGuiDrawer* imgui_drawer)
-      : xe::ui::ImGuiDialog(imgui_drawer) {}
-
-  virtual ~XamDialog() {};
-
-  void OnClose() override {
-    if (close_callback_) {
-      close_callback_();
-    }
-  }
-
- private:
-  std::function<void()> close_callback_ = nullptr;
-};
-
-// XamDialog with gamepad support for game-triggered dialogs
+// XAM dialog for a title. Holds the title's input while open and hides the
+// buttons held when it closes until they're released.
 class XamGamepadDialog : public xe::ui::ImGuiGamepadDialog {
  public:
   void set_close_callback(std::function<void()> close_callback) {
@@ -121,6 +103,8 @@ class MessageBoxDialog : public XamGamepadDialog {
   }
 
   uint32_t chosen_button() const { return chosen_button_; }
+  // Closed with B or Escape, without choosing a button
+  bool cancelled() const { return cancelled_; }
 
   // Lets the hand of the Kinect player with the tracking ID (or any) choose
   // a button by holding a cursor over it, as on a console.
@@ -130,6 +114,11 @@ class MessageBoxDialog : public XamGamepadDialog {
 
   void OnDraw(ImGuiIO& io) override;
   virtual ~MessageBoxDialog() {}
+
+ protected:
+  std::string GetLogTitle() const override { return title_; }
+  std::string GetLogText() const override;
+  std::string GetLogResult() const override;
 
  private:
   void Choose(uint32_t button);
@@ -141,6 +130,7 @@ class MessageBoxDialog : public XamGamepadDialog {
   std::vector<std::string> buttons_;
   uint32_t default_button_ = 0;
   uint32_t chosen_button_ = 0;
+  bool cancelled_ = false;
 };
 
 class KeyboardInputDialog : public XamGamepadDialog {
@@ -153,7 +143,7 @@ class KeyboardInputDialog : public XamGamepadDialog {
         title_(title),
         description_(description),
         default_text_(default_text),
-        max_length_(max_length),
+        max_chars_(max_length ? max_length - 1 : 0),
         text_buffer_() {
     if (!title_.size()) {
       if (!description_.size()) {
@@ -164,9 +154,9 @@ class KeyboardInputDialog : public XamGamepadDialog {
       }
     }
     text_ = default_text;
-    text_buffer_.resize(max_length);
-    xe::string_util::copy_truncating(text_buffer_.data(), default_text_,
-                                     text_buffer_.size());
+    // A UTF-16 code unit takes at most 3 bytes of UTF-8.
+    text_buffer_.resize(max_chars_ * 3 + 1);
+    CopyText(default_text_);
   }
   virtual ~KeyboardInputDialog() {}
 
@@ -175,13 +165,27 @@ class KeyboardInputDialog : public XamGamepadDialog {
 
   void OnDraw(ImGuiIO& io) override;
 
+ protected:
+  std::string GetLogTitle() const override { return title_; }
+  std::string GetLogText() const override;
+  std::string GetLogResult() const override;
+  // Enters the default text, as pressing OK straight away would.
+  void OnUnattendedDismiss() override {
+    text_ = text_buffer_.data();
+    cancelled_ = false;
+  }
+
  private:
+  // Copies the whole characters of |text| that fit in the title's buffer.
+  void CopyText(std::string_view text);
+
   bool has_opened_ = false;
   bool focus_set_ = false;
   std::string title_;
   std::string description_;
   std::string default_text_;
-  size_t max_length_ = 0;
+  // UTF-16 code units the title's buffer holds, without the terminator.
+  size_t max_chars_ = 0;
   std::vector<char> text_buffer_;
   std::string text_ = "";
   bool cancelled_ = true;

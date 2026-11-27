@@ -51,11 +51,15 @@ int InstrEmit_faddsx(PPCHIRBuilder& f, const InstrData& i) {
   Value* a = f.LoadFPR(i.A.FRA);
   Value* b = f.LoadFPR(i.A.FRB);
   f.BeginFPSCRUpdate(i.A.Rc);
-  Value* v = f.ToSingle(f.Add(a, b));
-  Value* denormal = f.SingleDenormalOperand({a, b});
-  v = f.ApplySingleDenormalOperand(denormal, v);
+  uint32_t range_flag = f.SingleRangeFlag(i.A.Rc);
+  Value* v = f.ToSingle(f.Add(a, b, range_flag), TO_SINGLE_KEEP_NAN);
+  Value* out_of_range = nullptr;
+  if (!range_flag) {
+    out_of_range = f.SingleOutOfRangeOperand({a, b});
+    v = f.ApplySingleOutOfRangeOperand(out_of_range, v);
+  }
   f.StoreFPR(i.A.FRT, v);
-  f.UpdateFPSCR({a, b}, i.A.Rc, denormal);
+  f.UpdateFPSCR({a, b}, i.A.Rc, out_of_range);
   return 0;
 }
 
@@ -96,11 +100,13 @@ int InstrEmit_fdivsx(PPCHIRBuilder& f, const InstrData& i) {
   Value* b = f.LoadFPR(frb);
   f.BeginFPSCRUpdate(rc);
   Value* v = f.Div(a, b);
-  // A denormalized operand keeps the double quotient, unrounded.
-  Value* denormal = f.SingleDenormalOperand({a, b});
   Value* before_rounding = f.SnapshotFpExceptions(rc);
-  f.StoreFPR(frt, f.Select(denormal, v, f.ToSingle(v)));
-  f.UpdateFPSCRForUnroundedSingle({a, b}, rc, denormal, before_rounding);
+  // Right after the quotient, whose NaN test can then serve it too.
+  Value* rounded = f.ToSingle(v, TO_SINGLE_KEEP_NAN);
+  // An operand outside the single range keeps the double quotient, unrounded.
+  Value* out_of_range = f.SingleOutOfRangeOperand({a, b});
+  f.StoreFPR(frt, f.Select(out_of_range, v, rounded));
+  f.UpdateFPSCRForUnroundedSingle({a, b}, rc, out_of_range, before_rounding);
   return 0;
 }
 
@@ -120,22 +126,22 @@ int InstrEmit_fmulsx(PPCHIRBuilder& f, const InstrData& i) {
   Value* a = f.LoadFPR(i.A.FRA);
   Value* c = f.LoadFPR(i.A.FRC);
   f.BeginFPSCRUpdate(i.A.Rc);
-  Value* v = f.ToSingle(f.Mul(a, c));
-  Value* denormal = f.SingleDenormalOperand({a, c});
-  v = f.ApplySingleDenormalOperand(denormal, v);
+  uint32_t range_flag = f.SingleRangeFlag(i.A.Rc);
+  Value* v = f.ToSingle(f.Mul(a, c, range_flag), TO_SINGLE_KEEP_NAN);
+  Value* out_of_range = nullptr;
+  if (!range_flag) {
+    out_of_range = f.SingleOutOfRangeOperand({a, c});
+    v = f.ApplySingleOutOfRangeOperand(out_of_range, v);
+  }
   f.StoreFPR(i.A.FRT, v);
-  f.UpdateFPSCR({a, c}, i.A.Rc, denormal);
+  f.UpdateFPSCR({a, c}, i.A.Rc, out_of_range);
   return 0;
 }
 
 int InstrEmit_fresx(PPCHIRBuilder& f, const InstrData& i) {
-  // frD <- 1.0 / (frB)
-
-  // this actually does seem to require single precision, oddly
-  // more research is needed
+  // frD <- estimate of 1.0 / (frB), as single precision
   Value* b = f.LoadFPR(i.A.FRB);
-  Value* v = f.Recip(f.Convert(b, FLOAT32_TYPE));
-  v = f.Convert(v, FLOAT64_TYPE);  // f.ToSingle(v);
+  Value* v = f.Recip(b);
   f.StoreFPR(i.A.FRT, v);
   f.UpdateFPSCRForEstimate(b, /*is_sqrt_estimate=*/false, i.A.Rc);
   return 0;
@@ -167,11 +173,15 @@ int InstrEmit_fsubsx(PPCHIRBuilder& f, const InstrData& i) {
   Value* a = f.LoadFPR(i.A.FRA);
   Value* b = f.LoadFPR(i.A.FRB);
   f.BeginFPSCRUpdate(i.A.Rc);
-  Value* v = f.ToSingle(f.Sub(a, b));
-  Value* denormal = f.SingleDenormalOperand({a, b});
-  v = f.ApplySingleDenormalOperand(denormal, v);
+  uint32_t range_flag = f.SingleRangeFlag(i.A.Rc);
+  Value* v = f.ToSingle(f.Sub(a, b, range_flag), TO_SINGLE_KEEP_NAN);
+  Value* out_of_range = nullptr;
+  if (!range_flag) {
+    out_of_range = f.SingleOutOfRangeOperand({a, b});
+    v = f.ApplySingleOutOfRangeOperand(out_of_range, v);
+  }
   f.StoreFPR(i.A.FRT, v);
-  f.UpdateFPSCR({a, b}, i.A.Rc, denormal);
+  f.UpdateFPSCR({a, b}, i.A.Rc, out_of_range);
   return 0;
 }
 
@@ -195,11 +205,13 @@ static int InstrEmit_fsqrt(PPCHIRBuilder& f, const InstrData& i, bool single) {
     f.UpdateFPSCR({b}, i.A.Rc);
     return 0;
   }
-  // A denormalized operand keeps the double root, unrounded.
-  Value* denormal = f.SingleDenormalOperand({b});
   Value* before_rounding = f.SnapshotFpExceptions(i.A.Rc);
-  f.StoreFPR(i.A.FRT, f.Select(denormal, v, f.ToSingle(v)));
-  f.UpdateFPSCRForUnroundedSingle({b}, i.A.Rc, denormal, before_rounding);
+  // Right after the root, whose NaN test can then serve it too.
+  Value* rounded = f.ToSingle(v, TO_SINGLE_KEEP_NAN);
+  // An operand outside the single range keeps the double root, unrounded.
+  Value* out_of_range = f.SingleOutOfRangeOperand({b});
+  f.StoreFPR(i.A.FRT, f.Select(out_of_range, v, rounded));
+  f.UpdateFPSCRForUnroundedSingle({b}, i.A.Rc, out_of_range, before_rounding);
   return 0;
 }
 int InstrEmit_fsqrtx(PPCHIRBuilder& f, const InstrData& i) {
@@ -218,15 +230,18 @@ static int InstrEmit_fmadd(PPCHIRBuilder& f, const InstrData& i, bool single) {
   Value* c = f.LoadFPR(i.A.FRC);
   Value* b = f.LoadFPR(i.A.FRB);
   f.BeginFPSCRUpdate(i.A.Rc);
-  Value* v = f.MulAdd(a, c, b);
-  Value* denormal = nullptr;
+  uint32_t range_flag = single ? f.SingleRangeFlag(i.A.Rc) : 0;
+  Value* v = f.MulAdd(a, c, b, false, range_flag);
+  Value* out_of_range = nullptr;
   if (single) {
-    v = f.ToSingle(v);
-    denormal = f.SingleDenormalOperand({a, c, b});
-    v = f.ApplySingleDenormalOperand(denormal, v);
+    v = f.ToSingle(v, TO_SINGLE_KEEP_NAN);
+    if (!range_flag) {
+      out_of_range = f.SingleOutOfRangeOperand({a, c, b});
+      v = f.ApplySingleOutOfRangeOperand(out_of_range, v);
+    }
   }
   f.StoreFPR(i.A.FRT, v);
-  f.UpdateFPSCRForMultiplyAdd(a, c, b, i.A.Rc, denormal);
+  f.UpdateFPSCRForMultiplyAdd(a, c, b, i.A.Rc, out_of_range);
   return 0;
 }
 
@@ -244,15 +259,18 @@ static int InstrEmit_fmsub(PPCHIRBuilder& f, const InstrData& i, bool single) {
   Value* c = f.LoadFPR(i.A.FRC);
   Value* b = f.LoadFPR(i.A.FRB);
   f.BeginFPSCRUpdate(i.A.Rc);
-  Value* v = f.MulSub(a, c, b);
-  Value* denormal = nullptr;
+  uint32_t range_flag = single ? f.SingleRangeFlag(i.A.Rc) : 0;
+  Value* v = f.MulSub(a, c, b, false, range_flag);
+  Value* out_of_range = nullptr;
   if (single) {
-    v = f.ToSingle(v);
-    denormal = f.SingleDenormalOperand({a, c, b});
-    v = f.ApplySingleDenormalOperand(denormal, v);
+    v = f.ToSingle(v, TO_SINGLE_KEEP_NAN);
+    if (!range_flag) {
+      out_of_range = f.SingleOutOfRangeOperand({a, c, b});
+      v = f.ApplySingleOutOfRangeOperand(out_of_range, v);
+    }
   }
   f.StoreFPR(i.A.FRT, v);
-  f.UpdateFPSCRForMultiplyAdd(a, c, b, i.A.Rc, denormal);
+  f.UpdateFPSCRForMultiplyAdd(a, c, b, i.A.Rc, out_of_range);
   return 0;
 }
 int InstrEmit_fmsubx(PPCHIRBuilder& f, const InstrData& i) {
@@ -283,12 +301,16 @@ int InstrEmit_fnmaddsx(PPCHIRBuilder& f, const InstrData& i) {
   Value* c = f.LoadFPR(i.A.FRC);
   Value* b = f.LoadFPR(i.A.FRB);
   f.BeginFPSCRUpdate(i.A.Rc);
-  Value* v = f.MulAdd(a, c, b, /*negate_result=*/true);
-  v = f.ToSingle(v);
-  Value* denormal = f.SingleDenormalOperand({a, c, b});
-  v = f.ApplySingleDenormalOperand(denormal, v);
+  uint32_t range_flag = f.SingleRangeFlag(i.A.Rc);
+  Value* v = f.MulAdd(a, c, b, /*negate_result=*/true, range_flag);
+  v = f.ToSingle(v, TO_SINGLE_KEEP_NAN);
+  Value* out_of_range = nullptr;
+  if (!range_flag) {
+    out_of_range = f.SingleOutOfRangeOperand({a, c, b});
+    v = f.ApplySingleOutOfRangeOperand(out_of_range, v);
+  }
   f.StoreFPR(i.A.FRT, v);
-  f.UpdateFPSCRForMultiplyAdd(a, c, b, i.A.Rc, denormal);
+  f.UpdateFPSCRForMultiplyAdd(a, c, b, i.A.Rc, out_of_range);
   return 0;
 }
 
@@ -310,12 +332,16 @@ int InstrEmit_fnmsubsx(PPCHIRBuilder& f, const InstrData& i) {
   Value* c = f.LoadFPR(i.A.FRC);
   Value* b = f.LoadFPR(i.A.FRB);
   f.BeginFPSCRUpdate(i.A.Rc);
-  Value* v = f.MulSub(a, c, b, /*negate_result=*/true);
-  v = f.ToSingle(v);
-  Value* denormal = f.SingleDenormalOperand({a, c, b});
-  v = f.ApplySingleDenormalOperand(denormal, v);
+  uint32_t range_flag = f.SingleRangeFlag(i.A.Rc);
+  Value* v = f.MulSub(a, c, b, /*negate_result=*/true, range_flag);
+  v = f.ToSingle(v, TO_SINGLE_KEEP_NAN);
+  Value* out_of_range = nullptr;
+  if (!range_flag) {
+    out_of_range = f.SingleOutOfRangeOperand({a, c, b});
+    v = f.ApplySingleOutOfRangeOperand(out_of_range, v);
+  }
   f.StoreFPR(i.A.FRT, v);
-  f.UpdateFPSCRForMultiplyAdd(a, c, b, i.A.Rc, denormal);
+  f.UpdateFPSCRForMultiplyAdd(a, c, b, i.A.Rc, out_of_range);
   return 0;
 }
 
@@ -331,22 +357,13 @@ int InstrEmit_fcfidx(PPCHIRBuilder& f, const InstrData& i) {
 
 int InstrEmit_fctidxx_(PPCHIRBuilder& f, const InstrData& i,
                        RoundMode round_mode) {
-  auto end = f.NewLabel();
-  auto isnan = f.NewLabel();
+  // The conversion saturates, and gives 0x8000000000000000 for a NaN, so it
+  // needs no branch (which would end the block)
   f.BeginFPSCRUpdate(i.X.Rc);
-  f.BranchTrue(f.IsNan(f.LoadFPR(i.X.RB)), isnan);
   Value* b = f.LoadFPR(i.X.RB);
   f.StoreFPR(i.X.RT,
              f.Cast(f.Convert(b, INT64_TYPE, round_mode), FLOAT64_TYPE));
   f.UpdateFPSCRForConvertToInteger(b, round_mode, /*to_int64=*/true, i.X.Rc);
-  f.Branch(end);
-  f.MarkLabel(isnan);
-  // A NaN answers with the most negative value, and is invalid and nothing
-  // else.
-  f.StoreFPR(i.X.RT,
-             f.Cast(f.LoadConstantUint64(0x8000000000000000ull), FLOAT64_TYPE));
-  f.SetFPSCRInvalid(i.X.Rc);
-  f.MarkLabel(end);
   return 0;
 }
 
@@ -361,22 +378,14 @@ int InstrEmit_fctidzx(PPCHIRBuilder& f, const InstrData& i) {
 
 int InstrEmit_fctiwxx_(PPCHIRBuilder& f, const InstrData& i,
                        RoundMode round_mode) {
-  auto end = f.NewLabel();
-  auto isnan = f.NewLabel();
+  // The conversion saturates, and gives 0x80000000 for a NaN, so it needs no
+  // branch (which would end the block)
   f.BeginFPSCRUpdate(i.X.Rc);
-  f.BranchTrue(f.IsNan(f.LoadFPR(i.X.RB)), isnan);
   Value* b = f.LoadFPR(i.X.RB);
   f.StoreFPR(i.X.RT, f.Cast(f.SignExtend(f.Convert(b, INT32_TYPE, round_mode),
                                          INT64_TYPE),
                             FLOAT64_TYPE));
   f.UpdateFPSCRForConvertToInteger(b, round_mode, /*to_int64=*/false, i.X.Rc);
-  f.Branch(end);
-  f.MarkLabel(isnan);
-  // The most negative value, sign extended as the conversion result is.
-  f.StoreFPR(i.X.RT,
-             f.Cast(f.LoadConstantUint64(0xFFFFFFFF80000000ull), FLOAT64_TYPE));
-  f.SetFPSCRInvalid(i.X.Rc);
-  f.MarkLabel(end);
   return 0;
 }
 
@@ -394,8 +403,8 @@ int InstrEmit_frspx(PPCHIRBuilder& f, const InstrData& i) {
   // frD <- Round_single(frB)
   Value* b = f.LoadFPR(i.X.RB);
   f.BeginFPSCRUpdate(i.X.Rc);
-  Value* v = f.Convert(b, FLOAT32_TYPE, ROUND_DYNAMIC);
-  v = f.Convert(v, FLOAT64_TYPE);
+  // Unlike the conversions lfs and stfs use, this quiets an SNaN
+  Value* v = f.ToSingle(b);
   f.StoreFPR(i.X.RT, v);
   f.UpdateFPSCR({b}, i.X.Rc);
   return 0;
@@ -532,9 +541,9 @@ static int InstrEmit_mtfsb(PPCHIRBuilder& f, const InstrData& i, bool value) {
       v = f.And(fpscr, f.LoadConstantInt32(~mask));
     }
     f.StoreFPSCR(UpdateFPSCRSummaryBits(f, v));
-    // Update the system rounding mode.
-    if (mask & 0x7) {
-      f.SetRoundingMode(f.And(v, f.LoadConstantInt32(7)));
+    // Update the system rounding mode. NI isn't implemented.
+    if (mask & 0x3) {
+      f.SetRoundingMode(f.And(v, f.LoadConstantInt32(3)));
     }
   }
   if (i.X.Rc) {
@@ -576,9 +585,9 @@ int InstrEmit_mtfsfx(PPCHIRBuilder& f, const InstrData& i) {
     }
     f.StoreFPSCR(UpdateFPSCRSummaryBits(f, v));
 
-    // Update the system rounding mode.
-    if (mask & 0x7) {
-      f.SetRoundingMode(f.And(v, f.LoadConstantInt32(7)));
+    // Update the system rounding mode. NI isn't implemented.
+    if (mask & 0x3) {
+      f.SetRoundingMode(f.And(v, f.LoadConstantInt32(3)));
     }
   }
   if (i.XFL.Rc) {
@@ -599,9 +608,9 @@ int InstrEmit_mtfsfix(PPCHIRBuilder& f, const InstrData& i) {
   fpscr = f.Or(fpscr, f.LoadConstantInt32(value));
   f.StoreFPSCR(UpdateFPSCRSummaryBits(f, fpscr));
 
-  // Update the system rounding mode.
-  if (mask & 0x7) {
-    f.SetRoundingMode(f.And(fpscr, f.LoadConstantInt32(7)));
+  // Update the system rounding mode. NI isn't implemented.
+  if (mask & 0x3) {
+    f.SetRoundingMode(f.And(fpscr, f.LoadConstantInt32(3)));
   }
 
   if (i.X.Rc) {

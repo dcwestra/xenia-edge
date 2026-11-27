@@ -65,10 +65,6 @@ class GraphicsSystem {
 
   virtual std::string name() const = 0;
 
-  // Whether the host can clamp depth instead of clipping at the near and far
-  // planes, which is what force_depth_clamp asks for.
-  virtual bool supports_depth_clamp() const { return true; }
-
   Memory* memory() const { return memory_; }
   cpu::Processor* processor() const { return processor_; }
   kernel::KernelState* kernel_state() const { return kernel_state_; }
@@ -117,13 +113,6 @@ class GraphicsSystem {
   void RequestEndTracing();
   bool is_tracing_stream() const;
 
-  bool is_paused() const { return paused_; }
-  void Pause();
-  void Resume();
-
-  bool Save(ByteStream* stream);
-  bool Restore(ByteStream* stream);
-
   static std::pair<uint16_t, uint16_t> GetInternalDisplayResolution();
 
   std::pair<uint32_t, uint32_t> GetScaledAspectRatio() const {
@@ -133,6 +122,11 @@ class GraphicsSystem {
     scaled_aspect_x_ = x;
     scaled_aspect_y_ = y;
   };
+
+  // Command processor thread, once per guest swap.
+  void OnGuestSwap();
+  // Measured from the guest's swaps, zero once it swaps no frame for a second.
+  float GetFramesPerSecond() const;
 
   // Whether pipelines are being created, in the background or inline, from
   // the thread that started or finished them.
@@ -174,12 +168,21 @@ class GraphicsSystem {
   RegisterFile* register_file_;
   std::unique_ptr<CommandProcessor> command_processor_;
 
-  bool paused_ = false;
-
   uint32_t scaled_aspect_x_ = 0;
   uint32_t scaled_aspect_y_ = 0;
 
  private:
+  static constexpr uint64_t kFrameRatePeriodMs = 500;
+  // A longer gap between swaps reads as zero and restarts the period.
+  static constexpr uint64_t kFrameRateStallMs = 1000;
+
+  // Command processor thread only.
+  uint64_t frame_rate_period_start_ticks_ = 0;
+  uint64_t frame_rate_period_swaps_ = 0;
+
+  std::atomic<uint64_t> frame_rate_last_swap_ticks_{0};
+  std::atomic<float> frame_rate_frames_per_second_{0.0f};
+
   std::unique_ptr<ui::Presenter> presenter_;
 
   std::atomic_flag host_gpu_loss_reported_;

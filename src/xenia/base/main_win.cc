@@ -33,6 +33,29 @@ DEFINE_bool(
 
 namespace xe {
 
+static bool IsBeforeWindows11(HMODULE ntdll_module) {
+  constexpr DWORD kWindows11BuildNumber = 22000;
+
+  // clang-format off
+  NTSTATUS (NTAPI* rtl_get_version)(OUT PRTL_OSVERSIONINFOW VersionInformation);
+  // clang-format on
+  rtl_get_version = reinterpret_cast<decltype(rtl_get_version)>(
+      GetProcAddress(ntdll_module, "RtlGetVersion"));
+
+  if (!rtl_get_version) {
+    return false;
+  }
+
+  RTL_OSVERSIONINFOW version_info = {};
+  version_info.dwOSVersionInfoSize = sizeof(version_info);
+
+  if (rtl_get_version(&version_info) < 0) {
+    return false;
+  }
+
+  return version_info.dwBuildNumber < kWindows11BuildNumber;
+}
+
 static void RequestWin32HighResolutionTimer() {
   HMODULE ntdll_module = GetModuleHandleW(L"ntdll.dll");
   if (!ntdll_module) {
@@ -56,10 +79,52 @@ static void RequestWin32HighResolutionTimer() {
     return;
   }
 
+  // Windows 11 may ignore the resolution request while the window is occluded
+  // or minimized, falling back to the 15.625 ms tick, which halves the speed
+  // of titles paced by a 16 ms timer. Opt out of that throttling, which earlier
+  // versions don't have.
+  if (!IsBeforeWindows11(ntdll_module)) {
+    HMODULE kernel32_module = GetModuleHandleW(L"kernel32.dll");
+
+    // clang-format off
+    BOOL (WINAPI* set_process_information)(
+        HANDLE hProcess, PROCESS_INFORMATION_CLASS ProcessInformationClass,
+        LPVOID ProcessInformation, DWORD ProcessInformationSize) = nullptr;
+    // clang-format on
+
+    if (kernel32_module) {
+      set_process_information =
+          reinterpret_cast<decltype(set_process_information)>(
+              GetProcAddress(kernel32_module, "SetProcessInformation"));
+    }
+
+    if (set_process_information) {
+      // PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, missing from older
+      // SDKs
+      constexpr ULONG kIgnoreTimerResolution = 0x4;
+
+      PROCESS_POWER_THROTTLING_STATE throttling_state = {};
+      throttling_state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+      throttling_state.ControlMask = kIgnoreTimerResolution;
+      throttling_state.StateMask = 0;
+
+      if (!set_process_information(GetCurrentProcess(), ProcessPowerThrottling,
+                                   &throttling_state,
+                                   sizeof(throttling_state))) {
+        XELOGW(
+            "Failed to opt out of timer resolution throttling (error {}); "
+            "guest timers may run slow while the window is not visible",
+            GetLastError());
+      }
+    }
+  }
+
   ULONG minimum_resolution, maximum_resolution, current_resolution;
   nt_query_timer_resolution(&minimum_resolution, &maximum_resolution,
                             &current_resolution);
   nt_set_timer_resolution(maximum_resolution, true, &current_resolution);
+
+  XELOGI("Host timer resolution set to {} x 100 ns", current_resolution);
 }
 
 static void RequestWin32MMCSS() {
@@ -125,12 +190,15 @@ int InitializeWin32App(const std::string_view app_name) {
   xe::InitializeLogging(app_name);
 
   // Print version info.
-  XELOGI(
-      "Build: "
-#ifdef XE_BUILD_IS_PR
-      "PR#" XE_BUILD_PR_NUMBER " - "
+  XELOGI("Build: "
+#ifdef XE_BUILD_VERSION
+         XE_BUILD_VERSION
+         " - "
 #endif
-      XE_BUILD_BRANCH "@" XE_BUILD_COMMIT_SHORT " on " XE_BUILD_DATE);
+#ifdef XE_BUILD_IS_PR
+         "PR#" XE_BUILD_PR_NUMBER " - "
+#endif
+         XE_BUILD_BRANCH "@" XE_BUILD_COMMIT_SHORT " on " XE_BUILD_DATE);
 
   // Request high-performance timing and scheduling.
   if (cvars::win32_high_resolution_timer) {

@@ -11,17 +11,13 @@
 #include "xenia/base/logging.h"
 #include "xenia/base/string_util.h"
 #include "xenia/cpu/processor.h"
+#include "xenia/emulator.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xbdm/xbdm_private.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_memory.h"
 #include "xenia/kernel/xthread.h"
-#include "xenia/vfs/devices/host_path_device.h"
 #include "xenia/xbox.h"
-
-DECLARE_bool(debug);
-
-DEFINE_bool(force_mount_devkit, false, "Force devkit mount", "Storage");
 
 DEFINE_int32(
     console_type, -1,
@@ -74,9 +70,7 @@ dword_result_t DmGetConsoleType_entry(lpdword_t console_type_out) {
 }
 DECLARE_XBDM_EXPORT1(DmGetConsoleType, kDebug, kImplemented);
 
-dword_result_t DmIsDebuggerPresent_entry() {
-  return static_cast<uint32_t>(cvars::debug);
-}
+dword_result_t DmIsDebuggerPresent_entry() { return 0; }
 DECLARE_XBDM_EXPORT1(DmIsDebuggerPresent, kDebug, kStub);
 
 dword_result_t DmSendNotificationString_entry(lpstring_t notify_string_ptr) {
@@ -85,11 +79,6 @@ dword_result_t DmSendNotificationString_entry(lpstring_t notify_string_ptr) {
   }
 
   XELOGI("(DmSendNotificationString) {}", notify_string_ptr.value());
-
-  if (cpu::DebugListener* listener =
-          kernel_state()->processor()->debug_listener()) {
-    listener->OnDebugPrint(notify_string_ptr.value());
-  }
 
   return XBDM_SUCCESSFUL;
 }
@@ -157,28 +146,7 @@ dword_result_t DmCloseLoadedModules_entry(lpdword_t walk_modules_ptr) {
 DECLARE_XBDM_EXPORT1(DmCloseLoadedModules, kDebug, kStub);
 
 dword_result_t DmMapDevkitDrive_entry(const ppc_context_t& ctx) {
-  if (cvars::force_mount_devkit) {
-    return 0;
-  }
-
-  auto devkit_device =
-      std::make_unique<xe::vfs::HostPathDevice>("\\DEVKIT", "devkit", false);
-
-  auto fs = kernel_state()->file_system();
-
-  if (!devkit_device->Initialize()) {
-    XELOGE("Unable to scan devkit path");
-    return XBDM_UNSUCCESSFUL;
-  }
-
-  if (!fs->RegisterDevice(std::move(devkit_device))) {
-    XELOGE("Unable to register devkit path");
-    return XBDM_UNSUCCESSFUL;
-  }
-
-  fs->RegisterSymbolicLink("DEVKIT:", "\\DEVKIT");
-  fs->RegisterSymbolicLink("e:", "\\DEVKIT");
-  return 0;
+  return kernel_state()->emulator()->MountDevkitDrive() ? 0 : XBDM_UNSUCCESSFUL;
 }
 DECLARE_XBDM_EXPORT1(DmMapDevkitDrive, kDebug, kImplemented);
 
@@ -230,6 +198,13 @@ dword_result_t DmGetSystemInfo_entry(pointer_t<XBDM_SYSTEM_INFO> info) {
 
   info->base_kernel_version.build = kBaseKernelBuildVersion;
   info->kernel_version.build = kernel_state()->GetKernelVersion()->build;
+  // The rest was left as the caller had it. The Silverlight CLR (xcoreclr.dll
+  // 0x84F0B55C) tests flags bit 0x02000000 and only uses its code cache
+  // modules, through XexReserveCodeBuffer, when it is clear; a devkit's real
+  // values are not known here.
+  info->xdk_version.major = info->xdk_version.minor = 0;
+  info->xdk_version.qfe = info->xdk_version.build = 0;
+  info->flags = 0;
 
   return XBDM_SUCCESSFUL;
 }

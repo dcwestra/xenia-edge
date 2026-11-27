@@ -9,7 +9,6 @@
 
 #include "xenia/kernel/xevent.h"
 
-#include "xenia/base/byte_stream.h"
 #include "xenia/base/logging.h"
 #include "xenia/kernel/guest_scheduler.h"
 #include "xenia/kernel/kernel_state.h"
@@ -73,20 +72,21 @@ void XEvent::InitializeNative(void* native_ptr,
 
 int32_t XEvent::Set(uint32_t priority_increment, bool wait) {
   set_priority_increment(priority_increment);
-  if (manual_reset_) {
-    // Releases every waiter parked right now, even if the event is reset
-    // before they run. Must precede the wake below.
-    pulse_epoch_.fetch_add(1);
-  }
   // KeSetEvent returns the signal state from before.
   int32_t old_signal_state;
   {
-    std::lock_guard<std::mutex> lock(state_lock_);
+    auto global_lock = global_critical_region_.Acquire();
     auto* kevent = memory()->TranslateVirtual<X_KEVENT*>(guest_object());
     old_signal_state = kevent->header.signal_state;
     kevent->header.signal_state = 1;
     host_signaled_ = true;
     event_->Set();
+    if (manual_reset_) {
+      // Releases every waiter parked right now, even if the event is reset
+      // before they run. Bumped after the state so a waiter that sees it can't
+      // reset the event before this set lands, and before the wake below.
+      pulse_epoch_.fetch_add(1);
+    }
   }
   WakeCooperativeWaiters();
   return old_signal_state;
@@ -105,23 +105,25 @@ int32_t XEvent::Pulse(uint32_t priority_increment, bool wait) {
     Set(priority_increment, wait);
     return old_signal_state;
   }
-  if (manual_reset_) {
-    // Releases every waiter parked right now. Must precede the wake below.
-    pulse_epoch_.fetch_add(1);
-  }
   {
-    std::lock_guard<std::mutex> lock(state_lock_);
+    auto global_lock = global_critical_region_.Acquire();
     event_->Pulse();
     // Pulse leaves the event reset after releasing waiters.
     kevent->header.signal_state = 0;
     host_signaled_ = false;
+    if (manual_reset_) {
+      // Releases every waiter parked right now. Bumped after the state so a
+      // waiter that sees it can't set the event before this reset lands, and
+      // before the wake below.
+      pulse_epoch_.fetch_add(1);
+    }
   }
   WakeCooperativeWaiters();
   return old_signal_state;
 }
 
 int32_t XEvent::Reset() {
-  std::lock_guard<std::mutex> lock(state_lock_);
+  auto global_lock = global_critical_region_.Acquire();
   // KeResetEvent returns the signal state from before.
   auto* kevent = memory()->TranslateVirtual<X_KEVENT*>(guest_object());
   const int32_t old_signal_state = kevent->header.signal_state;
@@ -134,7 +136,7 @@ int32_t XEvent::Reset() {
 void XEvent::WaitCallback() {
   // Auto-reset events atomically clear on successful wait; manual stay set.
   if (!manual_reset_) {
-    std::lock_guard<std::mutex> lock(state_lock_);
+    auto global_lock = global_critical_region_.Acquire();
     memory()->TranslateVirtual<X_KEVENT*>(guest_object())->header.signal_state =
         0;
     host_signaled_ = false;
@@ -147,7 +149,7 @@ void XEvent::SyncFromGuest() {
   }
   bool guest_signaled = false;
   {
-    std::lock_guard<std::mutex> lock(state_lock_);
+    auto global_lock = global_critical_region_.Acquire();
     auto* kevent = memory()->TranslateVirtual<X_KEVENT*>(guest_object());
     guest_signaled = kevent->header.signal_state ? true : false;
     if (guest_signaled == host_signaled_) {
@@ -167,7 +169,15 @@ void XEvent::SyncFromGuest() {
 
 void XEvent::CooperativeWaitBegin(XThread* thread) { waiters_.Add(thread); }
 
-void XEvent::CooperativeWaitEnd(XThread* thread) { waiters_.Remove(thread); }
+// A waiter leaving an auto-reset event that is still set hands the set to the
+// next one in line.
+void XEvent::CooperativeWaitEnd(XThread* thread) {
+  auto* kevent = memory()->TranslateVirtual<X_KEVENT*>(guest_object());
+  if (waiters_.Remove(thread) && !manual_reset_ &&
+      kevent->header.signal_state) {
+    WakeCooperativeWaiters();
+  }
+}
 
 // An auto-reset set with a parked waiter belongs to the front of the queue.
 // NT wakes the first waiter directly, so a later poller must not steal it.
@@ -181,56 +191,6 @@ void XEvent::Query(uint32_t* out_type, uint32_t* out_state) {
   *out_state = state;
 }
 void XEvent::Clear() { Reset(); }
-
-bool XEvent::Save(ByteStream* stream) {
-  XELOGD("XEvent {:08X} ({})", handle(), manual_reset_ ? "manual" : "auto");
-  SaveObject(stream);
-
-  bool signaled = true;
-  auto result =
-      xe::threading::Wait(event_.get(), false, std::chrono::milliseconds(0));
-  if (result == xe::threading::WaitResult::kSuccess) {
-    signaled = true;
-  } else if (result == xe::threading::WaitResult::kTimeout) {
-    signaled = false;
-  } else {
-    assert_always();
-  }
-
-  if (signaled) {
-    // Reset the event in-case it's an auto-reset.
-    event_->Set();
-  }
-
-  stream->Write<bool>(signaled);
-  stream->Write<bool>(manual_reset_);
-
-  return true;
-}
-
-object_ref<XEvent> XEvent::Restore(KernelState* kernel_state,
-                                   ByteStream* stream) {
-  auto evt = new XEvent(nullptr);
-  evt->kernel_state_ = kernel_state;
-
-  evt->RestoreObject(stream);
-  bool signaled = stream->Read<bool>();
-  evt->manual_reset_ = stream->Read<bool>();
-
-  if (evt->manual_reset_) {
-    evt->event_ = xe::threading::Event::CreateManualResetEvent(false);
-  } else {
-    evt->event_ = xe::threading::Event::CreateAutoResetEvent(false);
-  }
-  assert_not_null(evt->event_);
-
-  if (signaled) {
-    evt->event_->Set();
-  }
-  evt->host_signaled_ = signaled;
-
-  return object_ref<XEvent>(evt);
-}
 
 }  // namespace kernel
 }  // namespace xe

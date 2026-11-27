@@ -18,6 +18,7 @@
 
 #include <wx/button.h>
 #include <wx/choice.h>
+#include <wx/config.h>
 #include <wx/dcclient.h>
 #include <wx/dcmemory.h>
 #include <wx/filedlg.h>
@@ -73,6 +74,26 @@ wxBitmap CenteredOnCard(const wxBitmap& art, const wxSize& size) {
 wxString SortArrow(bool descending) {
   return wxString::FromUTF8(descending ? "\xe2\x86\x93" : "\xe2\x86\x91");
 }
+
+// The sort lives in the wx config next to the other UI state that survives
+// restarts, like the window geometry and the toolbar.
+constexpr char kSortKeyConfigKey[] = "/ui/game_list_sort";
+constexpr char kSortDescendingConfigKey[] = "/ui/game_list_sort_descending";
+
+struct SortOption {
+  GameListPanel::SortKey key;
+  const char* config_name;
+  const char* label;
+  bool default_descending;
+};
+
+// In picker order.
+constexpr SortOption kSortOptions[] = {
+    {GameListPanel::SortKey::kLastPlayed, "last_played",
+     wxTRANSLATE("Last Played"), true},
+    {GameListPanel::SortKey::kTitle, "title", wxTRANSLATE("Title"), false},
+    {GameListPanel::SortKey::kStatus, "status", wxTRANSLATE("Status"), false},
+};
 
 std::string ToLower(std::string_view s) {
   std::string out(s);
@@ -134,11 +155,26 @@ GameListPanel::GameListPanel(wxWindow* parent, EmulatorWindow* emulator_window)
     search_->SetFont(f);
   }
 
+  // Start from the sort the user last chose.
+  size_t sort_index = 0;
+  if (auto* config = wxConfigBase::Get()) {
+    wxString name;
+    if (config->Read(kSortKeyConfigKey, &name)) {
+      for (size_t i = 0; i < std::size(kSortOptions); ++i) {
+        if (name == kSortOptions[i].config_name) {
+          sort_index = i;
+        }
+      }
+    }
+    config->Read(kSortDescendingConfigKey, &sort_descending_);
+  }
+  sort_key_ = kSortOptions[sort_index].key;
+
   sort_choice_ = new wxChoice(list_side_, wxID_ANY);
-  sort_choice_->Append(_("Last Played"));
-  sort_choice_->Append(_("Title"));
-  sort_choice_->Append(_("Status"));
-  sort_choice_->SetSelection(0);
+  for (const auto& option : kSortOptions) {
+    sort_choice_->Append(wxGetTranslation(option.label));
+  }
+  sort_choice_->SetSelection(static_cast<int>(sort_index));
   sort_dir_button_ =
       new wxButton(list_side_, wxID_ANY, SortArrow(sort_descending_),
                    wxDefaultPosition, wxDefaultSize, wxBU_EXACTFIT);
@@ -178,24 +214,15 @@ GameListPanel::GameListPanel(wxWindow* parent, EmulatorWindow* emulator_window)
   search_->Bind(wxEVT_SEARCH_CANCEL,
                 [this](wxCommandEvent&) { search_->Clear(); });
   sort_choice_->Bind(wxEVT_CHOICE, [this](wxCommandEvent&) {
-    switch (sort_choice_->GetSelection()) {
-      case 1:
-        sort_key_ = SortKey::kTitle;
-        sort_descending_ = false;
-        break;
-      case 2:
-        sort_key_ = SortKey::kStatus;
-        sort_descending_ = false;
-        break;
-      default:
-        sort_key_ = SortKey::kLastPlayed;
-        sort_descending_ = true;
-        break;
-    }
+    const auto& option = kSortOptions[sort_choice_->GetSelection()];
+    sort_key_ = option.key;
+    sort_descending_ = option.default_descending;
+    SaveSort();
     OnSortChanged();
   });
   sort_dir_button_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
     sort_descending_ = !sort_descending_;
+    SaveSort();
     OnSortChanged();
   });
 
@@ -496,7 +523,7 @@ void GameListPanel::LaunchOrPrompt(const LibraryKey& key,
                      "Disc Image (*.iso)|*.iso|"
                      "Disc Archive (*.zar)|*.zar|"
                      "Xbox Executable (*.xex)|*.xex|"
-                     "All Files (*.*)|*.*"),
+                     "All Files|*"),
                    wxFD_OPEN | wxFD_FILE_MUST_EXIST);
   if (dlg.ShowModal() == wxID_OK) {
     // Replacement chosen, drop the stale path.
@@ -796,6 +823,18 @@ void GameListPanel::SortEntries() {
     }
   };
   std::stable_sort(entries_.begin(), entries_.end(), cmp);
+}
+
+void GameListPanel::SaveSort() {
+  if (auto* config = wxConfigBase::Get()) {
+    for (const auto& option : kSortOptions) {
+      if (option.key == sort_key_) {
+        config->Write(kSortKeyConfigKey, wxString(option.config_name));
+      }
+    }
+    config->Write(kSortDescendingConfigKey, sort_descending_);
+    config->Flush();
+  }
 }
 
 void GameListPanel::OnSortChanged() {

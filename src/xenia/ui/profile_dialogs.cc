@@ -7,6 +7,10 @@
  ******************************************************************************
  */
 #include "xenia/ui/profile_dialogs.h"
+
+#include <algorithm>
+#include <cfloat>
+
 #include "xenia/app/emulator_window.h"
 #include "xenia/base/png_utils.h"
 #include "xenia/base/system.h"
@@ -17,9 +21,7 @@
 #include "xenia/ui/imgui_host_notification.h"
 
 #include "xenia/kernel/xam/ui/create_profile_ui.h"
-#include "xenia/kernel/xam/ui/gamercard_ui.h"
 #include "xenia/kernel/xam/ui/signin_ui.h"
-#include "xenia/kernel/xam/ui/title_info_ui.h"
 
 namespace xe {
 namespace app {
@@ -86,9 +88,10 @@ void ProfileConfigDialog::OnDraw(ImGuiIO& io) {
 
   auto profiles = profile_manager->GetAccounts();
 
-  // Center the window on screen
-  ImVec2 center = ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f);
-  ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+  // Center every frame, from the size the profile list settles at.
+  const ImGuiViewport* viewport = ImGui::GetMainViewport();
+  ImGui::SetNextWindowPos(viewport->GetWorkCenter(), ImGuiCond_Always,
+                          ImVec2(0.5f, 0.5f));
 
   // Style like Xbox - white background, black text, Xbox green highlights
   const ImVec4 xbox_green(0.063f, 0.486f, 0.063f, 1.0f);
@@ -147,6 +150,25 @@ void ProfileConfigDialog::OnDraw(ImGuiIO& io) {
   const ImVec2 next_window_position =
       ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowSize().x + 20.f,
              ImGui::GetWindowPos().y);
+
+  // Scroll instead of running off the screen, keeping Create Profile visible.
+  // The limit leaves room for the title bar above the list and the button
+  // below it, wherever the window is.
+  const ImGuiStyle& style = ImGui::GetStyle();
+  const float above_list_height =
+      ImGui::GetCursorScreenPos().y - ImGui::GetWindowPos().y;
+  const float reserved_height = style.ItemSpacing.y * 2.0f +
+                                ImGui::GetFrameHeightWithSpacing() +
+                                style.WindowPadding.y;
+  const float max_list_height =
+      std::max(viewport->WorkSize.y - above_list_height - reserved_height,
+               ui::default_image_icon_size.y * 1.5f);
+  ImGui::SetNextWindowSizeConstraints(ImVec2(0.0f, 0.0f),
+                                      ImVec2(FLT_MAX, max_list_height));
+  ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, ImGui::GetFontSize() * 0.8f);
+  ImGui::BeginChild("##ProfileList", ImVec2(0.0f, 0.0f),
+                    ImGuiChildFlags_AutoResizeX | ImGuiChildFlags_AutoResizeY);
+  ImGui::PopStyleVar();
 
   for (auto& [xuid, account] : *profiles) {
     ImGui::PushID(fmt::format("{:016X}", xuid).c_str());
@@ -240,6 +262,7 @@ void ProfileConfigDialog::OnDraw(ImGuiIO& io) {
             context_menu_fun, [=, this]() { LoadProfileIcon(xuid); },
             &selected_xuid_)) {
       ImGui::PopID();
+      ImGui::EndChild();
       ImGui::PopStyleVar(1);
       ImGui::PopStyleColor(14);
       ImGui::End();
@@ -249,6 +272,8 @@ void ProfileConfigDialog::OnDraw(ImGuiIO& io) {
     ImGui::PopID();
     ImGui::Separator();
   }
+
+  ImGui::EndChild();
 
   ImGui::Spacing();
 

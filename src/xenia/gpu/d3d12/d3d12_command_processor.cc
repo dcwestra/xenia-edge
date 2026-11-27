@@ -607,7 +607,6 @@ bool D3D12CommandProcessor::SetupContext() {
   // Initially in open state, wait until a deferred command list submission.
   command_list_->Close();
   command_list_->QueryInterface(IID_PPV_ARGS(&command_list_1_));
-  command_list_->QueryInterface(IID_PPV_ARGS(&command_list_2_));
   command_list_->QueryInterface(IID_PPV_ARGS(&command_list_9_));
 
   bindless_resources_used_ =
@@ -677,10 +676,8 @@ bool D3D12CommandProcessor::SetupContext() {
            RenderTargetCache::Path::kPixelShaderInterlock ||
        cvars::xenos_sample_positions);
 
-  // Hybrid RTV queries count pre-test coverage in the pixel shader and clear
-  // their counter slot with WriteBufferImmediate, so they need CommandList2.
+  // Hybrid RTV queries count pre-test coverage in the pixel shader.
   zpd_hybrid_supported_ = cvars::occlusion_query_full_counters &&
-                          command_list_2_ &&
                           render_target_cache_->GetPath() ==
                               RenderTargetCache::Path::kHostRenderTargets;
   // The pixel shader interlock path applies the depth bias in the shader.
@@ -1518,7 +1515,6 @@ void D3D12CommandProcessor::ShutdownContext() {
 
   deferred_command_list_.Reset();
   ui::d3d12::util::ReleaseAndNull(command_list_1_);
-  ui::d3d12::util::ReleaseAndNull(command_list_2_);
   ui::d3d12::util::ReleaseAndNull(command_list_9_);
   ui::d3d12::util::ReleaseAndNull(command_list_);
   ClearCommandAllocatorCache();
@@ -2809,7 +2805,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   async_draw.interpreter_eligible = CanInterpretVertexShader(
       *vertex_shader, active_vertex_shader_ucode_address(),
       primitive_processing_result.host_vertex_shader_type,
-      primitive_processing_result.host_primitive_type);
+      primitive_processing_result.host_primitive_type,
+      vertex_shader_modification.vertex.z_clip_distances ||
+          vertex_shader_modification.vertex.guard_band_clip_distances ||
+          vertex_shader_modification.vertex.discard_band_cull_distances);
   const AsyncPipelinePlan async_plan = PlanAsyncPipeline(async_draw);
   void* pipeline_handle;
   ID3D12RootSignature* root_signature;
@@ -2959,7 +2958,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
           render_target_cache_->depth_float24_convert_in_pixel_shader(),
       host_render_targets_used, pixel_shader && pixel_shader->writes_depth(),
       !host_render_targets_used || xenos_sample_positions_used_);
-  gviargs.SetupRegisterValues(regs, window_offset_tiles != 0);
+  gviargs.SetupRegisterValues(regs, window_offset_tiles != 0,
+                              pipeline_cache_->raw_clipping_supported());
 
   if (gviargs == previous_viewport_info_args_) {
     viewport_info = previous_viewport_info_;
@@ -3899,18 +3899,21 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     frame_open_ = true;
 
     // Log guest ZPD report stats every 100 frames.
-    if (GetZPDMode() != ZPDMode::kFake && cvars::occlusion_query_log &&
+    if (zpd_mode_ != ZPDMode::kFake && cvars::occlusion_query_log &&
         host_query_pool_ && host_query_pool_->capacity() &&
         frame_current_ - zpd_stats_.last_log_frame >= 100) {
       XELOGI(
           "Occlusion Query Stats (last 100 frames): "
           "ReportsQueued={}, ReportsRetired={}, SegBegun={}, SegEnded={}, "
           "PoolExhausted={}, Failed={}, SpeculativeCorrections={}, "
-          "RetiresAbandoned={}",
+          "RetiresAbandoned={}, StrictWaitsDelaying={}, "
+          "StrictWaitsDelayingMs={:.1f}",
           zpd_stats_.reports_queued, zpd_stats_.reports_retired,
           zpd_stats_.segments_begun, zpd_stats_.segments_ended,
           zpd_stats_.pool_exhausted, zpd_stats_.failed,
-          zpd_stats_.speculative_corrections, zpd_stats_.retires_abandoned);
+          zpd_stats_.speculative_corrections, zpd_stats_.retires_abandoned,
+          zpd_stats_.strict_waits_delaying,
+          zpd_stats_.strict_waits_delaying_us / 1000.0);
 
       zpd_stats_.Reset(frame_current_);
     }
@@ -4028,7 +4031,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     command_allocator->Reset();
     command_list_->Reset(command_allocator, nullptr);
     deferred_command_list_.Execute(command_list_, command_list_1_,
-                                   command_list_2_, command_list_9_);
+                                   command_list_9_);
     command_list_->Close();
     ID3D12CommandList* execute_command_lists[] = {command_list_};
     direct_queue->ExecuteCommandLists(1, execute_command_lists);
@@ -4423,6 +4426,15 @@ bool D3D12CommandProcessor::UpdateBindingsMesa(
     sc.ndc_offset[i] = viewport_info.ndc_offset[i];
   }
 
+  sc.guard_band_clip_adj[0] =
+      regs.Get<float>(XE_GPU_REG_PA_CL_GB_HORZ_CLIP_ADJ);
+  sc.guard_band_clip_adj[1] =
+      regs.Get<float>(XE_GPU_REG_PA_CL_GB_VERT_CLIP_ADJ);
+  sc.guard_band_discard_adj[0] =
+      regs.Get<float>(XE_GPU_REG_PA_CL_GB_HORZ_DISC_ADJ);
+  sc.guard_band_discard_adj[1] =
+      regs.Get<float>(XE_GPU_REG_PA_CL_GB_VERT_DISC_ADJ);
+
   // User clip planes.
   auto pa_cl_clip_cntl = regs.Get<reg::PA_CL_CLIP_CNTL>();
   if (!pa_cl_clip_cntl.clip_disable && pa_cl_clip_cntl.ucp_ena) {
@@ -4578,6 +4590,9 @@ bool D3D12CommandProcessor::UpdateBindingsMesa(
     if (active_query_is_rov_ && active_query_index_ != UINT32_MAX &&
         host_query_pool_->counter_initialized()) {
       zpd_fsi_counter_index = active_query_index_;
+      if (active_segment_.viz.generation != kInvalidVIZGeneration) {
+        zpd_fsi_counter_index |= XenosZPDReport::kCounterIndexFirstCopyOnly;
+      }
     }
     bool fsi_dirty = false;
     WriteFragmentShaderInterlockSystemConstants(
@@ -5011,10 +5026,7 @@ void D3D12CommandProcessor::EnsureQueryResources() {
                   render_target_cache_->GetPath() ==
                       RenderTargetCache::Path::kPixelShaderInterlock;
   zpd_rov_path_ = rov_path;
-  // The counter clear uses WriteBufferImmediate, so only initialize when
-  // CommandList2 is available.
-  bool can_initialize_counter =
-      (rov_path || zpd_hybrid_supported_) && command_list_2_;
+  bool can_initialize_counter = rov_path || zpd_hybrid_supported_;
 
   ID3D12Resource* counter_buffer = nullptr;
   uint32_t counter_capacity = 0;
@@ -5040,15 +5052,9 @@ void D3D12CommandProcessor::EnsureQueryResources() {
         ui::d3d12::D3D12DescriptorHeapPool::kHeapIndexInvalid;
   }
   if (zpd_rov_path_ && !IsQueryPoolReady()) {
-    if (!command_list_2_) {
-      XELOGW(
-          "ZPD/D3D12: Counter unavailable because CommandList2 is not "
-          "available; keeping counter index sentinel active");
-    } else {
-      XELOGW(
-          "ZPD/D3D12: Counter resources unavailable; keeping counter index "
-          "sentinel active");
-    }
+    XELOGW(
+        "ZPD/D3D12: Counter resources unavailable; keeping counter index "
+        "sentinel active");
   }
 }
 
@@ -5166,7 +5172,8 @@ bool D3D12CommandProcessor::CloseQuery(ReportHandle report_handle,
       }
       SubmitBarriers();
       if (active_query_is_rov_) {
-        // The ZPass lane of the counter slot, written by pixel shader atomics.
+        // The ZPass lane of the slot's first copy, which pixel shaders add to
+        // alone in VIZ segments.
         // The transition out of UNORDERED_ACCESS also orders the copy after
         // them. Only the low dword is written. The high one reads zero from
         // the buffer's zeroed creation, or from an earlier full resolve.

@@ -179,6 +179,10 @@ static bool exception_pointers_handler(HostExceptionReport* report) {
   DWORD except_code = report->ExceptionInfo->ExceptionRecord->ExceptionCode;
 
   std::string build = (
+#ifdef XE_BUILD_VERSION
+      XE_BUILD_VERSION
+      " - "
+#endif
 #ifdef XE_BUILD_IS_PR
       "PR#" XE_BUILD_PR_NUMBER " - "
 #endif
@@ -306,7 +310,10 @@ LONG _UnhandledExceptionFilter(_EXCEPTION_POINTERS* ExceptionInfo) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
   }
-  report.DisplayExceptionMessage();
+  // Unattended, the report in the log is all anyone will see.
+  if (!xe::IsUnattended()) {
+    report.DisplayExceptionMessage();
+  }
 
   return EXCEPTION_CONTINUE_SEARCH;
 }

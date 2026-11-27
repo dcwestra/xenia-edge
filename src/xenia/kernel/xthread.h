@@ -12,15 +12,11 @@
 
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
 #include "xenia/base/mutex.h"
-#if !XE_PLATFORM_WIN32
-#include <condition_variable>
-#include <csignal>
-#include <mutex>
-#endif
 #if XE_PLATFORM_WIN32
 #include <csetjmp>
 #endif
@@ -38,8 +34,6 @@ namespace cpu {
 class Function;
 }  // namespace cpu
 namespace kernel {
-
-constexpr fourcc_t kThreadSaveSignature = make_fourcc("THRD");
 
 class XEvent;
 
@@ -97,7 +91,7 @@ struct XAPC {
   // KAPC is 0x28(40) bytes? (what's passed to ExAllocatePoolWithTag)
   // This is 4b shorter than NT - looks like the reserved dword at +4 is gone.
   // NOTE: stored in guest memory.
-  uint16_t type;                     // +0
+  xe::be<uint16_t> type;             // +0
   uint8_t apc_mode;                  // +2
   uint8_t enqueued;                  // +3
   xe::be<uint32_t> thread_ptr;       // +4
@@ -306,7 +300,7 @@ struct X_KTHREAD {
   uint8_t wait_reason;                            // 0xA7
   TypedGuestPointer<X_KWAIT_BLOCK> wait_blocks;   // 0xA8
   uint8_t unk_AC[4];                              // 0xAC
-  int32_t apc_disable_count;                      // 0xB0
+  xe::be<int32_t> apc_disable_count;              // 0xB0
   xe::be<int32_t> quantum;                        // 0xB4
   uint8_t saturation_increment;                   // 0xB8
   uint8_t base_priority;                          // 0xB9
@@ -391,10 +385,9 @@ class XThread : public XObject, public cpu::Thread {
  public:
   static const XObject::Type kObjectType = XObject::Type::Thread;
 
-  static constexpr uint32_t kStackAddressRangeBegin = 0x70000000;
-  static constexpr uint32_t kStackAddressRangeEnd = 0x7F000000;
-
   static constexpr uint32_t kThreadKernelStackSize = 0xF0;
+  // A thread can't be suspended past this count.
+  static constexpr uint8_t kMaxSuspendCount = 0x7F;
 
   struct CreationParams {
     uint32_t stack_size;
@@ -405,7 +398,6 @@ class XThread : public XObject, public cpu::Thread {
     uint32_t guest_process;
   };
 
-  XThread(KernelState* kernel_state);
   XThread(KernelState* kernel_state, uint32_t stack_size,
           uint32_t xapi_thread_startup, uint32_t start_address,
           uint32_t start_context, uint32_t creation_flags, bool guest_thread,
@@ -474,9 +466,18 @@ class XThread : public XObject, public cpu::Thread {
   // cooperative scheduler's alertable waits to return USER_APC, the same way a
   // host alertable wait wakes on a queued APC.
   bool HasPendingUserApc();
-  // True if a kernel APC is queued that this thread can run now, below
-  // APC_LEVEL, outside a critical region and outside another kernel APC.
+  // True below APC_LEVEL, outside a critical region and outside another kernel
+  // APC, where a normal kernel APC can run.
+  bool KernelApcsUnmasked();
+  // True if a kernel APC is queued that this thread can run now.
   bool HasDeliverableKernelApc();
+  // True if this thread is suspended, unmasked as for a normal kernel APC and
+  // not terminating, and as the current fiber not holding the global critical
+  // region.
+  bool HasDeliverableSuspend();
+  // On the current fiber, stops for a deliverable suspend until resumed.
+  // Returns true if it stopped.
+  bool DeliverPendingSuspend();
 
   int32_t priority() const { return priority_; }
   int32_t QueryPriority();
@@ -506,6 +507,8 @@ class XThread : public XObject, public cpu::Thread {
   uint8_t active_cpu() const;
   void SetActiveCpu(uint8_t cpu_index);
 
+  // Slot n sits n + 1 words below the TLS pointer.
+  uint32_t TLSSlotAddress(uint32_t slot) const;
   bool GetTLSValue(uint32_t slot, uint32_t* value_out);
   bool SetTLSValue(uint32_t slot, uint32_t value);
 
@@ -518,18 +521,10 @@ class XThread : public XObject, public cpu::Thread {
   X_STATUS Delay(uint32_t processor_mode, uint32_t alertable,
                  uint64_t interval);
 
-#if !XE_PLATFORM_WIN32
-  // Performs self-suspension: increments suspend_count and blocks until
-  // another thread calls Resume() and suspend_count reaches 0.
-  // Returns the previous suspend_count value.
-  uint32_t SelfSuspend();
-#endif
-
   xe::threading::Thread* thread() { return thread_.get(); }
 
-  // The fiber this guest thread runs on when the cooperative scheduler is
-  // active (null under the host-thread model). Created in the fiber path of
-  // Create().
+  // The fiber this thread runs on, null for a host-routine thread with its own
+  // host thread. Created in Create().
   xe::threading::Fiber* fiber() const { return fiber_.get(); }
 
   // The fiber to dispatch, the user mode fiber while one is running.
@@ -614,16 +609,20 @@ class XThread : public XObject, public cpu::Thread {
     user_mode_ = std::move(user_mode);
   }
 
-  // A guest exception dispatch whose handler is running. One whose handler
-  // continued the thread elsewhere instead of returning stays here until the
-  // next dispatch on the thread finds it gone.
+  // Kernel code running guest code on the thread: an exception dispatch or an
+  // unwind calling a handler, or a handler calling a filter or finally block.
+  // One whose guest code continued the thread elsewhere instead of returning
+  // stays here until a later dispatch or unwind on the thread finds it gone.
   struct ExceptionDispatch {
-    // Where the handlers run, below the trap frame, and return to, which
-    // unwinding a handler's frame leads to.
+    enum class Kind : uint8_t { kDispatch, kUnwind, kCall };
+    // Where the guest code runs and returns to, which unwinding its frame
+    // leads to.
     uint32_t handler_sp;
     uint32_t handler_return;
-    // Its CONTEXT, EXCEPTION_RECORD and DISPATCHER_CONTEXT in the system heap.
+    // A dispatch's CONTEXT, EXCEPTION_RECORD and DISPATCHER_CONTEXT in the
+    // system heap, or an unwind's or a call's frame on the guest stack.
     uint32_t records;
+    Kind kind;
   };
   std::vector<ExceptionDispatch>& exception_dispatches() {
     return exception_dispatches_;
@@ -739,6 +738,15 @@ class XThread : public XObject, public cpu::Thread {
     uint64_t wait_deadline_ms = 0;  // absolute host uptime, 0 = none
     // Also re-poll on a deliverable kernel APC.
     bool wait_interruptible = true;
+    // Parked in a CooperativeWait, which a suspend unwinds while other parks
+    // stop in place.
+    bool object_wait = false;
+    // How a suspend landing on that park unwinds it, set under lock_.
+    // |suspend_poll_first|: a signal may have satisfied the wait first so it
+    // polls before stopping. |suspend_unwait|: it leaves without polling and
+    // waits again once resumed.
+    bool suspend_poll_first = false;
+    bool suspend_unwait = false;
     // What this fiber parked in and the guest handles it named. Handles, not
     // XObject pointers: safe to print if the object is released mid-dump, and
     // they key the signal ring. Without it a multi-object wait dumps obj=0x0.
@@ -767,14 +775,6 @@ class XThread : public XObject, public cpu::Thread {
   // to the host thread, or (for a fiber-backed thread) its exit event.
   xe::threading::WaitHandle* wait_handle() { return GetWaitHandle(); }
 
-  virtual bool Save(ByteStream* stream) override;
-  static object_ref<XThread> Restore(KernelState* kernel_state,
-                                     ByteStream* stream);
-
-  // Internal - do not use.
-  void AcquireMutantOnStartup(object_ref<XMutant> mutant) {
-    pending_mutant_acquires_.push_back(mutant);
-  }
   // Rebinds the per-host-thread TLS (XThread / cpu::Thread / ThreadState) so
   // |thread| becomes the current guest thread on the calling host thread. Used
   // on each fiber switch by the guest scheduler. Pass nullptr to clear.
@@ -790,14 +790,13 @@ class XThread : public XObject, public cpu::Thread {
   void RundownAPCs();
   cpu::ppc::PPCContext* ApcQueueContext();
 
-  // Publishes a new effective priority to the guest KTHREAD field, the host
-  // thread and the scheduler's ready queue. Every change goes through here.
+  // Publishes a new effective priority to the guest KTHREAD field and the
+  // scheduler's ready queue. Every change goes through here.
   void PublishPriority(int32_t priority);
 
   xe::threading::WaitHandle* GetWaitHandle() override {
-    // Under the cooperative scheduler there is no host thread, so a
-    // fiber-backed thread exposes an event signaled on exit for other threads
-    // to wait on.
+    // A fiber-backed thread has no host thread, so it exposes an event
+    // signaled on exit for other threads to wait on.
     if (thread_) {
       return thread_.get();
     }
@@ -805,8 +804,6 @@ class XThread : public XObject, public cpu::Thread {
   }
 
   CreationParams creation_params_ = {0};
-
-  std::vector<object_ref<XMutant>> pending_mutant_acquires_;
 
   uint32_t thread_id_ = 0;
   uint32_t tls_static_address_ = 0;
@@ -825,12 +822,6 @@ class XThread : public XObject, public cpu::Thread {
   int32_t base_priority_ = 0;  // priority floor — decay never goes below this
   int32_t boost_amount_ = 0;   // accumulated priority boost above base
 
-#if !XE_PLATFORM_WIN32
-  // Condition variable for thread self-suspension.
-  std::mutex suspend_mutex_;
-  std::condition_variable suspend_cv_;
-#endif
-
   // Reentry mechanism for fiber-based stack switching.
   // On Linux, C++ exceptions are used instead of setjmp/longjmp so that
   // destructors and RAII guards in host C++ frames are properly unwound.
@@ -840,8 +831,8 @@ class XThread : public XObject, public cpu::Thread {
   uint32_t reentry_address_ = 0;
 #endif
 
-  // When the cooperative scheduler is active, the guest thread runs on this
-  // fiber instead of its own host thread (cpu::Thread::thread_).
+  // The fiber this thread runs on instead of its own host thread
+  // (cpu::Thread::thread_), which only a host-routine thread has.
   std::unique_ptr<xe::threading::Fiber> fiber_;
   xe::threading::Fiber* active_fiber_ = nullptr;
   std::unique_ptr<UserMode> user_mode_;

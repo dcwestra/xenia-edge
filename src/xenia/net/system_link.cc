@@ -131,9 +131,8 @@ struct Inbox {
       if (error || packets.size() >= kInboxLimit) {
         return;
       }
-      if (packets.empty()) {
-        notify = ready;
-      }
+      // Every datagram signals, as on the console, not only the first.
+      notify = ready;
       packets.push_back(std::move(packet));
     }
     changed.notify_all();
@@ -1507,15 +1506,6 @@ class SystemLink::Stream final : public SystemLinkStream {
   bool Failed() const override {
     std::lock_guard lock(state_->mutex);
     return ConnectFailed(*stream_);
-  }
-
-  uint32_t ConnectError() const override {
-    std::lock_guard lock(state_->mutex);
-    if (!ConnectFailed(*stream_)) {
-      return 0;
-    }
-    return stream_->error ? stream_->error
-                          : FailureError(stream_->connection->failure());
   }
 
   void SetReadyCallback(std::function<void(uint32_t)> callback) override {

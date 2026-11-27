@@ -154,6 +154,15 @@ class XSocket : public XObject {
   X_STATUS IOControl(uint32_t cmd, uint8_t* arg_ptr);
 
   X_STATUS Connect(N_XSOCKADDR* name, int name_len);
+  // A non-blocking connect select hasn't seen finish, and one it saw fail.
+  bool connecting() const {
+    return connect_state_ == ConnectState::kConnecting;
+  }
+  bool connect_failed() const {
+    return connect_state_ == ConnectState::kFailed;
+  }
+  // Settles a connect select found ready, by the host's SO_ERROR.
+  void SettleConnect();
   X_STATUS Bind(N_XSOCKADDR_IN* name, int name_len);
   X_STATUS Listen(int backlog);
   X_STATUS GetSockName(N_XSOCKADDR_IN* name);
@@ -237,12 +246,26 @@ class XSocket : public XObject {
                            uint32_t* optlen);
   // How long a System Link call waits on this thread.
   uint32_t SystemLinkWait(RetryMode mode) const;
-  // SO_RCVTIMEO and SO_SNDTIMEO, which the retry loop enforces itself.
-  void KeepTimeout(uint32_t level, uint32_t optname, const void* optval_ptr,
-                   uint32_t optlen);
+  // Keeps what getsockopt reports and the retry loop enforces itself.
+  void KeepOption(uint32_t level, uint32_t optname, const void* optval_ptr,
+                  uint32_t optlen);
+  // An option getsockopt answers from what the guest set, none for the others.
+  std::optional<uint32_t> GuestOption(uint32_t level, uint32_t optname) const;
+  // An accepted socket starts with the options the guest set on the listener.
+  void TakeListenerOptions(XSocket& accepted) const;
+  // IPPROTO_IP's options, which keep Winsock 1's numbers.
+  X_STATUS SetIpOption(uint32_t optname, const void* optval_ptr,
+                       uint32_t optlen);
+  // IP_ADD_MEMBERSHIP and IP_DROP_MEMBERSHIP of a datagram socket.
+  X_STATUS SetMulticastGroup(bool join, uint32_t group);
   // Hooks the WSAEventSelect event and the overlapped receives up to the
   // System Link port or stream. select_mutex_ held.
   void ArmSystemLinkReady();
+  // Waits for the host socket to be ready for the selected FD_* events, one
+  // wait per direction. select_mutex_ held.
+  void ArmHostReady(uint32_t events);
+  // Waits again after the call that re-enables events, as Winsock does.
+  void ReenableHostEvents(uint32_t events);
 
   // Reads the local or remote address into xenia's own layout. Some hosts lay
   // sockaddr_in out differently.
@@ -254,6 +277,17 @@ class XSocket : public XObject {
 
   // Acceptor for listening TCP sockets (created when Listen() is called)
   std::optional<asio::ip::tcp::acceptor> acceptor_;
+  // Host options the guest set on the acceptor, which Connect sets again on the
+  // TCP socket it opens in the acceptor's place.
+  struct HostOption {
+    int level;
+    int name;
+    std::vector<char> value;
+  };
+  std::vector<HostOption> acceptor_options_;
+
+  enum class ConnectState { kNone, kConnecting, kFailed };
+  std::atomic<ConnectState> connect_state_{ConnectState::kNone};
 
   AddressFamily af_;    // Address family
   Type type_;           // Type (DGRAM/Stream/etc)
@@ -262,6 +296,9 @@ class XSocket : public XObject {
 
   bool bound_ = false;  // Explicitly bound to an IP address?
   uint16_t bound_port_ = 0;
+  // The address getsockname reports, the one bound to rather than the one a
+  // connection goes out from.
+  uint32_t bound_address_ = 0;
 
   bool broadcast_socket_ = false;
 
@@ -274,6 +311,16 @@ class XSocket : public XObject {
   // since the host option has no effect on a non-blocking socket.
   uint32_t recv_timeout_ms_ = 0;
   uint32_t send_timeout_ms_ = 0;
+  // What getsockopt reports, which a host socket doesn't keep as the guest set
+  // it and a System Link stream doesn't have.
+  uint32_t send_buffer_size_ = 0;
+  uint32_t receive_buffer_size_ = 0;
+  uint16_t linger_on_ = 0;
+  uint16_t linger_seconds_ = 60;
+  bool no_delay_ = false;
+  uint8_t ip_ttl_ = 64;
+  uint8_t ip_dscp_ = 0;
+  std::vector<uint32_t> multicast_groups_;
 
   // Last error code for this socket
   mutable uint32_t last_error_ = 0;
@@ -285,13 +332,16 @@ class XSocket : public XObject {
   std::mutex select_mutex_;
   object_ref<XEvent> selected_event_;
   uint32_t selected_event_flags_ = 0;
+  // A host wait pending for each direction. A wait of an earlier selection,
+  // with an older generation, leaves them alone.
+  bool host_read_wait_ = false;
+  bool host_write_wait_ = false;
+  uint32_t select_generation_ = 0;
 
   // A socket of a title running System Link.
   bool on_system_link_ = false;
   std::unique_ptr<net::SystemLinkPort> system_link_port_;
   std::unique_ptr<net::SystemLinkStream> system_link_stream_;
-  // SO_LINGER with a zero timeout so closing resets the connection.
-  bool linger_abort_ = false;
   // Set by shutdown(SD_RECEIVE or SD_BOTH). Receives fail with WSAESHUTDOWN.
   std::atomic<bool> receive_shutdown_{false};
   // Overlapped receives, shared with the port's ready callback that completes

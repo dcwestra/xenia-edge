@@ -406,6 +406,7 @@ void SpirvShaderTranslator::Reset() {
   main_rect_list_loop_vertex_index_next_ = spv::NoResult;
   var_main_kill_pixel_ = spv::NoResult;
   var_main_fsi_color_written_ = spv::NoResult;
+  var_main_fsi_zpd_samples_.fill(spv::NoResult);
   var_main_zpd_coverage_ = spv::NoResult;
   std::ranges::fill(output_fragment_data_, spv::NoResult);
   output_or_var_fragment_depth_ = spv::NoResult;
@@ -634,6 +635,8 @@ void SpirvShaderTranslator::StartTranslation() {
        type_uint_},
       {"vertex_base_index", offsetof(SystemConstants, vertex_base_index),
        type_int_},
+      {"guard_band_clip_adj", offsetof(SystemConstants, guard_band_clip_adj),
+       type_float2_},
       {"ndc_scale", offsetof(SystemConstants, ndc_scale), type_float3_},
       {"point_vertex_diameter_min",
        offsetof(SystemConstants, point_vertex_diameter_min), type_float_},
@@ -661,6 +664,8 @@ void SpirvShaderTranslator::StartTranslation() {
        type_uint_},
       {"edram_depth_base_dwords_scaled",
        offsetof(SystemConstants, edram_depth_base_dwords_scaled), type_uint_},
+      {"guard_band_discard_adj",
+       offsetof(SystemConstants, guard_band_discard_adj), type_float2_},
       {"color_exp_bias", offsetof(SystemConstants, color_exp_bias),
        type_float4_},
       {"edram_poly_offset_front_scale",
@@ -2006,8 +2011,7 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderBeforeMain() {
   struct_per_vertex_members.reserve(kOutputPerVertexMemberCount);
   struct_per_vertex_members.push_back(type_float4_);
 
-  // Only allocate ClipDistance/CullDistance arrays when user clip planes are
-  // actually enabled (count > 0).
+  // Only allocate the ClipDistance and CullDistance arrays that are written.
   uint32_t user_clip_plane_count =
       shader_modification.vertex.user_clip_plane_count;
   uint32_t clip_distance_count = 0;
@@ -2022,15 +2026,26 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderBeforeMain() {
   if (shader_modification.vertex.vertex_kill_and) {
     ++cull_distance_count;
   }
+  if (shader_modification.vertex.discard_band_cull_distances) {
+    cull_distance_count += 4;
+  }
+  if (shader_modification.vertex.z_clip_distances) {
+    clip_distance_count += 2;
+  }
+  if (shader_modification.vertex.guard_band_clip_distances) {
+    clip_distance_count += 4;
+  }
   output_per_vertex_clip_distance_member_index_ = 0;
   output_per_vertex_cull_distance_member_index_ = 0;
   if (clip_distance_count > 0) {
+    builder_->addCapability(spv::CapabilityClipDistance);
     output_per_vertex_clip_distance_member_index_ =
         static_cast<unsigned int>(struct_per_vertex_members.size());
     struct_per_vertex_members.push_back(builder_->makeArrayType(
         type_float_, builder_->makeUintConstant(clip_distance_count), 0));
   }
   if (cull_distance_count > 0) {
+    builder_->addCapability(spv::CapabilityCullDistance);
     output_per_vertex_cull_distance_member_index_ =
         static_cast<unsigned int>(struct_per_vertex_members.size());
     struct_per_vertex_members.push_back(builder_->makeArrayType(
@@ -3070,6 +3085,100 @@ void SpirvShaderTranslator::CompleteVertexOrTessEvalShaderInMain() {
     }
   }
 
+  // Clip and cull the raw position before the PA_CL_VTE_CNTL formats convert
+  // it. At the near and far planes the host clamps the depth instead of
+  // clipping the converted position. At the guard band the host viewport
+  // doesn't clip X and Y.
+  uint32_t raw_clip_distance_index =
+      shader_modification.vertex.user_clip_plane_cull ? 0
+                                                      : user_clip_plane_count;
+  auto store_raw_clip_distance = [&](spv::Id distance) {
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(builder_->makeIntConstant(
+        int(output_per_vertex_clip_distance_member_index_)));
+    id_vector_temp_.push_back(
+        builder_->makeIntConstant(int(raw_clip_distance_index++)));
+    builder_->createStore(distance, builder_->createAccessChain(
+                                        spv::StorageClassOutput,
+                                        output_per_vertex_, id_vector_temp_));
+  };
+  if (shader_modification.vertex.z_clip_distances ||
+      shader_modification.vertex.guard_band_clip_distances ||
+      shader_modification.vertex.discard_band_cull_distances) {
+    spv::Id guest_position_w =
+        builder_->createCompositeExtract(guest_position, type_float_, 3);
+    if (shader_modification.vertex.z_clip_distances) {
+      spv::Id guest_position_z =
+          builder_->createCompositeExtract(guest_position, type_float_, 2);
+      store_raw_clip_distance(shader_modification.vertex.z_clip_near_at_minus_w
+                                  ? builder_->createNoContractionBinOp(
+                                        spv::OpFAdd, type_float_,
+                                        guest_position_z, guest_position_w)
+                                  : guest_position_z);
+      store_raw_clip_distance(builder_->createNoContractionBinOp(
+          spv::OpFSub, type_float_, guest_position_w, guest_position_z));
+    }
+    if (shader_modification.vertex.guard_band_clip_distances) {
+      // -adj * W <= X, Y <= adj * W.
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(
+          builder_->makeIntConstant(kSystemConstantGuardBandClipAdj));
+      spv::Id guard_band_w = builder_->createNoContractionBinOp(
+          spv::OpVectorTimesScalar, type_float2_,
+          builder_->createLoad(builder_->createAccessChain(
+                                   spv::StorageClassUniform,
+                                   uniform_system_constants_, id_vector_temp_),
+                               spv::NoPrecision),
+          guest_position_w);
+      for (uint32_t i = 0; i < 2; ++i) {
+        spv::Id guest_position_axis =
+            builder_->createCompositeExtract(guest_position, type_float_, i);
+        spv::Id guard_band_w_axis =
+            builder_->createCompositeExtract(guard_band_w, type_float_, i);
+        store_raw_clip_distance(builder_->createNoContractionBinOp(
+            spv::OpFAdd, type_float_, guard_band_w_axis, guest_position_axis));
+        store_raw_clip_distance(builder_->createNoContractionBinOp(
+            spv::OpFSub, type_float_, guard_band_w_axis, guest_position_axis));
+      }
+    }
+    if (shader_modification.vertex.discard_band_cull_distances) {
+      // Primitives wholly past -adj * W or adj * W in X or Y are culled.
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(
+          builder_->makeIntConstant(kSystemConstantGuardBandDiscardAdj));
+      spv::Id discard_band_w = builder_->createNoContractionBinOp(
+          spv::OpVectorTimesScalar, type_float2_,
+          builder_->createLoad(builder_->createAccessChain(
+                                   spv::StorageClassUniform,
+                                   uniform_system_constants_, id_vector_temp_),
+                               spv::NoPrecision),
+          guest_position_w);
+      uint32_t cull_distance_index =
+          (shader_modification.vertex.user_clip_plane_cull
+               ? user_clip_plane_count
+               : 0) +
+          shader_modification.vertex.vertex_kill_and;
+      for (uint32_t i = 0; i < 2; ++i) {
+        spv::Id guest_position_axis =
+            builder_->createCompositeExtract(guest_position, type_float_, i);
+        spv::Id discard_band_w_axis =
+            builder_->createCompositeExtract(discard_band_w, type_float_, i);
+        for (spv::Op op : {spv::OpFAdd, spv::OpFSub}) {
+          id_vector_temp_.clear();
+          id_vector_temp_.push_back(builder_->makeIntConstant(
+              int(output_per_vertex_cull_distance_member_index_)));
+          id_vector_temp_.push_back(
+              builder_->makeIntConstant(int(cull_distance_index++)));
+          builder_->createStore(
+              builder_->createNoContractionBinOp(
+                  op, type_float_, discard_band_w_axis, guest_position_axis),
+              builder_->createAccessChain(spv::StorageClassOutput,
+                                          output_per_vertex_, id_vector_temp_));
+        }
+      }
+    }
+  }
+
   // Apply the NDC scale and offset for guest to host viewport transformation.
   id_vector_temp_.clear();
   id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantNdcScale));
@@ -3415,8 +3524,8 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
                               int(input_location));
       builder_->addDecoration(interpolator_per_vertex,
                               spv::DecorationPerVertexKHR);
-      // Note: Centroid decoration is not applicable with PerVertexKHR since
-      // we're doing manual interpolation.
+      // Centroid can't be decorated here, the barycentrics are clamped to the
+      // triangle in main instead.
       main_interface_.push_back(interpolator_per_vertex);
       ++input_location;
     }
@@ -3669,9 +3778,12 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
         "xe_var_fragment_depth", const_float_0_);
   }
 
-  if (DSV_IsApplyingPolygonOffset()) {
+  if (DSV_IsApplyingPolygonOffset() ||
+      (edram_fragment_shader_interlock_ && !current_shader().writes_depth())) {
     // The decal path needs the original triangle depth slope, not the slope of
-    // whichever lanes survive guest control flow or kill.
+    // whichever lanes survive guest control flow or kill. The late FSI depth /
+    // stencil test may run in the branch on main_fsi_sample_mask_ != 0, where
+    // the lanes outside the coverage are inactive, so take it here for FSI too.
     assert_true(input_fragment_coordinates_ != spv::NoResult);
     id_vector_temp_.clear();
     id_vector_temp_.push_back(builder_->makeIntConstant(2));
@@ -3694,8 +3806,10 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
     FSI_DepthStencilTest(false);
     if (zpd_full_counters_) {
       // Failed samples never reach the end of an early-tested shader, so
-      // they're counted here before the quad can be discarded.
-      FSI_AddMSAASamplesToZPD(false, true);
+      // they're counted here before the quad can be discarded. Not deferred,
+      // as a guest kill may still demote the invocation to a helper, whose
+      // atomics have no effect.
+      FSI_AddMSAASamplesToZPD(false, true, false);
     }
     if (!is_depth_only_fragment_shader_) {
       // Skip the rest of the shader if the whole quad (due to derivatives) has
@@ -3769,6 +3883,8 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
   // Using only bary.y and bary.z since we anchor on v0 (bary.x = 1 - y - z).
   spv::Id bary_y_vec4 = spv::NoResult;
   spv::Id bary_z_vec4 = spv::NoResult;
+  spv::Id bary_centroid_y_vec4 = spv::NoResult;
+  spv::Id bary_centroid_z_vec4 = spv::NoResult;
   if (use_barycentric_interpolation && interpolator_mask) {
     // Load barycentric coordinates once for all interpolators.
     spv::Id barycentric_coords =
@@ -3794,6 +3910,47 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
     id_vector_temp_util_.push_back(bary_z);
     bary_z_vec4 =
         builder_->createCompositeConstruct(type_float4_, id_vector_temp_util_);
+
+    // A shader can only have one barycentric input, at the center here, so
+    // centroid interpolators clamp the weights to the triangle rather than
+    // extrapolate past its edges. Inside it, the weights are used as they are.
+    if (shader_modification.pixel.interpolators_centroid & interpolator_mask) {
+      std::array<spv::Id, 3> bary;
+      std::array<spv::Id, 3> bary_clamped;
+      spv::Id bary_outside = spv::NoResult;
+      for (uint32_t i = 0; i < 3; ++i) {
+        bary[i] = builder_->createCompositeExtract(barycentric_coords,
+                                                   type_float_, i);
+        bary_clamped[i] = builder_->createBinBuiltinCall(
+            type_float_, ext_inst_glsl_std_450_, GLSLstd450FMax, bary[i],
+            const_float_0_);
+        spv::Id bary_negative = builder_->createBinOp(
+            spv::OpFOrdLessThan, type_bool_, bary[i], const_float_0_);
+        bary_outside = bary_outside != spv::NoResult
+                           ? builder_->createBinOp(spv::OpLogicalOr, type_bool_,
+                                                   bary_outside, bary_negative)
+                           : bary_negative;
+      }
+      spv::Id bary_clamped_sum = builder_->createBinOp(
+          spv::OpFAdd, type_float_,
+          builder_->createBinOp(spv::OpFAdd, type_float_, bary_clamped[0],
+                                bary_clamped[1]),
+          bary_clamped[2]);
+      std::array<spv::Id, 2> bary_centroid_vec4;
+      for (uint32_t i = 0; i < 2; ++i) {
+        id_vector_temp_util_.clear();
+        id_vector_temp_util_.resize(
+            4, builder_->createTriOp(
+                   spv::OpSelect, type_float_, bary_outside,
+                   builder_->createBinOp(spv::OpFDiv, type_float_,
+                                         bary_clamped[1 + i], bary_clamped_sum),
+                   bary[1 + i]));
+        bary_centroid_vec4[i] = builder_->createCompositeConstruct(
+            type_float4_, id_vector_temp_util_);
+      }
+      bary_centroid_y_vec4 = bary_centroid_vec4[0];
+      bary_centroid_z_vec4 = bary_centroid_vec4[1];
+    }
   }
 
   // The Xenos samples a pixel once, at its center. With resolution scaling, the
@@ -3888,10 +4045,14 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
         spv::Id d2 = builder_->createBinOp(spv::OpFSub, type_float4_, v2, v0);
 
         // Compute: v0 + d1*bary.y + d2*bary.z
-        spv::Id term1 =
-            builder_->createBinOp(spv::OpFMul, type_float4_, d1, bary_y_vec4);
-        spv::Id term2 =
-            builder_->createBinOp(spv::OpFMul, type_float4_, d2, bary_z_vec4);
+        bool centroid = (shader_modification.pixel.interpolators_centroid &
+                         (UINT32_C(1) << i)) != 0;
+        spv::Id term1 = builder_->createBinOp(
+            spv::OpFMul, type_float4_, d1,
+            centroid ? bary_centroid_y_vec4 : bary_y_vec4);
+        spv::Id term2 = builder_->createBinOp(
+            spv::OpFMul, type_float4_, d2,
+            centroid ? bary_centroid_z_vec4 : bary_z_vec4);
         spv::Id sum_terms =
             builder_->createBinOp(spv::OpFAdd, type_float4_, term1, term2);
         interpolated_value =

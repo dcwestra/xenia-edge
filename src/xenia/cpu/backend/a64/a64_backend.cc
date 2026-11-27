@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cstddef>
 #include <cstring>
 #include <utility>
@@ -39,9 +40,9 @@
 #include "xenia/cpu/backend/a64/a64_stack_layout.h"
 #include "xenia/cpu/backend/a64/a64_tracers.h"
 #include "xenia/cpu/backend/vrsqrte_table.h"
-#include "xenia/cpu/breakpoint.h"
 #include "xenia/cpu/mmio_handler.h"
 #include "xenia/cpu/ppc/ppc_context.h"
+#include "xenia/cpu/ppc/ppc_estimates.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/cpu/stack_walker.h"
 #include "xenia/cpu/thread_state.h"
@@ -119,8 +120,8 @@ A64HelperEmitter::A64HelperEmitter(A64Backend* backend,
 
 void A64HelperEmitter::EmitEnterHostFpcr() {
   // Host C code runs with the AAPCS64 default FPCR (round to nearest, no
-  // flush-to-zero), not the guest's scalar mode: mtfsf can put rounding
-  // controls or FPSCR.NI (FZ) in fpcr_fpu, which host code must not inherit.
+  // flush-to-zero), not the guest's: mtfsf can put rounding controls in
+  // fpcr_fpu and the VMX modes flush to zero, which host code must not inherit.
   Xbyak_aarch64::Label host_fpcr_ready;
   mrs(x11, 3, 3, 4, 4, 0);  // mrs x11, FPCR
   cbz(x11, host_fpcr_ready);
@@ -864,9 +865,7 @@ void* A64HelperEmitter::EmitFrsqrteHelper() {
   L(exp_nonmax);
   cbnz(x1, check_negative);
   cbz(x2, signed_inf);  // +-0 -> +-inf
-  // Denormal. Non-IEEE mode flushes it to +-0 and takes the same path.
-  ldr(w3, ptr(x19, static_cast<uint32_t>(offsetof(A64BackendContext, flags))));
-  tbnz(w3, kA64BackendNonIEEEMode, signed_inf);
+  // Denormal
   tbnz(x0, 63, ret_qnan);
   // Renormalize; the implicit 1 lands at bit 52 and the index masks it off.
   clz(x3, x2);
@@ -1786,158 +1785,36 @@ std::unique_ptr<GuestFunction> A64Backend::CreateGuestFunction(
   return std::make_unique<A64Function>(module, address);
 }
 
-namespace {
-
-// Encoding 31 reads as XZR in every branch form below.
-uint64_t ReadXReg(const HostThreadContext& ctx, uint32_t n) {
-  return n == 31 ? 0 : ctx.x[n];
-}
-
-bool TestCondition(uint64_t pstate, uint32_t cond) {
-  const bool n = (pstate >> 31) & 1;
-  const bool z = (pstate >> 30) & 1;
-  const bool c = (pstate >> 29) & 1;
-  const bool v = (pstate >> 28) & 1;
-  bool result;
-  switch (cond >> 1) {
-    case 0b000:
-      result = z;
-      break;
-    case 0b001:
-      result = c;
-      break;
-    case 0b010:
-      result = n;
-      break;
-    case 0b011:
-      result = v;
-      break;
-    case 0b100:
-      result = c && !z;
-      break;
-    case 0b101:
-      result = n == v;
-      break;
-    case 0b110:
-      result = (n == v) && !z;
-      break;
-    default:
-      result = true;
-      break;
-  }
-  if ((cond & 1) && cond != 0b1111) {
-    result = !result;
-  }
-  return result;
-}
-
-int64_t SignExtend(uint64_t value, uint32_t bits) {
-  const uint32_t shift = 64 - bits;
-  return int64_t(value << shift) >> shift;
-}
-
-}  // namespace
-
-uint64_t A64Backend::CalculateNextHostInstruction(ThreadDebugInfo* thread_info,
-                                                  uint64_t current_pc) {
-  const auto& ctx = thread_info->host_context;
-  const uint32_t insn = xe::load<uint32_t>(reinterpret_cast<void*>(current_pc));
-  const uint64_t next_pc = current_pc + 4;
-
-  // B  imm26  0b000101...    BL imm26  0b100101...
-  if ((insn & 0x7C000000) == 0x14000000) {
-    return current_pc + SignExtend(insn & 0x03FFFFFF, 26) * 4;
-  }
-  // B.cond / BC.cond imm19   0b01010100 imm19 x cond
-  if ((insn & 0xFF000000) == 0x54000000) {
-    if (!TestCondition(ctx.pstate, insn & 0xF)) {
-      return next_pc;
-    }
-    return current_pc + SignExtend((insn >> 5) & 0x7FFFF, 19) * 4;
-  }
-  // CBZ / CBNZ  sf 011010 op imm19 Rt
-  if ((insn & 0x7E000000) == 0x34000000) {
-    uint64_t value = ReadXReg(ctx, insn & 0x1F);
-    if (!(insn & 0x80000000)) {
-      value = uint32_t(value);
-    }
-    const bool nonzero = value != 0;
-    const bool is_cbnz = (insn >> 24) & 1;
-    if (nonzero != is_cbnz) {
-      return next_pc;
-    }
-    return current_pc + SignExtend((insn >> 5) & 0x7FFFF, 19) * 4;
-  }
-  // TBZ / TBNZ  b5 011011 op b40 imm14 Rt
-  if ((insn & 0x7E000000) == 0x36000000) {
-    const uint32_t bit = ((insn >> 26) & 0x20) | ((insn >> 19) & 0x1F);
-    const bool set = (ReadXReg(ctx, insn & 0x1F) >> bit) & 1;
-    const bool is_tbnz = (insn >> 24) & 1;
-    if (set != is_tbnz) {
-      return next_pc;
-    }
-    return current_pc + SignExtend((insn >> 5) & 0x3FFF, 14) * 4;
-  }
-  // BR / BLR / RET  Rn
-  if ((insn & 0xFFFFFC1F) == 0xD61F0000 || (insn & 0xFFFFFC1F) == 0xD63F0000 ||
-      (insn & 0xFFFFFC1F) == 0xD65F0000) {
-    return ReadXReg(ctx, (insn >> 5) & 0x1F);
-  }
-  return next_pc;
-}
-
-// ARM64 BRK #0 encoding (4 bytes, fixed-width instruction).
-static constexpr uint32_t kArm64Brk0 = 0xD4200000;
-
-void A64Backend::InstallBreakpoint(Breakpoint* breakpoint) {
-  breakpoint->ForEachHostAddress([this, breakpoint](uint64_t host_address) {
-    auto ptr = reinterpret_cast<void*>(host_address);
-    auto original_bytes = xe::load<uint32_t>(ptr);
-    assert_true(original_bytes != kArm64Brk0);
-    if (!code_cache()->PatchCode(ptr, &kArm64Brk0, sizeof(kArm64Brk0))) {
-      assert_always();
-      return;
-    }
-    breakpoint->backend_data().emplace_back(host_address, original_bytes);
-  });
-}
-
-void A64Backend::InstallBreakpoint(Breakpoint* breakpoint, Function* fn) {
-  assert_true(breakpoint->address_type() == Breakpoint::AddressType::kGuest);
-  assert_true(fn->is_guest());
-  auto guest_function = reinterpret_cast<cpu::GuestFunction*>(fn);
-  auto host_address =
-      guest_function->MapGuestAddressToMachineCode(breakpoint->guest_address());
-  if (!host_address) {
-    assert_always();
-    return;
-  }
-
-  auto ptr = reinterpret_cast<void*>(host_address);
-  auto original_bytes = xe::load<uint32_t>(ptr);
-  assert_true(original_bytes != kArm64Brk0);
-  if (!code_cache()->PatchCode(ptr, &kArm64Brk0, sizeof(kArm64Brk0))) {
-    assert_always();
-    return;
-  }
-  breakpoint->backend_data().emplace_back(host_address, original_bytes);
-}
-
-void A64Backend::UninstallBreakpoint(Breakpoint* breakpoint) {
-  for (auto& pair : breakpoint->backend_data()) {
-    auto ptr = reinterpret_cast<uint8_t*>(pair.first);
-    auto instruction_bytes = xe::load<uint32_t>(ptr);
-    assert_true(instruction_bytes == kArm64Brk0);
-    const uint32_t original_bytes = static_cast<uint32_t>(pair.second);
-    code_cache()->PatchCode(ptr, &original_bytes, sizeof(original_bytes));
-  }
-  breakpoint->backend_data().clear();
-}
-
 // The backend context is carved out of the allocation granule immediately
 // before the guest context, so it has to stay inside one page.
 static_assert(sizeof(A64BackendContext) < 4096,
               "A64BackendContext must fit in the granule before the context");
+
+// The vexptefp, vlogefp and fres tables, read back from ppc_estimates.cc:
+// vexptefp of i/2048 less the exponent of 2^0's, which leaves the implicit bit
+// at bit 23, vlogefp of 1 + i/2048 in 2048ths, and the mantissa of fres of
+// 1 + i/128
+struct EstimateTables {
+  uint32_t pow2[2048];
+  uint32_t log2[2048];
+  uint64_t fres[128];
+
+  EstimateTables() {
+    for (uint32_t i = 0; i < 2048; ++i) {
+      pow2[i] = ppc::EstimatePow2(std::bit_cast<uint32_t>(i / 2048.0f)) -
+                (126u << 23);
+      log2[i] = static_cast<uint32_t>(
+          std::bit_cast<float>(ppc::EstimateLog2(0x3F800000 | (i << 12))) *
+          2048.0f);
+    }
+    for (uint32_t i = 0; i < 128; ++i) {
+      fres[i] = std::bit_cast<uint64_t>(
+                    ppc::EstimateReciprocalSingle(1.0 + i / 128.0)) &
+                0x000FFFFFFFFFFFFFull;
+    }
+  }
+};
+static const EstimateTables estimate_tables;
 
 void A64Backend::InitializeBackendContext(void* ctx) {
   auto* a64_ctx = BackendContextForGuestContext(ctx);
@@ -1972,44 +1849,24 @@ void A64Backend::InitializeBackendContext(void* ctx) {
   a64_ctx->preempt_yield_handler_address =
       reinterpret_cast<uint64_t>(&preempt_yield_handler);
 
-  auto set_est = [&](int index, float value) {
-    uint32_t bits;
-    std::memcpy(&bits, &value, sizeof(bits));
-    for (int lane = 0; lane < 4; lane++) {
-      a64_ctx->est_consts[index][lane] = bits;
-    }
-  };
-  auto set_est_bits = [&](int index, uint32_t bits) {
-    for (int lane = 0; lane < 4; lane++) {
-      a64_ctx->est_consts[index][lane] = bits;
-    }
-  };
-  // 2^f on [0,1), max relative error 7.7e-08.
-  set_est(kEstExp2Poly + 0, 0.9999999266823865f);
-  set_est(kEstExp2Poly + 1, 0.6931530239113992f);
-  set_est(kEstExp2Poly + 2, 0.24015381838022493f);
-  set_est(kEstExp2Poly + 3, 0.055826172900559086f);
-  set_est(kEstExp2Poly + 4, 0.008989127362479102f);
-  set_est(kEstExp2Poly + 5, 0.0018777841277241077f);
-  // log2(1+u) on [0,1], max absolute error 1.85e-06.
-  set_est(kEstLog2Poly + 0, 1.8456866772102942e-06f);
-  set_est(kEstLog2Poly + 1, 1.4424953159391898f);
-  set_est(kEstLog2Poly + 2, -0.7177910762015521f);
-  set_est(kEstLog2Poly + 3, 0.4565216600899004f);
-  set_est(kEstLog2Poly + 4, -0.2765407398023532f);
-  set_est(kEstLog2Poly + 5, 0.12100223739860312f);
-  set_est(kEstLog2Poly + 6, -0.025691088797142478f);
-  set_est(kEstScale, 2048.0f);
-  set_est(kEstUnscale, 1.0f / 2048.0f);
-  set_est(kEstExp2Max, 128.0f);
-  set_est(kEstExp2Min, -126.0f);
-  set_est_bits(kEstOne, 0x3F800000u);
-  set_est_bits(kEstInt127, 127u);
-  set_est_bits(kEstPosInf, 0x7F800000u);
-  set_est_bits(kEstNegInf, 0xFF800000u);
-  set_est_bits(kEstQNaN, 0x7FC00000u);
-  set_est_bits(kEstMantissaMask, 0x007FFFFFu);
-  set_est_bits(kEstQuietBit, 0x00400000u);
+  a64_ctx->vexptefp_table_address =
+      reinterpret_cast<uint64_t>(estimate_tables.pow2);
+  a64_ctx->vlogefp_table_address =
+      reinterpret_cast<uint64_t>(estimate_tables.log2);
+  a64_ctx->fres_table_address =
+      reinterpret_cast<uint64_t>(estimate_tables.fres);
+
+  // Each segment's base and slope, read back from ppc::EstimateReciprocal at
+  // the segment's first two steps. The base always has bit 23 set, so the
+  // masked mantissas differ by exactly the slope.
+  for (uint32_t segment = 0; segment < 32; ++segment) {
+    uint32_t first = 0x3F800000 | (segment << 18);
+    uint32_t mantissa = ppc::EstimateReciprocal(first) & 0x7FFFFF;
+    uint32_t next = ppc::EstimateReciprocal(first | (1 << 9)) & 0x7FFFFF;
+    uint32_t base = 0x800000 | mantissa;
+    assert_zero(base & 0x1FF);
+    a64_ctx->vrefp_table[segment] = ((mantissa - next) << 16) | (base >> 9);
+  }
 
   a64_ctx->stackpoints = AllocStackpoints();
   a64_ctx->dynamic_call_cache = nullptr;
@@ -2040,6 +1897,9 @@ void A64Backend::DeinitializeBackendContext(void* ctx) {
 
 void A64Backend::InvalidateDynamicCalls(uint32_t start, uint32_t end) {
   auto global_lock = global_critical_region_.Acquire();
+  // Code with an indirection slot is reached through the slot, not the
+  // per-thread cache below, so the slot goes back to the resolve thunk.
+  code_cache()->ResetIndirectionRange(start, end);
   // A range with fewer instructions than the cache has slots only checks the
   // slots those hash to.
   const bool targeted = end - start < kA64DynamicCallCacheSize * 4;
@@ -2190,7 +2050,7 @@ std::string A64Backend::FormatSequenceKey(uint64_t key) const {
 
 void A64Backend::SetGuestRoundingMode(void* ctx, unsigned int mode) {
   A64BackendContext* bctx = BackendContextForGuestContext(ctx);
-  uint32_t control = mode & 7;
+  uint32_t control = mode & 3;
   uint32_t fpcr_val = kGuestFpcrTable[control];
 #if XE_COMPILER_MSVC
   // MSVC ARM64 intrinsic: ARM64_FPCR = register ID 0x5A20.
@@ -2199,14 +2059,8 @@ void A64Backend::SetGuestRoundingMode(void* ctx, unsigned int mode) {
   __asm__ volatile("msr fpcr, %0" : : "r"(static_cast<uint64_t>(fpcr_val)));
 #endif
   bctx->fpcr_fpu = fpcr_val;
-  if (control & 0b100) {
-    bctx->flags |= (1u << kA64BackendNonIEEEMode);
-  } else {
-    bctx->flags &= ~(1u << kA64BackendNonIEEEMode);
-  }
   auto ppc_context = reinterpret_cast<ppc::PPCContext*>(ctx);
   ppc_context->fpscr.bits.rn = control;
-  ppc_context->fpscr.bits.ni = control >> 2;
 }
 
 bool A64Backend::PopulatePseudoStacktrace(GuestPseudoStackTrace* st) {
@@ -2287,18 +2141,7 @@ bool A64Backend::ExceptionCallback(Exception* ex) {
       }
     }
   }
-  if (ex->code() != Exception::Code::kIllegalInstruction) {
-    return false;
-  }
-
-  // Verify it's our BRK #0 instruction.
-  auto instruction_bytes =
-      xe::load<uint32_t>(reinterpret_cast<void*>(ex->pc()));
-  if (instruction_bytes != kArm64Brk0) {
-    return false;
-  }
-
-  return processor()->OnThreadBreakpointHit(ex);
+  return false;
 }
 
 }  // namespace a64

@@ -9,10 +9,13 @@
 
 #include "xenia/cpu/backend/a64/a64_sequences.h"
 
+#include <bit>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 #include <type_traits>
+#include <vector>
 
 #include "xenia/base/byte_order.h"
 #include "xenia/base/clock.h"
@@ -28,6 +31,7 @@
 #include "xenia/cpu/cpu_flags.h"
 #include "xenia/cpu/hir/instr.h"
 #include "xenia/cpu/ppc/ppc_context.h"
+#include "xenia/cpu/ppc/ppc_estimates.h"
 
 namespace xe {
 namespace cpu {
@@ -733,17 +737,59 @@ static void EmitTakeNanOperand(A64Emitter& e, const Reg& dest,
   e.b(done);
 }
 
+// The ARM result of a binary operation is already PowerPC's unless the first
+// operand can be a quiet NaN while the second is a signalling one. Only then
+// does EmitFpBinOpWithPpcNan test the result for a NaN.
+static bool FpBinOpNeedsPpcNanFixup(const hir::Instr* instr) {
+  const hir::Value* v1 = instr->src1.value;
+  const hir::Value* v2 = instr->src2.value;
+  return v1 != v2 && !IsNeverSignalingNan(v2) && !IsNonNanConstant(v1);
+}
+
+// Fuses the TO_SINGLE_KEEP_NAN right after an F64 operation that reads its
+// result (see A64Emitter::MarkFusedToSingle). Only for operations whose every
+// NaN result leaves through exits bound with BindNanExit, and before any is.
+static void FuseToSingleIfNext(A64Emitter& e, const hir::Instr* instr) {
+  const hir::Instr* next = instr->next;
+  if (!next || next->GetOpcodeNum() != hir::OPCODE_TO_SINGLE ||
+      !(next->flags & TO_SINGLE_KEEP_NAN) || next->src1.value != instr->dest) {
+    return;
+  }
+  assert_null(e.fused_to_single());
+  e.MarkFusedToSingle(next, &e.NewCachedLabel());
+}
+
+// Binds exit, which an F64 operation's tails return to with a NaN in the
+// register dest_idx. Fused with a TO_SINGLE, exit starts a stub instead that
+// hands the NaN to the TO_SINGLE's dest and jumps past its conversion, while
+// the hot path, which has no NaN, runs on into it. Neither touches w7.
+static void BindNanExit(A64Emitter& e, Xbyak_aarch64::Label& exit,
+                        int dest_idx) {
+  const hir::Instr* to_single = e.fused_to_single();
+  if (!to_single) {
+    e.LKeepingRemapBound(exit);
+    return;
+  }
+  DReg to_single_dest(0);
+  A64Emitter::SetupReg(to_single->dest, to_single_dest);
+  const DReg dest(dest_idx);
+  Xbyak_aarch64::Label* past = e.fused_to_single_exit();
+  e.AddToTail([&exit, dest, to_single_dest, past](A64Emitter& e,
+                                                  Xbyak_aarch64::Label&) {
+    e.L(exit);
+    if (to_single_dest.getIdx() != dest.getIdx()) {
+      e.fmov(to_single_dest, dest);
+    }
+    e.b(*past);
+  });
+}
+
 template <typename Reg>
 static void EmitFpBinOpWithPpcNan(A64Emitter& e, const hir::Instr* instr,
                                   std::type_identity_t<Reg> dest, Reg s1,
                                   Reg s2, FpBinOp op) {
   e.ChangeFpcrMode(FPCRMode::Fpu);
-  // The ARM result is already PowerPC's unless the first operand can be a
-  // quiet NaN while the second is a signalling one.
-  const hir::Value* v1 = instr->src1.value;
-  const hir::Value* v2 = instr->src2.value;
-  const bool fixup =
-      v1 != v2 && !IsNeverSignalingNan(v2) && !IsNonNanConstant(v1);
+  const bool fixup = FpBinOpNeedsPpcNanFixup(instr);
 
   // Preserve the first source if the op overwrites it: the fixup reads it.
   Reg t1 = s1;
@@ -779,7 +825,77 @@ static void EmitFpBinOpWithPpcNan(A64Emitter& e, const hir::Instr* instr,
       });
   e.fcmp(dest, dest);
   e.b(VS, nan_result);
-  e.LKeepingRemapBound(done);
+  BindNanExit(e, done, dest.getIdx());
+}
+// Branches to target if an operand is nonzero and outside [2^-149, 2^128), or
+// infinite or NaN: the bits are compared without the sign, shifted up by one.
+// Clobbers x0-x2.
+static void BranchIfOutsideSingleRange(A64Emitter& e, const DReg* operands,
+                                       size_t count,
+                                       Xbyak_aarch64::Label& target) {
+  e.mov(e.x1, static_cast<uint64_t>(0x6D40000000000000ull));  // 2^-149
+  e.mov(e.x2, static_cast<uint64_t>(0x22A0000000000000ull));  // To 2^128
+  for (size_t k = 0; k < count; ++k) {
+    auto& next = e.NewCachedLabel();
+    e.fmov(e.x0, operands[k]);
+    e.add(e.x0, e.x0, e.x0);
+    e.cbz(e.x0, next);
+    e.sub(e.x0, e.x0, e.x1);
+    e.cmp(e.x0, e.x2);
+    e.b(HS, target);
+    e.LKeepingRemapBound(next);
+  }
+}
+
+// ARITHMETIC_SINGLE_RANGE, ahead of the operation: the default QNaN if an
+// operand is nonzero and outside [2^-149, 2^128) and none is infinite or NaN,
+// see PPCHIRBuilder::SingleOutOfRangeOperand. A branch rather than a select
+// keeps the check out of the result's dependency chain. Only the operands that
+// might be out of range are tested, and none at all when every one is known to
+// be in it: an infinite or NaN operand only matters once another is out of
+// range, and the tail tests all of them for that. operands are instr's sources
+// in order. Returns a label to bind after the operation, if one's needed. The
+// tail makes no call, so both labels keep the remap bound.
+static Xbyak_aarch64::Label* EmitSingleRangeCheck(
+    A64Emitter& e, const hir::Instr* instr, DReg dest,
+    std::initializer_list<DReg> operands) {
+  if (!(instr->flags & ARITHMETIC_SINGLE_RANGE)) {
+    return nullptr;
+  }
+  std::vector<DReg> regs(operands);
+  const hir::Value* sources[3] = {
+      instr->src1.value, instr->src2.value,
+      regs.size() > 2 ? instr->src3.value : nullptr};
+  std::vector<DReg> unknown;
+  for (size_t n = 0; n < regs.size(); ++n) {
+    if (!sources[n]->IsInSingleRange()) {
+      unknown.push_back(regs[n]);
+    }
+  }
+  if (unknown.empty()) {
+    return nullptr;
+  }
+  // Ahead of the branch, as the quirk skips the operation that would do this
+  e.ChangeFpcrMode(FPCRMode::Fpu);
+  auto& done = e.NewCachedLabel();
+  auto& resume = e.NewCachedLabel();
+  auto& out_of_range = e.AddToTail(
+      [dest, regs, &done, &resume](A64Emitter& e, Xbyak_aarch64::Label& tail) {
+        // An infinite or NaN operand takes precedence
+        e.mov(e.x1, static_cast<uint64_t>(0xFFE0000000000000ull));
+        for (const DReg& reg : regs) {
+          e.fmov(e.x0, reg);
+          e.add(e.x0, e.x0, e.x0);
+          e.cmp(e.x0, e.x1);
+          e.b(HS, resume);
+        }
+        e.mov(e.x0, static_cast<uint64_t>(0x7FF8000000000000ull));
+        e.fmov(dest, e.x0);
+        e.b(done);
+      });
+  BranchIfOutsideSingleRange(e, unknown.data(), unknown.size(), out_of_range);
+  e.LKeepingRemapBound(resume);
+  return &done;
 }
 
 // PPC FMA NaN selection (PowerISA 4.6.7.2):
@@ -834,7 +950,7 @@ static void EmitFmaWithPpcNan(A64Emitter& e, std::type_identity_t<Reg> dest,
   if (negate) {
     e.fneg(dest, dest);
   }
-  e.LKeepingRemapBound(done);
+  BindNanExit(e, done, dest.getIdx());
 }
 
 struct ADD_F32 : Sequence<ADD_F32, I<OPCODE_ADD, F32Op, F32Op, F32Op>> {
@@ -884,7 +1000,14 @@ struct ADD_F64 : Sequence<ADD_F64, I<OPCODE_ADD, F64Op, F64Op, F64Op>> {
       e.mov(e.x0, c.u);
       e.fmov(e.d1, e.x0);
     }
+    if (FpBinOpNeedsPpcNanFixup(i.instr)) {
+      FuseToSingleIfNext(e, i.instr);
+    }
+    auto* range_done = EmitSingleRangeCheck(e, i.instr, i.dest, {s1, s2});
     EmitFpBinOpWithPpcNan(e, i.instr, i.dest, s1, s2, FpBinOp::Add);
+    if (range_done) {
+      BindNanExit(e, *range_done, i.dest.reg().getIdx());
+    }
   }
 };
 struct ADD_V128 : Sequence<ADD_V128, I<OPCODE_ADD, V128Op, V128Op, V128Op>> {
@@ -1197,7 +1320,14 @@ struct SUB_F64 : Sequence<SUB_F64, I<OPCODE_SUB, F64Op, F64Op, F64Op>> {
       e.mov(e.x0, c.u);
       e.fmov(e.d1, e.x0);
     }
+    if (FpBinOpNeedsPpcNanFixup(i.instr)) {
+      FuseToSingleIfNext(e, i.instr);
+    }
+    auto* range_done = EmitSingleRangeCheck(e, i.instr, i.dest, {s1, s2});
     EmitFpBinOpWithPpcNan(e, i.instr, i.dest, s1, s2, FpBinOp::Sub);
+    if (range_done) {
+      BindNanExit(e, *range_done, i.dest.reg().getIdx());
+    }
   }
 };
 struct SUB_V128 : Sequence<SUB_V128, I<OPCODE_SUB, V128Op, V128Op, V128Op>> {
@@ -1442,7 +1572,14 @@ struct MUL_F64 : Sequence<MUL_F64, I<OPCODE_MUL, F64Op, F64Op, F64Op>> {
       e.mov(e.x0, c.u);
       e.fmov(e.d1, e.x0);
     }
+    if (FpBinOpNeedsPpcNanFixup(i.instr)) {
+      FuseToSingleIfNext(e, i.instr);
+    }
+    auto* range_done = EmitSingleRangeCheck(e, i.instr, i.dest, {s1, s2});
     EmitFpBinOpWithPpcNan(e, i.instr, i.dest, s1, s2, FpBinOp::Mul);
+    if (range_done) {
+      BindNanExit(e, *range_done, i.dest.reg().getIdx());
+    }
   }
 };
 struct MUL_V128 : Sequence<MUL_V128, I<OPCODE_MUL, V128Op, V128Op, V128Op>> {
@@ -1562,6 +1699,9 @@ struct DIV_F64 : Sequence<DIV_F64, I<OPCODE_DIV, F64Op, F64Op, F64Op>> {
       c.d = i.src2.constant();
       e.mov(e.x0, c.u);
       e.fmov(e.d1, e.x0);
+    }
+    if (FpBinOpNeedsPpcNanFixup(i.instr)) {
+      FuseToSingleIfNext(e, i.instr);
     }
     EmitFpBinOpWithPpcNan(e, i.instr, i.dest, s1, s2, FpBinOp::Div);
   }
@@ -2246,46 +2386,7 @@ struct SHL_I64 : Sequence<SHL_I64, I<OPCODE_SHL, I64Op, I64Op, I8Op>> {
     }
   }
 };
-struct SHL_V128 : Sequence<SHL_V128, I<OPCODE_SHL, V128Op, V128Op, I8Op>> {
-  static void Emit(A64Emitter& e, const EmitArgType& i) {
-    // PPC 128-bit SHL by N bits (0-7). The value is stored as 4 word-swapped
-    // 32-bit lanes. Carries flow from higher NEON lanes to lower:
-    //   lane[i] = (lane[i] << N) | (lane[i+1] >> (32-N))
-    int s = SrcVReg(e, i.src1, 0);
-    int d = i.dest.reg().getIdx();
-    if (s < 4) {
-      // A constant landed in the scratch bank the shifts below clobber.
-      e.mov(VReg(3).b16, VReg(s).b16);
-      s = 3;
-    }
-    if (i.src2.is_constant) {
-      uint8_t sh = i.src2.constant() & 0x7;
-      if (sh == 0) {
-        if (d != s) {
-          e.mov(VReg(d).b16, VReg(s).b16);
-        }
-        return;
-      }
-      // Read carry before writing result (handles dest==src aliasing).
-      e.ushr(VReg(0).s4, VReg(s).s4, 32 - sh);
-      e.shl(VReg(d).s4, VReg(s).s4, sh);
-    } else {
-      // Variable shift: mask to 0-7, splat, use ushl.
-      e.and_(e.w0, WReg(i.src2.reg().getIdx()), 7);
-      e.dup(VReg(1).s4, e.w0);
-      e.movi(VReg(2).s4, 32);
-      e.sub(VReg(2).s4, VReg(2).s4, VReg(1).s4);   // 32-N
-      e.neg(VReg(2).s4, VReg(2).s4);               // -(32-N) for right shift
-      e.ushl(VReg(0).s4, VReg(s).s4, VReg(2).s4);  // carry: lane >> (32-N)
-      e.ushl(VReg(d).s4, VReg(s).s4, VReg(1).s4);  // result: lane << N
-    }
-    // Shift carries from lane i+1 to lane i; lane 3 gets zero.
-    e.movi(VReg(1).s4, 0);
-    e.ext(VReg(0).b16, VReg(0).b16, VReg(1).b16, 4);
-    e.orr(VReg(d).b16, VReg(d).b16, VReg(0).b16);
-  }
-};
-EMITTER_OPCODE_TABLE(OPCODE_SHL, SHL_I8, SHL_I16, SHL_I32, SHL_I64, SHL_V128);
+EMITTER_OPCODE_TABLE(OPCODE_SHL, SHL_I8, SHL_I16, SHL_I32, SHL_I64);
 
 // ============================================================================
 // OPCODE_SHR (logical shift right)
@@ -2388,46 +2489,7 @@ struct SHR_I64 : Sequence<SHR_I64, I<OPCODE_SHR, I64Op, I64Op, I8Op>> {
     }
   }
 };
-struct SHR_V128 : Sequence<SHR_V128, I<OPCODE_SHR, V128Op, V128Op, I8Op>> {
-  static void Emit(A64Emitter& e, const EmitArgType& i) {
-    // PPC 128-bit SHR by N bits (0-7). Carries flow from lower NEON lanes
-    // to higher:
-    //   lane[i] = (lane[i] >> N) | (lane[i-1] << (32-N))
-    int s = SrcVReg(e, i.src1, 0);
-    int d = i.dest.reg().getIdx();
-    if (s < 4) {
-      // A constant landed in the scratch bank the shifts below clobber.
-      e.mov(VReg(3).b16, VReg(s).b16);
-      s = 3;
-    }
-    if (i.src2.is_constant) {
-      uint8_t sh = i.src2.constant() & 0x7;
-      if (sh == 0) {
-        if (d != s) {
-          e.mov(VReg(d).b16, VReg(s).b16);
-        }
-        return;
-      }
-      // Read carry before writing result (handles dest==src aliasing).
-      e.shl(VReg(0).s4, VReg(s).s4, 32 - sh);
-      e.ushr(VReg(d).s4, VReg(s).s4, sh);
-    } else {
-      // Variable shift: mask to 0-7, splat, use ushl.
-      e.and_(e.w0, WReg(i.src2.reg().getIdx()), 7);
-      e.dup(VReg(1).s4, e.w0);
-      e.movi(VReg(2).s4, 32);
-      e.sub(VReg(2).s4, VReg(2).s4, VReg(1).s4);   // 32-N
-      e.ushl(VReg(0).s4, VReg(s).s4, VReg(2).s4);  // carry: lane << (32-N)
-      e.neg(VReg(1).s4, VReg(1).s4);               // -N for right shift
-      e.ushl(VReg(d).s4, VReg(s).s4, VReg(1).s4);  // result: lane >> N
-    }
-    // Shift carries from lane i-1 to lane i; lane 0 gets zero.
-    e.movi(VReg(1).s4, 0);
-    e.ext(VReg(0).b16, VReg(1).b16, VReg(0).b16, 12);
-    e.orr(VReg(d).b16, VReg(d).b16, VReg(0).b16);
-  }
-};
-EMITTER_OPCODE_TABLE(OPCODE_SHR, SHR_I8, SHR_I16, SHR_I32, SHR_I64, SHR_V128);
+EMITTER_OPCODE_TABLE(OPCODE_SHR, SHR_I8, SHR_I16, SHR_I32, SHR_I64);
 
 // ============================================================================
 // OPCODE_SHA (arithmetic shift right)
@@ -3415,13 +3477,14 @@ EMITTER_OPCODE_TABLE(OPCODE_CAST, CAST_I32_F32, CAST_I64_F64, CAST_F32_I32,
 // ============================================================================
 struct DID_SATURATE
     : Sequence<DID_SATURATE, I<OPCODE_DID_SATURATE, I8Op, V128Op>> {
+  // The PPC front end passes the lanes that saturated (see SetSatIfAny) so
+  // this is whether any is nonzero
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    // TODO(has207): Implement saturation tracking. ARM64 NEON saturating
-    // ops (sqadd/uqadd/etc.) set FPSR.QC — clear it before the saturating
-    // op, then read it here with mrs. Requires coordinating with all
-    // ARITHMETIC_SATURATE vector paths. Always returns 0 for now (same as
-    // x64 backend).
-    e.mov(i.dest, 0);
+    int s = SrcVReg(e, i.src1, 0);
+    e.umaxv(SReg(0), VReg(s).s4);
+    e.umov(e.w0, VReg(0).s4[0]);
+    e.cmp(e.w0, 0);
+    e.cset(i.dest, Xbyak_aarch64::NE);
   }
 };
 EMITTER_OPCODE_TABLE(OPCODE_DID_SATURATE, DID_SATURATE);
@@ -3488,12 +3551,13 @@ struct MAX_V128 : Sequence<MAX_V128, I<OPCODE_MAX, V128Op, V128Op, V128Op>> {
 EMITTER_OPCODE_TABLE(OPCODE_MAX, MAX_F32, MAX_F64, MAX_V128);
 
 // ============================================================================
-// OPCODE_DENORMAL_QUIRK
+// OPCODE_SINGLE_RANGE_QUIRK
 // ============================================================================
-// quirk = (any operand denormal) && (all operands finite), as i8 0/1.
-struct DENORMAL_QUIRK
-    : Sequence<DENORMAL_QUIRK,
-               I<OPCODE_DENORMAL_QUIRK, I8Op, F64Op, F64Op, F64Op>> {
+// quirk = (any operand nonzero and outside [2^-149, 2^128)) && (all operands
+// finite), as i8 0/1.
+struct SINGLE_RANGE_QUIRK
+    : Sequence<SINGLE_RANGE_QUIRK,
+               I<OPCODE_SINGLE_RANGE_QUIRK, I8Op, F64Op, F64Op, F64Op>> {
   template <typename SRC>
   static int CollectOperands(A64Emitter& e, const SRC& s1, const SRC& s2,
                              const SRC& s3, DReg* out) {
@@ -3564,26 +3628,14 @@ struct DENORMAL_QUIRK
           emit_finite_check(e);
         });
 
-    // Once LO, ccmp writes NZCV = 0 (still LO), so the verdict sticks.
-    e.mov(e.x1, 0x000FFFFFFFFFFFFFull);
-    for (int k = 0; k < n; ++k) {
-      e.fmov(e.x0, ops[k]);
-      e.and_(e.x0, e.x0, 0x7FFFFFFFFFFFFFFFull);
-      e.sub(e.x0, e.x0, 1);
-      if (k == 0) {
-        e.cmp(e.x0, e.x1);
-      } else {
-        e.ccmp(e.x0, e.x1, 0, HS);
-      }
-    }
-    // The tail can sit beyond b.cond's reach; b() emits the range-safe form.
-    e.b(LO, slow_path);
+    // Infinities and NaNs take the slow path too, which sorts them out.
+    BranchIfOutsideSingleRange(e, ops, n, slow_path);
     // movz form: mov(dest, WReg(31)) would assemble as the SP-alias ADD.
     e.mov(i.dest, uint64_t(0));
     e.LKeepingRemapBound(done);
   }
 };
-EMITTER_OPCODE_TABLE(OPCODE_DENORMAL_QUIRK, DENORMAL_QUIRK);
+EMITTER_OPCODE_TABLE(OPCODE_SINGLE_RANGE_QUIRK, SINGLE_RANGE_QUIRK);
 
 // MIN has signed semantics (HIR builder constant-folds using CompareSLT).
 // I8/I16 need sign-extension; all need signed condition code (LT not LO).
@@ -3750,6 +3802,11 @@ struct CONVERT_I32_F64
       e.frintx(e.d0, src);
       e.fcvtzs(i.dest, e.d0);
     }
+    // fcvtzs saturates as PPC does, but gives 0 for a NaN, where PPC gives
+    // 0x80000000
+    e.fcmp(src, src);
+    e.mov(e.w0, static_cast<uint64_t>(0x80000000u));
+    e.csel(i.dest, e.w0, i.dest, VS);
   }
 };
 struct CONVERT_I64_F64
@@ -3774,6 +3831,10 @@ struct CONVERT_I64_F64
       e.frintx(e.d0, src);
       e.fcvtzs(i.dest, e.d0);
     }
+    // As for CONVERT_I32_F64: a NaN gives 0x8000000000000000
+    e.fcmp(src, src);
+    e.mov(e.x0, static_cast<uint64_t>(0x8000000000000000ull));
+    e.csel(i.dest, e.x0, i.dest, VS);
   }
 };
 struct CONVERT_F32_I32
@@ -4415,8 +4476,13 @@ struct MUL_ADD_F64
       e.mov(e.x0, c.u);
       e.fmov(e.d2, e.x0);
     }
+    FuseToSingleIfNext(e, i.instr);
+    auto* range_done = EmitSingleRangeCheck(e, i.instr, i.dest, {s1, s2, s3});
     EmitFmaWithPpcNan(e, i.dest, s1, s2, s3, /*is_sub=*/false,
                       i.instr->flags & ARITHMETIC_NEGATE_RESULT);
+    if (range_done) {
+      BindNanExit(e, *range_done, i.dest.reg().getIdx());
+    }
   }
 };
 // Picks FixupVmxNan_V128_Fma's scratch registers: tmp is live across the
@@ -4521,8 +4587,13 @@ struct MUL_SUB_F64
       e.mov(e.x0, c.u);
       e.fmov(e.d2, e.x0);
     }
+    FuseToSingleIfNext(e, i.instr);
+    auto* range_done = EmitSingleRangeCheck(e, i.instr, i.dest, {s1, s2, s3});
     EmitFmaWithPpcNan(e, i.dest, s1, s2, s3, /*is_sub=*/true,
                       i.instr->flags & ARITHMETIC_NEGATE_RESULT);
+    if (range_done) {
+      BindNanExit(e, *range_done, i.dest.reg().getIdx());
+    }
   }
 };
 struct MUL_SUB_V128
@@ -4537,44 +4608,47 @@ EMITTER_OPCODE_TABLE(OPCODE_MUL_SUB, MUL_SUB_F64, MUL_SUB_V128);
 // ============================================================================
 // OPCODE_POW2
 // ============================================================================
-static void LoadEstConst(A64Emitter& e, int vreg_idx, int const_idx) {
-  e.ldr(QReg(vreg_idx),
-        ptr(e.GetBackendCtxReg(),
-            static_cast<int32_t>(offsetof(A64BackendContext, est_consts) +
-                                 const_idx * 16)));
-}
-
-// Horner in v2/v3 with the variable in v1, alternating so each fmla has its
-// accumulator in the other register. Returns the register holding the result.
-static int EmitEstPoly(A64Emitter& e, int first, int count) {
-  int acc = 2;
-  LoadEstConst(e, acc, first + count - 1);
-  for (int k = count - 2; k >= 0; k--) {
-    const int next = acc ^ 1;  // 2 <-> 3
-    LoadEstConst(e, next, first + k);
-    e.fmla(VReg(next).s4, VReg(acc).s4, VReg(1).s4);
-    acc = next;
+// vrefp, vexptefp and vlogefp are table driven, and NEON has no gather. Each
+// lane's index (width bits from lsb) comes out through x17 (lanes 0 and 1) and
+// x0 (lanes 2 and 3); its entry, from the table at x16, is loaded into a GPR,
+// paired with its neighbor and moved into v1. Only v1 is written, so v0 can
+// carry a value across. Their only FP op is the NaN test, which no FPCR mode
+// changes, so the mode is left alone.
+static void GatherEstimateEntries(A64Emitter& e, int lsb, int width) {
+  for (int half = 0; half < 2; ++half) {
+    const XReg& lanes = half ? e.x0 : e.x17;
+    e.ubfx(e.x1, lanes, lsb, width);
+    e.ldr(e.w2, ptr(e.x16, e.x1, LSL, 2));
+    e.ubfx(e.x1, lanes, 32 + lsb, width);
+    e.ldr(e.w3, ptr(e.x16, e.x1, LSL, 2));
+    e.orr(e.x2, e.x2, e.x3, LSL, 32);
+    if (half) {
+      e.ins(VReg(1).d2[1], e.x2);
+    } else {
+      e.fmov(DReg(1), e.x2);
+    }
   }
-  return acc;
 }
 
-// Snap onto the guest's 2^-11 estimate grid. Not cosmetic: it is what keeps
-// 2^0 == 1.0 and log2(2^n) == n exact once the math is a polynomial.
-static void EmitEstGridSnap(A64Emitter& e, int r, int tmp) {
-  LoadEstConst(e, tmp, kEstScale);
-  e.fmul(VReg(r).s4, VReg(r).s4, VReg(tmp).s4);
-  e.frintn(VReg(r).s4, VReg(r).s4);
-  LoadEstConst(e, tmp, kEstUnscale);
-  e.fmul(VReg(r).s4, VReg(r).s4, VReg(tmp).s4);
+template <uint32_t (*Estimate)(uint32_t)>
+static void LoadEstimateConstant(A64Emitter& e, int d, vec128_t value) {
+  for (int k = 0; k < 4; ++k) {
+    value.u32[k] = Estimate(value.u32[k]);
+  }
+  LoadV128Const(e, d, value);
 }
 
-// NaN in, quieted NaN out. Consumes the source and writes the destination.
-static void EmitEstQuietNan(A64Emitter& e, int r, int s, int d) {
-  e.fcmeq(VReg(0).s4, VReg(s).s4, VReg(s).s4);  // all-ones where NOT NaN
-  LoadEstConst(e, 1, kEstQuietBit);
-  e.orr(VReg(1).b16, VReg(s).b16, VReg(1).b16);
-  e.bif(VReg(r).b16, VReg(1).b16, VReg(0).b16);
-  e.mov(VReg(d).b16, VReg(r).b16);
+static void LoadInfinity(A64Emitter& e, int r) {
+  e.movi(VReg(r).s4, 0x7F, LSL, 24);
+  e.orr(VReg(r).s4, 0x80, LSL, 16);
+}
+
+// v[d] = v[s] | 0x00400000 where v[s] is a NaN. Clobbers v1 and v2.
+static void QuietNanLanes(A64Emitter& e, int d, int s) {
+  e.fcmeq(VReg(1).s4, VReg(s).s4, VReg(s).s4);
+  e.movi(VReg(2).s4, 0x40, LSL, 16);
+  e.orr(VReg(2).b16, VReg(s).b16, VReg(2).b16);
+  e.bif(VReg(d).b16, VReg(2).b16, VReg(1).b16);
 }
 
 struct POW2_F32 : Sequence<POW2_F32, I<OPCODE_POW2, F32Op, F32Op>> {
@@ -4587,41 +4661,57 @@ struct POW2_F64 : Sequence<POW2_F64, I<OPCODE_POW2, F64Op, F64Op>> {
     assert_always("POW2_F64 should not be emitted");
   }
 };
+// vexptefp, as ppc::EstimatePow2: the input as fixed point with 11 fraction
+// bits, floored, whose integer part is the result's exponent and whose
+// fraction indexes the table
 struct POW2_V128 : Sequence<POW2_V128, I<OPCODE_POW2, V128Op, V128Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    EmitWithVmxFpcr(e, [&] {
-      const int d = i.dest.reg().getIdx();
-      int s = SrcVReg(e, i.src1, 0);
-      if (s < 4) {
-        // A constant landed in the scratch bank, which the math below needs.
-        e.mov(VReg(d).b16, VReg(s).b16);
-        s = d;
-      }
-      // 2^x = 2^floor(x) * 2^frac(x). Splitting on floor rather than nearest
-      // puts the second factor in [1,2), so it lands on the grid directly.
-      e.frintm(VReg(0).s4, VReg(s).s4);
-      e.fsub(VReg(1).s4, VReg(s).s4, VReg(0).s4);
-      e.fcvtzs(VReg(0).s4, VReg(0).s4);
-      e.shl(VReg(0).s4, VReg(0).s4, 23);
-      LoadEstConst(e, 2, kEstOne);
-      e.add(VReg(0).s4, VReg(0).s4, VReg(2).s4);  // (127 + n) << 23
-      const int r = EmitEstPoly(e, kEstExp2Poly, 6);
-      EmitEstGridSnap(e, r, r ^ 1);
-      e.fmul(VReg(r).s4, VReg(r).s4, VReg(0).s4);
+    const int d = i.dest.reg().getIdx();
+    if (i.src1.is_constant) {
+      LoadEstimateConstant<ppc::EstimatePow2>(e, d, i.src1.constant());
+      return;
+    }
+    const int s = i.src1.reg().getIdx();
 
-      // Out-of-range and non-finite inputs never reached the guest's
-      // estimator. Denormals need no case of their own: floor is 0 either way,
-      // so the grid snap returns exactly 1.0.
-      LoadEstConst(e, 0, kEstExp2Max);
-      e.fcmge(VReg(0).s4, VReg(s).s4, VReg(0).s4);
-      LoadEstConst(e, 1, kEstPosInf);
-      e.bit(VReg(r).b16, VReg(1).b16, VReg(0).b16);
-      LoadEstConst(e, 0, kEstExp2Min);
-      e.fcmgt(VReg(0).s4, VReg(0).s4, VReg(s).s4);
-      e.movi(VReg(1).s4, 0);
-      e.bit(VReg(r).b16, VReg(1).b16, VReg(0).b16);
-      EmitEstQuietNan(e, r, s, d);
-    });
+    // Fixed point with 15 fraction bits, truncated and negated if negative:
+    // the mantissa with its implicit bit, shifted right by 135 - exponent
+    e.shl(VReg(0).s4, VReg(s).s4, 8);
+    e.orr(VReg(0).s4, 0x80, LSL, 24);
+    e.shl(VReg(1).s4, VReg(s).s4, 1);
+    e.ushr(VReg(1).s4, VReg(1).s4, 24);
+    e.movi(VReg(2).s4, 143);
+    e.sub(VReg(1).s4, VReg(1).s4, VReg(2).s4);
+    e.ushl(VReg(0).s4, VReg(0).s4, VReg(1).s4);
+    e.sshr(VReg(1).s4, VReg(s).s4, 31);
+    e.eor(VReg(0).b16, VReg(0).b16, VReg(1).b16);
+    e.sub(VReg(0).s4, VReg(0).s4, VReg(1).s4);
+    e.ldr(e.x16,
+          e.BackendCtxPtr(offsetof(A64BackendContext, vexptefp_table_address)));
+    e.umov(e.x17, VReg(0).d2[0]);
+    e.umov(e.x0, VReg(0).d2[1]);
+    GatherEstimateEntries(e, 4, 11);
+
+    // The integer part plus 126, as the entry carries the implicit bit into
+    // the exponent. Below -126 the result is zero.
+    e.sshr(VReg(0).s4, VReg(0).s4, 15);
+    e.movi(VReg(2).s4, 126);
+    e.add(VReg(0).s4, VReg(0).s4, VReg(2).s4);
+    e.cmlt(VReg(2).s4, VReg(0).s4, 0);
+    e.shl(VReg(0).s4, VReg(0).s4, 23);
+    e.add(VReg(0).s4, VReg(0).s4, VReg(1).s4);
+    e.bic(VReg(0).b16, VReg(0).b16, VReg(2).b16);
+
+    // From 128 up (and infinity): infinity, or zero if negative
+    e.shl(VReg(1).s4, VReg(s).s4, 1);
+    e.ushr(VReg(1).s4, VReg(1).s4, 24);
+    e.movi(VReg(2).s4, 133);
+    e.cmhi(VReg(1).s4, VReg(1).s4, VReg(2).s4);
+    LoadInfinity(e, 2);
+    e.sshr(VReg(3).s4, VReg(s).s4, 31);
+    e.bic(VReg(2).b16, VReg(2).b16, VReg(3).b16);
+    e.bit(VReg(0).b16, VReg(2).b16, VReg(1).b16);
+    QuietNanLanes(e, 0, s);
+    e.mov(VReg(d).b16, VReg(0).b16);
   }
 };
 EMITTER_OPCODE_TABLE(OPCODE_POW2, POW2_F32, POW2_F64, POW2_V128);
@@ -4639,44 +4729,48 @@ struct LOG2_F64 : Sequence<LOG2_F64, I<OPCODE_LOG2, F64Op, F64Op>> {
     assert_always("LOG2_F64 should not be emitted");
   }
 };
+// vlogefp, as ppc::EstimateLog2: the exponent less 127, plus the table entry
+// for the top 11 mantissa bits, in 2048ths
 struct LOG2_V128 : Sequence<LOG2_V128, I<OPCODE_LOG2, V128Op, V128Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    EmitWithVmxFpcr(e, [&] {
-      const int d = i.dest.reg().getIdx();
-      int s = SrcVReg(e, i.src1, 0);
-      if (s < 4) {
-        e.mov(VReg(d).b16, VReg(s).b16);
-        s = d;
-      }
-      // log2(x) = exponent(x) + log2(mantissa(x)). Negatives are masked off
-      // below, so the sign bit can ride along in the exponent shift.
-      e.ushr(VReg(0).s4, VReg(s).s4, 23);
-      LoadEstConst(e, 2, kEstInt127);
-      e.sub(VReg(0).s4, VReg(0).s4, VReg(2).s4);
-      e.scvtf(VReg(0).s4, VReg(0).s4);
-      LoadEstConst(e, 1, kEstMantissaMask);
-      e.and_(VReg(1).b16, VReg(s).b16, VReg(1).b16);
-      LoadEstConst(e, 2, kEstOne);
-      e.orr(VReg(1).b16, VReg(1).b16, VReg(2).b16);  // mantissa in [1,2)
-      e.fsub(VReg(1).s4, VReg(1).s4, VReg(2).s4);
-      const int r = EmitEstPoly(e, kEstLog2Poly, 7);
-      e.fadd(VReg(r).s4, VReg(r).s4, VReg(0).s4);
-      EmitEstGridSnap(e, r, r ^ 1);
+    const int d = i.dest.reg().getIdx();
+    if (i.src1.is_constant) {
+      LoadEstimateConstant<ppc::EstimateLog2>(e, d, i.src1.constant());
+      return;
+    }
+    const int s = i.src1.reg().getIdx();
 
-      LoadEstConst(e, 1, kEstPosInf);
-      e.fcmeq(VReg(0).s4, VReg(s).s4, VReg(1).s4);
-      e.bit(VReg(r).b16, VReg(1).b16, VReg(0).b16);
-      e.sshr(VReg(0).s4, VReg(s).s4, 31);
-      LoadEstConst(e, 1, kEstQNaN);
-      e.bit(VReg(r).b16, VReg(1).b16, VReg(0).b16);
-      // Zero and denormal both reach the estimator as zero, so both give -inf.
-      LoadEstConst(e, 0, kEstPosInf);
-      e.and_(VReg(0).b16, VReg(s).b16, VReg(0).b16);
-      e.cmeq(VReg(0).s4, VReg(0).s4, 0);
-      LoadEstConst(e, 1, kEstNegInf);
-      e.bit(VReg(r).b16, VReg(1).b16, VReg(0).b16);
-      EmitEstQuietNan(e, r, s, d);
-    });
+    e.ldr(e.x16,
+          e.BackendCtxPtr(offsetof(A64BackendContext, vlogefp_table_address)));
+    e.umov(e.x17, VReg(s).d2[0]);
+    e.umov(e.x0, VReg(s).d2[1]);
+    GatherEstimateEntries(e, 12, 11);
+
+    // ((exponent - 127) << 11) + entry is exact as a float, and so is
+    // dividing it by 2048
+    e.shl(VReg(0).s4, VReg(s).s4, 1);
+    e.ushr(VReg(0).s4, VReg(0).s4, 24);
+    e.movi(VReg(2).s4, 127);
+    e.sub(VReg(0).s4, VReg(0).s4, VReg(2).s4);
+    e.shl(VReg(0).s4, VReg(0).s4, 11);
+    e.add(VReg(0).s4, VReg(0).s4, VReg(1).s4);
+    e.scvtf(VReg(0).s4, VReg(0).s4, 11);
+
+    // A negative input gives the default NaN, infinity gives infinity, and
+    // zero and denormals give -infinity (even when negative)
+    e.sshr(VReg(1).s4, VReg(s).s4, 31);
+    e.movi(VReg(2).s4, 0x7F, LSL, 24);
+    e.orr(VReg(2).s4, 0xC0, LSL, 16);
+    e.bit(VReg(0).b16, VReg(2).b16, VReg(1).b16);
+    LoadInfinity(e, 2);
+    e.cmeq(VReg(1).s4, VReg(s).s4, VReg(2).s4);
+    e.bit(VReg(0).b16, VReg(2).b16, VReg(1).b16);
+    e.and_(VReg(1).b16, VReg(s).b16, VReg(2).b16);
+    e.cmeq(VReg(1).s4, VReg(1).s4, 0);
+    e.mvni(VReg(2).s4, 0x7F, MSL, 16);
+    e.bit(VReg(0).b16, VReg(2).b16, VReg(1).b16);
+    QuietNanLanes(e, 0, s);
+    e.mov(VReg(d).b16, VReg(0).b16);
   }
 };
 EMITTER_OPCODE_TABLE(OPCODE_LOG2, LOG2_F32, LOG2_F64, LOG2_V128);
@@ -4684,12 +4778,21 @@ EMITTER_OPCODE_TABLE(OPCODE_LOG2, LOG2_F32, LOG2_F64, LOG2_V128);
 // ============================================================================
 // OPCODE_DOT_PRODUCT_3
 // ============================================================================
+// The double sum of the products in d1, truncated to single in s0, as x64's
+// use_fast_dot_product. With the bits below single precision cleared, a sum in
+// float32's normal range is exactly a float32, so the conversion rounds toward
+// zero.
+//
 // The guest returns QNaN when the double sum overflows on the narrowing to
 // float32, but preserves an infinity that came from an infinite input. Both
 // leave an infinite result; only the overflow leaves a finite sum behind, so
 // the second test only has to run once the first one says the result is
-// infinite. Takes the result in s0 and the sum in d1; clobbers v2, v3 and x17.
+// infinite. Clobbers v2, v3 and x17.
 static void EmitDotProductResult(A64Emitter& e, int dest_idx) {
+  e.mov(e.x17, 0xFFFFFFFFE0000000ull);
+  e.fmov(DReg(3), e.x17);
+  e.and_(VReg(1).b8, VReg(1).b8, VReg(3).b8);
+  e.fcvt(SReg(0), DReg(1));
   auto& done = e.NewCachedLabel();
   e.fabs(SReg(2), SReg(0));
   e.mov(e.w17, 0x7F800000u);  // +inf
@@ -4726,11 +4829,11 @@ struct DOT_PRODUCT_3_V128
       e.fcvtl(VReg(0).d2, VReg(s1).s2);            // v0 = {s1[0], s1[1]} as f64
       e.fcvtl(VReg(1).d2, VReg(s2).s2);            // v1 = {s2[0], s2[1]} as f64
       e.fmul(VReg(0).d2, VReg(0).d2, VReg(1).d2);  // v0 = {a0*b0, a1*b1}
-      // Sum: d0 = v0[0] + v0[1] + v2[0] (skip v2[1] = element 3).
-      e.faddp(DReg(1), VReg(0).d2);
-      e.fadd(DReg(1), DReg(1), DReg(2));
-      // Convert back to float.
-      e.fcvt(SReg(0), DReg(1));
+      // Sum in x64's order: d1 = (v0[0] + v2[0]) + v0[1] (skip v2[1] =
+      // element 3).
+      e.fadd(DReg(1), DReg(0), DReg(2));
+      e.dup(DReg(3), VReg(0).d[1]);
+      e.fadd(DReg(1), DReg(1), DReg(3));
       EmitDotProductResult(e, d);
     });
   }
@@ -4760,8 +4863,6 @@ struct DOT_PRODUCT_4_V128
       // Sum all 4 products: v0 = {a0*b0+a2*b2, a1*b1+a3*b3}
       e.fadd(VReg(0).d2, VReg(0).d2, VReg(2).d2);
       e.faddp(DReg(1), VReg(0).d2);
-      // Convert back to float.
-      e.fcvt(SReg(0), DReg(1));
       EmitDotProductResult(e, d);
     });
   }
@@ -4774,55 +4875,27 @@ EMITTER_OPCODE_TABLE(OPCODE_DOT_PRODUCT_4, DOT_PRODUCT_4_V128);
 struct SET_ROUNDING_MODE
     : Sequence<SET_ROUNDING_MODE, I<OPCODE_SET_ROUNDING_MODE, VoidOp, I32Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    // Input is PPC FPSCR bits (already masked to 0-7 by the frontend).
-    // We set FPCR RMode + FZ bits and cache the value in the backend context.
+    // Input is FPSCR RN (already masked to 0-3 by the frontend). We set FPCR
+    // RMode and cache the value in the backend context.
     auto bctx = e.GetBackendCtxReg();
 
     if (i.src1.is_constant) {
-      uint32_t fpcr_val = kGuestFpcrTable[i.src1.constant() & 7];
+      uint32_t fpcr_val = kGuestFpcrTable[i.src1.constant() & 3];
       e.mov(e.x0, static_cast<uint64_t>(fpcr_val));
       e.msr(3, 3, 4, 4, 0, e.x0);  // msr FPCR, x0
       // Cache in backend context.
       e.str(e.w0, ptr(bctx, static_cast<uint32_t>(
                                 offsetof(A64BackendContext, fpcr_fpu))));
-      // Update NonIEEE flag.
-      e.ldr(
-          e.w0,
-          ptr(bctx, static_cast<uint32_t>(offsetof(A64BackendContext, flags))));
-      if (i.src1.constant() & 4) {
-        e.orr(e.w0, e.w0, 1u << kA64BackendNonIEEEMode);
-      } else {
-        // Clear bit kA64BackendNonIEEEMode using BIC (avoids bitmask encoding).
-        e.mov(e.w1, 1u << kA64BackendNonIEEEMode);
-        e.bic(e.w0, e.w0, e.w1);
-      }
-      e.str(
-          e.w0,
-          ptr(bctx, static_cast<uint32_t>(offsetof(A64BackendContext, flags))));
     } else {
       // Dynamic: look up FPCR value from table.
       e.mov(e.x0, reinterpret_cast<uint64_t>(kGuestFpcrTable));
-      e.and_(e.w1, i.src1, 7);
+      e.and_(e.w1, i.src1, 3);
       e.ldr(e.w0, Xbyak_aarch64::ptr(e.x0, e.x1, Xbyak_aarch64::LSL, 2));
       // Write FPCR.
       e.msr(3, 3, 4, 4, 0, e.x0);
       // Cache in backend context.
       e.str(e.w0, ptr(bctx, static_cast<uint32_t>(
                                 offsetof(A64BackendContext, fpcr_fpu))));
-      // Update NonIEEE flag based on bit 2 of input.
-      e.ldr(
-          e.w0,
-          ptr(bctx, static_cast<uint32_t>(offsetof(A64BackendContext, flags))));
-      // Clear bit kA64BackendNonIEEEMode using BIC (avoids bitmask encoding).
-      e.mov(e.w1, 1u << kA64BackendNonIEEEMode);
-      e.bic(e.w0, e.w0, e.w1);
-      // Conditionally set it back if input bit 2 is set.
-      e.tst(i.src1, 4);
-      e.csel(e.w1, e.w1, e.wzr, Xbyak_aarch64::Cond::NE);
-      e.orr(e.w0, e.w0, e.w1);
-      e.str(
-          e.w0,
-          ptr(bctx, static_cast<uint32_t>(offsetof(A64BackendContext, flags))));
     }
     e.ChangeFpcrMode(FPCRMode::Fpu, /*already_set=*/true);
   }
@@ -4917,44 +4990,114 @@ struct RECIP_F32 : Sequence<RECIP_F32, I<OPCODE_RECIP, F32Op, F32Op>> {
     e.fdiv(i.dest, e.s2, src);
   }
 };
+// fres. While the result is a normal single (an input exponent from 895 to
+// 1148) it is exact: its mantissa comes from the table, and its exponent is
+// 2045 less the input's. Anything else (denormal and overflowing results,
+// zero, infinity, NaNs and denormal inputs) calls
+// ppc::EstimateReciprocalSingle from tail code. Neither path needs an FPCR
+// mode.
 struct RECIP_F64 : Sequence<RECIP_F64, I<OPCODE_RECIP, F64Op, F64Op>> {
+  static uint64_t EmulateFres(void*, uint64_t bits) {
+    return std::bit_cast<uint64_t>(
+        ppc::EstimateReciprocalSingle(std::bit_cast<double>(bits)));
+  }
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    e.ChangeFpcrMode(FPCRMode::Fpu);
-    DReg src = i.src1.is_constant ? e.d0 : DReg(i.src1.reg().getIdx());
+    const DReg dest = i.dest;
     if (i.src1.is_constant) {
-      union {
-        double d;
-        uint64_t u;
-      } c;
-      c.d = i.src1.constant();
-      e.mov(e.x0, c.u);
-      e.fmov(e.d0, e.x0);
+      e.mov(e.x0, std::bit_cast<uint64_t>(
+                      ppc::EstimateReciprocalSingle(i.src1.constant())));
+      e.fmov(dest, e.x0);
+      return;
     }
-    e.fmov(e.d2, 1.0);
-    e.fdiv(i.dest, e.d2, src);
+    const DReg src(i.src1.reg().getIdx());
+
+    // The thunk returns in the Fpu mode, while the hot path may hold a VMX one
+    const FPCRMode held_mode = e.fpcr_mode();
+    Xbyak_aarch64::Label& done = e.NewCachedLabel();
+    Xbyak_aarch64::Label& call = e.AddToTail(
+        [src, dest, held_mode, &done](A64Emitter& e, Xbyak_aarch64::Label&) {
+          e.fmov(e.x1, src);
+          e.mov(e.x0, reinterpret_cast<uint64_t>(&EmulateFres));
+          e.ldr(e.x9, e.BackendCtxPtr(offsetof(A64BackendContext,
+                                               guest_to_host_thunk_address)));
+          e.blr(e.x9);
+          e.NoteCallClobbersRemapBound();
+          e.fmov(dest, e.x0);
+          if (held_mode != FPCRMode::Unknown && held_mode != FPCRMode::Fpu) {
+            e.ReloadFpcrMode(held_mode);
+          }
+          e.b(done);
+        });
+
+    e.fmov(e.x0, src);
+    e.ubfx(e.x1, e.x0, 52, 11);
+    e.sub(e.w2, e.w1, 895);
+    e.cmp(e.w2, 1148 - 895);
+    e.b(HI, call);
+
+    // Sign | (2045 - exponent) << 52 | the table's mantissa
+    e.ldr(e.x16,
+          e.BackendCtxPtr(offsetof(A64BackendContext, fres_table_address)));
+    e.ubfx(e.x2, e.x0, 45, 7);
+    e.ldr(e.x2, ptr(e.x16, e.x2, LSL, 3));
+    e.mov(e.w3, 2045);
+    e.sub(e.x1, e.x3, e.x1);
+    e.and_(e.x0, e.x0, 0x8000000000000000ull);
+    e.orr(e.x0, e.x0, e.x1, LSL, 52);
+    e.orr(e.x0, e.x0, e.x2);
+    e.fmov(dest, e.x0);
+    e.L(done);
   }
 };
+// vrefp, as ppc::EstimateReciprocal: the top 5 mantissa bits pick a segment
+// from vrefp_table, and the result mantissa is its base minus its slope times
+// the next 9 bits
 struct RECIP_V128 : Sequence<RECIP_V128, I<OPCODE_RECIP, V128Op, V128Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    EmitWithVmxFpcr(e, [&] {
-      if (i.src1.is_constant) {
-        LoadV128Const(e, 1, i.src1.constant());
-      } else {
-        e.mov(VReg(1).b16, VReg(i.src1.reg().getIdx()).b16);
-      }
-      // Flush input denormals.
-      if (!e.IsFeatureEnabled(xe::arm64::kA64FZFlushesInputs)) {
-        FlushDenormals_V128(e, 1);  // scratch v2, v3
-      }
-      auto d = VReg(i.dest.reg().getIdx()).s4;
-      // Load 1.0f vector.
-      e.fmov(VReg(0).s4, 1.0f);
-      e.fdiv(d, VReg(0).s4, VReg(1).s4);
-      // Flush output denormals.
-      if (!e.IsFeatureEnabled(xe::arm64::kA64FZFlushesInputs)) {
-        FlushDenormals_V128(e, i.dest.reg().getIdx(), 0, 1);
-      }
-    });
+    const int d = i.dest.reg().getIdx();
+    if (i.src1.is_constant) {
+      LoadEstimateConstant<ppc::EstimateReciprocal>(e, d, i.src1.constant());
+      return;
+    }
+    const int s = i.src1.reg().getIdx();
+
+    e.add(e.x16, e.GetBackendCtxReg(),
+          static_cast<uint32_t>(offsetof(A64BackendContext, vrefp_table)));
+    e.umov(e.x17, VReg(s).d2[0]);
+    e.umov(e.x0, VReg(s).d2[1]);
+    GatherEstimateEntries(e, 18, 5);
+
+    // Mantissa, with the implicit bit: base - slope * step
+    e.shl(VReg(2).s4, VReg(s).s4, 14);
+    e.ushr(VReg(2).s4, VReg(2).s4, 23);
+    e.ushr(VReg(3).s4, VReg(1).s4, 16);
+    e.shl(VReg(1).s4, VReg(1).s4, 16);
+    e.ushr(VReg(1).s4, VReg(1).s4, 7);
+    e.mls(VReg(1).s4, VReg(3).s4, VReg(2).s4);
+
+    // Exponent: 253 - the input's, less the implicit bit the mantissa adds
+    e.shl(VReg(2).s4, VReg(s).s4, 1);
+    e.ushr(VReg(2).s4, VReg(2).s4, 24);
+    e.movi(VReg(3).s4, 252);
+    e.sub(VReg(3).s4, VReg(3).s4, VReg(2).s4);
+    e.shl(VReg(3).s4, VReg(3).s4, 23);
+    e.add(VReg(1).s4, VReg(1).s4, VReg(3).s4);
+    e.movi(VReg(3).s4, 0x80, LSL, 24);
+    e.and_(VReg(0).b16, VReg(s).b16, VReg(3).b16);
+    e.orr(VReg(1).b16, VReg(1).b16, VReg(0).b16);
+
+    // An exponent from 253 up (and infinity) gives a signed zero, zero and
+    // denormals a signed infinity, and a NaN comes back quiet
+    e.movi(VReg(3).s4, 253);
+    e.cmhs(VReg(3).s4, VReg(2).s4, VReg(3).s4);
+    e.bit(VReg(1).b16, VReg(0).b16, VReg(3).b16);
+    e.cmeq(VReg(3).s4, VReg(2).s4, 0);
+    e.orr(VReg(0).s4, 0x7F, LSL, 24);
+    e.orr(VReg(0).s4, 0x80, LSL, 16);
+    e.bit(VReg(1).b16, VReg(0).b16, VReg(3).b16);
+    e.mov(VReg(0).b16, VReg(1).b16);
+    QuietNanLanes(e, 0, s);
+    e.mov(VReg(d).b16, VReg(0).b16);
   }
 };
 EMITTER_OPCODE_TABLE(OPCODE_RECIP, RECIP_F32, RECIP_F64, RECIP_V128);
@@ -4966,17 +5109,48 @@ EMITTER_OPCODE_TABLE(OPCODE_RECIP, RECIP_F32, RECIP_F64, RECIP_V128);
 // is the source unchanged and a normal single or zero: neither rounding nor
 // FZ applies to such a value in any mode. Anything else, a NaN included,
 // takes the tail and converts in the Fpu mode.
+//
+// With TO_SINGLE_KEEP_NAN a NaN comes back quieted with its whole payload
+// instead: from a tail of its own in the Fpu mode, else from the conversion
+// tail it already takes. Fused with the operation before (FuseToSingleIfNext),
+// no NaN gets here and there is no test.
 struct TOSINGLE : Sequence<TOSINGLE, I<OPCODE_TO_SINGLE, F64Op, F64Op>> {
+  // dest = src with the quiet bit set. Clobbers x0.
+  static void EmitKeepNan(A64Emitter& e, const DReg& dest, const DReg& src) {
+    e.fmov(e.x0, src);
+    e.orr(e.x0, e.x0, uint64_t(1) << 51);
+    e.fmov(dest, e.x0);
+  }
+
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+    // Fused, the operation before kept every NaN away from here. A source
+    // that is never a wide NaN rounds without losing a payload bit.
+    Xbyak_aarch64::Label* past_nan = e.ConsumeFusedToSingle(i.instr);
+    EmitConversion(e, i,
+                   (i.instr->flags & TO_SINGLE_KEEP_NAN) != 0 && !past_nan &&
+                       !i.src1.value->IsNeverWideNan());
+    if (past_nan) {
+      // The stubs that jump here only move a register.
+      e.LKeepingRemapBound(*past_nan);
+    }
+  }
+
+  static void EmitConversion(A64Emitter& e, const EmitArgType& i,
+                             bool keep_nan) {
     if (i.src1.is_constant) {
-      if (!IsExactNormalSingle(i.src1.constant())) {
-        e.ChangeFpcrMode(FPCRMode::Fpu);
-      }
       union {
         double d;
         uint64_t u;
       } c;
       c.d = i.src1.constant();
+      if (keep_nan && std::isnan(c.d)) {
+        e.mov(e.x0, c.u | (uint64_t(1) << 51));
+        e.fmov(i.dest, e.x0);
+        return;
+      }
+      if (!IsExactNormalSingle(c.d)) {
+        e.ChangeFpcrMode(FPCRMode::Fpu);
+      }
       e.mov(e.x0, c.u);
       e.fmov(e.d0, e.x0);
     }
@@ -4985,16 +5159,44 @@ struct TOSINGLE : Sequence<TOSINGLE, I<OPCODE_TO_SINGLE, F64Op, F64Op>> {
     // NaN sign is already correct from upstream arithmetic (EmitFmaWithPpcNan
     // etc.) or fneg.  fcvt with DN=0 preserves NaN sign, so no fixup needed.
     e.fcvt(e.s0, src);
+    const DReg dest = i.dest;
     if (i.src1.is_constant || e.fpcr_mode() == FPCRMode::Fpu) {
+      if (!keep_nan || i.src1.is_constant) {
+        e.fcvt(i.dest, e.s0);
+        return;
+      }
+      // The source is still intact in the tail when dest aliases it.
+      auto& done = e.NewCachedLabel();
+      auto& nan_tail =
+          e.AddToTail([src, dest, &done](A64Emitter& e, Xbyak_aarch64::Label&) {
+            EmitKeepNan(e, dest, src);
+            e.b(done);
+          });
+      e.fcmp(src, src);
+      e.b(Xbyak_aarch64::VS, nan_tail);
       e.fcvt(i.dest, e.s0);
+      // The tail works in x0.
+      e.LKeepingRemapBound(done);
       return;
     }
-    const DReg dest = i.dest;
     auto& done = e.NewCachedLabel();
-    auto& in_fpu = AddFpuModeTail(e, done, [src, dest](A64Emitter& e) {
-      e.fcvt(e.s0, src);
-      e.fcvt(dest, e.s0);
-    });
+    auto& in_fpu =
+        AddFpuModeTail(e, done, [src, dest, keep_nan](A64Emitter& e) {
+          if (keep_nan) {
+            Xbyak_aarch64::Label convert, converted;
+            e.fcmp(src, src);
+            e.b_near(Xbyak_aarch64::VC, convert);
+            EmitKeepNan(e, dest, src);
+            e.b(converted);
+            e.L(convert);
+            e.fcvt(e.s0, src);
+            e.fcvt(dest, e.s0);
+            e.L(converted);
+            return;
+          }
+          e.fcvt(e.s0, src);
+          e.fcvt(dest, e.s0);
+        });
     e.fcvt(e.d1, e.s0);
     e.cmeq(e.d2, e.d1, src);
     e.fmov(e.x17, e.d2);

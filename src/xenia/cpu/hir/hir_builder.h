@@ -222,7 +222,7 @@ class HIRBuilder {
   void DelayExecution();
   void SetRoundingMode(Value* value);
   Value* Max(Value* value1, Value* value2);
-  Value* DenormalQuirk(Value* value1, Value* value2, Value* value3);
+  Value* SingleRangeQuirk(Value* value1, Value* value2, Value* value3);
   Value* VectorMax(Value* value1, Value* value2, TypeName part_type,
                    uint32_t arithmetic_flags = 0);
   Value* Min(Value* value1, Value* value2);
@@ -252,7 +252,7 @@ class HIRBuilder {
   Value* VectorCompareUGT(Value* value1, Value* value2, TypeName part_type);
   Value* VectorCompareUGE(Value* value1, Value* value2, TypeName part_type);
   Value* VectorDenormFlush(Value* value1);
-  Value* ToSingle(Value* value);
+  Value* ToSingle(Value* value, uint32_t to_single_flags = 0);
   Value* UnpackSingle(Value* single_bits);
   Value* PackSingle(Value* value);
   Value* Add(Value* value1, Value* value2, uint32_t arithmetic_flags = 0);
@@ -268,10 +268,10 @@ class HIRBuilder {
   Value* Div(Value* value1, Value* value2, uint32_t arithmetic_flags = 0);
   // (1 * 2) + 3, optionally negated
   Value* MulAdd(Value* value1, Value* value2, Value* value3,
-                bool negate_result = false);
+                bool negate_result = false, uint32_t arithmetic_flags = 0);
   // (1 * 2) - 3, optionally negated
   Value* MulSub(Value* value1, Value* value2, Value* value3,
-                bool negate_result = false);
+                bool negate_result = false, uint32_t arithmetic_flags = 0);
 
   Value* Neg(Value* value);
   Value* Abs(Value* value);
@@ -294,6 +294,9 @@ class HIRBuilder {
   Value* Shr(Value* value1, Value* value2);
   Value* Shr(Value* value1, int8_t value2);
   Value* VectorShr(Value* value1, Value* value2, TypeName part_type);
+  // vsl and vsr: each byte shifted by the low 3 bits of its byte of counts
+  Value* VectorShlBits(Value* value, Value* counts);
+  Value* VectorShrBits(Value* value, Value* counts);
   Value* Sha(Value* value1, Value* value2);
   Value* Sha(Value* value1, int8_t value2);
   Value* VectorSha(Value* value1, Value* value2, TypeName part_type);

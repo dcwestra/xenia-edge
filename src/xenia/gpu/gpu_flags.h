@@ -87,8 +87,6 @@ DECLARE_bool(gpu_3d_to_2d_texture);
 
 DECLARE_bool(use_fuzzy_alpha_epsilon);
 
-DECLARE_bool(force_depth_clamp);
-
 DECLARE_bool(alu_round_toward_zero);
 DECLARE_bool(alu_dot_products_round_once);
 

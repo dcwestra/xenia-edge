@@ -79,7 +79,7 @@ enum ValueFlags {
   VALUE_IS_CONSTANT = (1 << 1),
   VALUE_IS_ALLOCATED = (1 << 2),  // Used by backends. Do not set.
   // Magnitude is zero, at least 2^-1022, or non-finite.
-  VALUE_NEVER_F64_DENORMAL = (1 << 3),
+  VALUE_IN_SINGLE_RANGE = (1 << 3),
 };
 
 struct RegAssignment {
@@ -607,6 +607,14 @@ class Value {
   void CountLeadingZeros(const Value* other);
   bool Compare(Opcode opcode, Value* other);
   hir::Instr* GetDefSkipAssigns();
+  // Whether a double can never set off the single-precision quirk: zero, a
+  // magnitude in [2^-149, 2^128), infinity or a NaN. Every single is one.
+  bool IsInSingleRange(int depth = 4) const;
+  // Whether a double can never be a wide NaN, one with fraction bits a single
+  // drops: a value widened from a single or rounded to one, or worked out from
+  // such operands only, as an arithmetic NaN result is one of the operands' or
+  // the default QNaN. Rounding one to single loses nothing then.
+  bool IsNeverWideNan() const;
   // tunnel_flags is updated to the kinds we actually traversed
   hir::Instr* GetDefTunnelMovs(unsigned int* tunnel_flags);
 

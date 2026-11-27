@@ -16,15 +16,22 @@ namespace kernel {
 namespace xam {
 namespace ui {
 
+CreateProfileUI::CreateProfileUI(xe::ui::ImGuiDrawer* imgui_drawer,
+                                 Emulator* emulator)
+    : XamGamepadDialog(imgui_drawer, emulator->input_system()),
+      emulator_(emulator) {
+  memset(gamertag_, 0, sizeof(gamertag_));
+}
+
 void CreateProfileUI::OnDraw(ImGuiIO& io) {
   if (!has_opened_) {
     ImGui::OpenPopup("Create Profile");
     has_opened_ = true;
   }
 
-  // Center the window on screen
+  // Center every frame so the window follows resizes.
   ImVec2 center = ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f);
-  ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+  ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
   ImGui::SetNextWindowSizeConstraints(ImVec2(350, 0), ImVec2(400, 300));
 
   // Style like Xbox - white background, black text, Xbox green highlights

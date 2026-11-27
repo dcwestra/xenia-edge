@@ -77,7 +77,7 @@ bool HostPathEntry::Overwrite() {
   return true;
 }
 
-void HostPathEntry::SetOverwrittenSize(size_t size) {
+void HostPathEntry::SetSize(size_t size) {
   size_ = size;
   allocation_size_ = xe::round_up(size, device()->bytes_per_sector());
 }
@@ -88,22 +88,25 @@ HostPathEntry* HostPathEntry::Create(Device* device, Entry* parent,
   auto path = xe::utf8::join_guest_paths(parent->path(),
                                          xe::path_to_utf8(file_info.name));
   auto entry = new HostPathEntry(device, parent, path, full_path);
-
-  entry->create_timestamp_ = file_info.create_timestamp;
-  entry->access_timestamp_ = file_info.access_timestamp;
-  entry->write_timestamp_ = file_info.write_timestamp;
-  if (file_info.type == xe::filesystem::FileInfo::Type::kDirectory) {
-    entry->attributes_ = kFileAttributeDirectory;
-  } else {
-    entry->attributes_ = kFileAttributeNormal;
-    if (device->is_read_only()) {
-      entry->attributes_ |= kFileAttributeReadOnly;
-    }
-    entry->size_ = file_info.total_size;
-    entry->allocation_size_ =
-        xe::round_up(file_info.total_size, device->bytes_per_sector());
-  }
+  entry->SetInfo(file_info);
   return entry;
+}
+
+void HostPathEntry::SetInfo(const xe::filesystem::FileInfo& file_info) {
+  create_timestamp_ = file_info.create_timestamp;
+  access_timestamp_ = file_info.access_timestamp;
+  write_timestamp_ = file_info.write_timestamp;
+  if (file_info.type == xe::filesystem::FileInfo::Type::kDirectory) {
+    attributes_ = kFileAttributeDirectory;
+  } else {
+    attributes_ = kFileAttributeNormal;
+    if (device_->is_read_only()) {
+      attributes_ |= kFileAttributeReadOnly;
+    }
+    size_ = file_info.total_size;
+    allocation_size_ =
+        xe::round_up(file_info.total_size, device_->bytes_per_sector());
+  }
 }
 
 X_STATUS HostPathEntry::Open(uint32_t desired_access, File** out_file) {
@@ -214,6 +217,12 @@ void HostPathEntry::update() {
     allocation_size_ =
         xe::round_up(file_info->total_size, device()->bytes_per_sector());
   }
+}
+
+bool HostPathEntry::is_empty_folder() const {
+  std::error_code error;
+  const bool empty = std::filesystem::is_empty(host_path_, error);
+  return error ? Entry::is_empty_folder() : empty;
 }
 
 bool HostPathEntry::SetTimes(xe::filesystem::FileHandle& file_handle,

@@ -27,8 +27,10 @@ namespace gpu {
 std::vector<unsigned int> BuildGuestPrimitiveGeometryShaderSpirv(
     BuiltinGeometryShaderType type, uint32_t interpolator_count,
     uint32_t user_clip_plane_count, bool user_clip_plane_cull,
-    bool has_vertex_kill_and, bool has_point_size, bool has_point_coordinates,
-    unsigned int spirv_version, bool denorm_flush_to_zero_float32,
+    bool z_clip_distances, bool guard_band_clip_distances,
+    bool discard_band_cull_distances, bool has_vertex_kill_and,
+    bool has_point_size, bool has_point_coordinates, unsigned int spirv_version,
+    bool denorm_flush_to_zero_float32,
     bool signed_zero_inf_nan_preserve_float32, bool rounding_mode_rte_float32) {
   std::vector<spv::Id> id_vector_temp;
   std::vector<unsigned int> uint_vector_temp;
@@ -78,7 +80,16 @@ std::vector<unsigned int> BuildGuestPrimitiveGeometryShaderSpirv(
   } else {
     clip_distance_count = user_clip_plane_count;
   }
+  if (z_clip_distances) {
+    clip_distance_count += 2;
+  }
+  if (guard_band_clip_distances) {
+    clip_distance_count += 4;
+  }
   cull_distance_count += has_vertex_kill_and;
+  if (discard_band_cull_distances) {
+    cull_distance_count += 4;
+  }
 
   SpirvBuilder builder(spirv_version,
                        (SpirvShaderTranslator::kSpirvMagicToolId << 16) | 1,
@@ -414,8 +425,8 @@ std::vector<unsigned int> BuildGuestPrimitiveGeometryShaderSpirv(
     builder.setBuildPoint(&discard_merge_block);
   }
 
-  // Cull the whole primitive if any cull distance for all vertices in the
-  // primitive is < 0.
+  // Cull the whole primitive if any cull distance is < 0 for all of its
+  // vertices.
   // TODO(Triang3l): For points, handle ps_ucp_mode (transform the host clip
   // space to the guest one, calculate the distances to the user clip planes,
   // cull using the distance from the center for modes 0, 1 and 2, cull and clip
@@ -426,6 +437,7 @@ std::vector<unsigned int> BuildGuestPrimitiveGeometryShaderSpirv(
     spv::Id const_float_0 = builder.makeFloatConstant(0.0f);
     spv::Id cull_condition = spv::NoResult;
     for (uint32_t i = 0; i < cull_distance_count; ++i) {
+      spv::Id distance_cull_condition = spv::NoResult;
       for (uint32_t j = 0; j < input_primitive_vertex_count; ++j) {
         id_vector_temp.clear();
         id_vector_temp.push_back(builder.makeIntConstant(int32_t(j)));
@@ -438,13 +450,20 @@ std::vector<unsigned int> BuildGuestPrimitiveGeometryShaderSpirv(
                                           in_gl_per_vertex, id_vector_temp),
                 spv::NoPrecision),
             const_float_0);
-        if (cull_condition != spv::NoResult) {
-          cull_condition =
-              builder.createBinOp(spv::OpLogicalAnd, type_bool, cull_condition,
-                                  cull_distance_is_negative);
+        if (distance_cull_condition != spv::NoResult) {
+          distance_cull_condition = builder.createBinOp(
+              spv::OpLogicalAnd, type_bool, distance_cull_condition,
+              cull_distance_is_negative);
         } else {
-          cull_condition = cull_distance_is_negative;
+          distance_cull_condition = cull_distance_is_negative;
         }
+      }
+      if (cull_condition != spv::NoResult) {
+        cull_condition =
+            builder.createBinOp(spv::OpLogicalOr, type_bool, cull_condition,
+                                distance_cull_condition);
+      } else {
+        cull_condition = distance_cull_condition;
       }
     }
     assert_true(cull_condition != spv::NoResult);

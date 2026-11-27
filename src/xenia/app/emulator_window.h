@@ -27,6 +27,7 @@
 #include "xenia/ui/imgui_debug_dialog.h"
 #include "xenia/ui/imgui_dialog.h"
 #include "xenia/ui/imgui_drawer.h"
+#include "xenia/ui/imgui_music_dialog.h"
 #include "xenia/ui/imgui_performance_dialog.h"
 #include "xenia/ui/imgui_postprocessing_dialog.h"
 #include "xenia/ui/immediate_drawer.h"
@@ -45,10 +46,10 @@ namespace kernel {
 namespace nui {
 class KinectViewOverlay;
 }  // namespace nui
+namespace xam {
+class DashMouse;
+}  // namespace xam
 }  // namespace kernel
-}  // namespace xe
-
-namespace xe {
 namespace app {
 
 class GameListPanel;
@@ -116,6 +117,14 @@ class EmulatorWindow {
                                bool boot_animation = false);
   xe::X_STATUS RunTitle(const std::filesystem::path& path_to_file,
                         bool boot_animation = false);
+  // Offers the title update dialog before the game at |path| starts when a
+  // newer update is known for its release, or some are for its other releases
+  // while none is installed. The game's config has to be loaded first, since it
+  // can turn the offer off.
+  void OfferTitleUpdate(const std::filesystem::path& path);
+  // Notes a title the update index lists while none of its updates is
+  // installed, whether or not the offer is on.
+  void NoteMissingTitleUpdate(uint32_t title_id);
   void UpdateTitle();
 
   void SetFullscreen(bool fullscreen);
@@ -133,6 +142,7 @@ class EmulatorWindow {
 
   void ToggleProfilesConfigDialog();
   void ToggleAudioDialog();
+  void ToggleMusicDialog();
   void ToggleConfigDialog();
   void OpenConfigDialog(const std::string& category = "");
   void ToggleControllerVibration();
@@ -190,6 +200,9 @@ class EmulatorWindow {
     void OnMouseDown(ui::MouseEvent& e) override;
     void OnMouseUp(ui::MouseEvent& e) override;
     void OnMouseDoubleClick(ui::MouseEvent& e) override;
+    void OnMouseMove(ui::MouseEvent& e) override;
+    void OnMouseWheel(ui::MouseEvent& e) override;
+    void OnLostFocus(ui::UISetupEvent& e) override;
     void OnUsbDeviceChanged(bool is_arrival) override;
 
    private:
@@ -222,11 +235,23 @@ class EmulatorWindow {
       uint32_t title_id, const std::string& name,
       const std::filesystem::path& path);
 
+  // Keeps the title's frame rate current until the title shuts down.
+  void StartFrameRateTimer();
+
   void OnKeyDown(ui::KeyEvent& e);
   void OnMouseDown(const ui::MouseEvent& e);
-  void OnMouseDoubleClick(const ui::MouseEvent& e);
+  void OnMouseDoubleClick(ui::MouseEvent& e);
   void FileDrop(const std::filesystem::path& filename);
   void OnMouseUp(const ui::MouseEvent& e);
+  void OnMouseMove(const ui::MouseEvent& e);
+  void OnMouseWheel(const ui::MouseEvent& e);
+  // The dashboard's mouse input, while it takes the game window's mouse.
+  kernel::xam::DashMouse* GetDashMouse() const;
+  bool HasOpenDialogs() const;
+  // The mouse as fractions of the guest output, clamped to it, with whether
+  // it's over the output.
+  bool GetGuestOutputMousePosition(const ui::MouseEvent& e, float& x_out,
+                                   float& y_out, bool& inside_out) const;
   void FileClose();
   void UpdateAddGamesMenuState();
   void UpdateStartDashboardMenuState();
@@ -242,7 +267,6 @@ class EmulatorWindow {
   void CpuTimeScalarReset();
   void CpuTimeScalarSetHalf();
   void CpuTimeScalarSetDouble();
-  void CpuBreakIntoDebugger();
   void CpuBreakIntoHostDebugger();
   void GpuTraceFrame();
   void GpuClearCaches();
@@ -284,14 +308,19 @@ class EmulatorWindow {
   bool initializing_shader_storage_ = false;
   bool compiling_shaders_ = false;
   std::unique_ptr<wxTimer> compiling_shaders_hide_timer_;
+  // Refreshes the frame rate in the title while a title runs.
+  std::unique_ptr<wxTimer> frame_rate_timer_;
 
   ui::ImGuiPostProcessingDialog* postprocessing_dialog_ = nullptr;
   ui::ImGuiPerformanceDialog* performance_dialog_ = nullptr;
   ui::ImGuiDebugDialog* debug_dialog_ = nullptr;
   ProfileConfigDialog* profile_dialog_ = nullptr;
   ui::ImGuiAudioDialog* audio_dialog_ = nullptr;
+  ui::ImGuiMusicDialog* music_dialog_ = nullptr;
   ui::ImGuiConfirmDialog* stop_title_dialog_ = nullptr;
   ui::ImGuiContextMenu* context_menu_ = nullptr;
+  // Wheel turns toward the next detent sent to the dashboard.
+  int32_t dash_mouse_wheel_ = 0;
   std::unordered_set<ui::VirtualKey> hotkeys_down_;
 
   GameListPanel* game_list_panel_ = nullptr;
@@ -347,6 +376,10 @@ class EmulatorWindow {
   // Reapply the "render visible iff title open or fullscreen, game list
   // otherwise" invariant. Called on every relevant state change.
   void ApplyContentVisibility();
+  // Whether xenia may activate its window or move the focus into it on its
+  // own: never while hidden (disable_ui) and unattended only while it already
+  // has the focus, as nobody asked for it.
+  bool MayTakeFocus() const;
   // Shows the game list, windowed at the default size, after a title stops or
   // fails to launch.
   void RestoreListWindow();

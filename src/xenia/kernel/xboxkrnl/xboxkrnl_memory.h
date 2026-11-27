@@ -42,7 +42,7 @@ struct X_MM_QUERY_STATISTICS_RESULT {
 };
 static_assert_size(X_MM_QUERY_STATISTICS_RESULT, 104);
 
-uint32_t xeMmAllocatePhysicalMemoryEx(uint32_t flags, uint32_t region_size,
+uint32_t xeMmAllocatePhysicalMemoryEx(uint32_t type, uint32_t region_size,
                                       uint32_t protect_bits,
                                       uint32_t min_addr_range,
                                       uint32_t max_addr_range,
@@ -54,7 +54,10 @@ uint32_t xeAllocatePoolTypeWithTag(PPCContext* context, uint32_t size,
 
 void xeFreePool(PPCContext* context, uint32_t base_address);
 
-uint32_t xeMmCreateKernelStack(uint32_t size, uint32_t r4);
+uint32_t xeMmCreateKernelStack(uint32_t size, uint32_t type,
+                               uint32_t* out_alloc_base = nullptr);
+bool xeMmDeleteKernelStack(Memory* memory, uint32_t stack_base,
+                           uint32_t stack_limit);
 
 // Forgets segment array copies a title left mapped, as its memory goes away.
 void xeMmForgetSegmentArrays();

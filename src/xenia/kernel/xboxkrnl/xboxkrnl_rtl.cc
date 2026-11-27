@@ -7,6 +7,7 @@
  ******************************************************************************
  */
 
+#include <algorithm>
 #include <cwctype>
 
 #include "xenia/kernel/xboxkrnl/xboxkrnl_rtl.h"
@@ -296,11 +297,21 @@ void RtlCopyUnicodeString_entry(pointer_t<X_UNICODE_STRING> destination,
   if (length > 0) {
     auto dst_buf = kernel_memory()->TranslateVirtual(destination->pointer);
     auto src_buf = kernel_memory()->TranslateVirtual(source->pointer);
-    std::memcpy(dst_buf, src_buf, length * 2);
+    std::memcpy(dst_buf, src_buf, length);
   }
   destination->length = length;
+  // Terminated after the last whole character when there's room.
+  if (length < destination->maximum_length) {
+    kernel_memory()->TranslateVirtual<uint16_t*>(
+        destination->pointer)[length / 2] = 0;
+  }
 }
 DECLARE_XBOXKRNL_EXPORT1(RtlCopyUnicodeString, kNone, kImplemented);
+
+// A character as an ANSI byte, '?' for one past 0xFF.
+static uint8_t UnicodeCharToAnsi(char16_t c) {
+  return c < 0x100 ? static_cast<uint8_t>(c) : '?';
+}
 
 // https://msdn.microsoft.com/en-us/library/ff562969
 dword_result_t RtlUnicodeStringToAnsiString_entry(
@@ -313,7 +324,8 @@ dword_result_t RtlUnicodeStringToAnsiString_entry(
 
   std::u16string unicode_str =
       util::TranslateUnicodeString(kernel_memory(), source_ptr);
-  std::string ansi_str = xe::to_utf8(unicode_str);
+  std::string ansi_str(unicode_str.size(), '\0');
+  std::ranges::transform(unicode_str, ansi_str.begin(), UnicodeCharToAnsi);
   if (ansi_str.size() > 0xFFFF - 1) {
     return X_STATUS_INVALID_PARAMETER_2;
   }
@@ -336,11 +348,19 @@ dword_result_t RtlUnicodeStringToAnsiString_entry(
     if (buffer_capacity < ansi_str.size() + 1) {
       // Too large - we just write what we can.
       result = X_STATUS_BUFFER_OVERFLOW;
-      memcpy(buffer_ptr, ansi_str.data(), buffer_capacity - 1);
+      if (buffer_capacity) {
+        memcpy(buffer_ptr, ansi_str.data(), buffer_capacity - 1);
+        buffer_ptr[buffer_capacity - 1] = 0;
+        destination_ptr->length = static_cast<uint16_t>(buffer_capacity - 1);
+      } else {
+        // The length is set to the whole string's before the buffer is
+        // checked.
+        destination_ptr->length = static_cast<uint16_t>(ansi_str.size());
+      }
     } else {
       memcpy(buffer_ptr, ansi_str.data(), ansi_str.size() + 1);
+      destination_ptr->length = static_cast<uint16_t>(ansi_str.size());
     }
-    buffer_ptr[buffer_capacity - 1] = 0;  // \0
   }
   return result;
 }
@@ -382,8 +402,7 @@ dword_result_t RtlUnicodeToMultiByteN_entry(pointer_t<uint8_t> destination_ptr,
 
   // TODO(benvanik): maybe use UnicodeToMultiByte on Win32?
   for (uint32_t i = 0; i < copy_len; i++) {
-    uint16_t c = source_ptr[i];
-    destination_ptr[i] = c < 256 ? (uint8_t)c : '?';
+    destination_ptr[i] = UnicodeCharToAnsi(source_ptr[i]);
   }
 
   if (written_ptr.guest_address() != 0) {
@@ -535,12 +554,16 @@ DECLARE_XBOXKRNL_EXPORT1(RtlImageXexHeaderField, kNone, kImplemented);
 #pragma pack(push, 1)
 struct X_RTL_CRITICAL_SECTION {
   X_DISPATCH_HEADER header;
+  // Big-endian like the other fields, but kept as a plain int for the atomic
+  // operations; -1 and 0 read the same either way.
   int32_t lock_count;                          // 0x10 -1 -> 0 on first lock
   xe::be<int32_t> recursion_count;             // 0x14  0 -> 1 on first lock
   TypedGuestPointer<X_KTHREAD> owning_thread;  // 0x18 PKTHREAD 0 unless locked
 };
 #pragma pack(pop)
 static_assert_size(X_RTL_CRITICAL_SECTION, 28);
+
+uint32_t xeRtlCriticalSectionSize() { return sizeof(X_RTL_CRITICAL_SECTION); }
 
 void xeRtlInitializeCriticalSection(X_RTL_CRITICAL_SECTION* cs,
                                     uint32_t cs_ptr) {
@@ -585,6 +608,20 @@ dword_result_t RtlInitializeCriticalSectionAndSpinCount_entry(
 DECLARE_XBOXKRNL_EXPORT2(RtlInitializeCriticalSectionAndSpinCount, kNone,
                          kImplemented, kHighFrequency);
 
+// Adds to a critical section's big-endian LockCount and returns the new value.
+static int32_t CriticalSectionAddLockCount(X_RTL_CRITICAL_SECTION* cs,
+                                           int32_t delta) {
+  while (true) {
+    const int32_t old_raw =
+        *reinterpret_cast<volatile int32_t*>(&cs->lock_count);
+    const int32_t new_value = xe::byte_swap(old_raw) + delta;
+
+    if (xe::atomic_cas(old_raw, xe::byte_swap(new_value), &cs->lock_count)) {
+      return new_value;
+    }
+  }
+}
+
 static void CriticalSectionPrefetchW(const void* vp) {
 #if XE_ARCH_AMD64 == 1
   if (amd64::GetFeatureFlags() & amd64::kX64EmitPrefetchW) {
@@ -593,18 +630,14 @@ static void CriticalSectionPrefetchW(const void* vp) {
 #endif
 }
 
-void RtlEnterCriticalSection_entry(pointer_t<X_RTL_CRITICAL_SECTION> cs) {
-  if (!cs.guest_address()) {
-    XELOGE("Null critical section in RtlEnterCriticalSection!");
-    return;
-  }
+void xeRtlEnterCriticalSection(X_RTL_CRITICAL_SECTION* cs) {
   CriticalSectionPrefetchW(&cs->lock_count);
   uint32_t cur_thread = XThread::GetCurrentThread()->guest_object();
   uint32_t spin_count = cs->header.absolute * 256;
 
   if (cs->owning_thread == cur_thread) {
     // We already own the lock.
-    xe::atomic_inc(&cs->lock_count);
+    CriticalSectionAddLockCount(cs, 1);
     cs->recursion_count++;
     return;
   }
@@ -619,15 +652,22 @@ void RtlEnterCriticalSection_entry(pointer_t<X_RTL_CRITICAL_SECTION> cs) {
     }
   }
 
-  if (xe::atomic_inc(&cs->lock_count) != 0) {
+  if (CriticalSectionAddLockCount(cs, 1) != 0) {
     // Create a full waiter.
-    xeKeWaitForSingleObject(reinterpret_cast<void*>(cs.host_address()), 8, 0, 0,
-                            nullptr);
+    xeKeWaitForSingleObject(reinterpret_cast<void*>(cs), 8, 0, 0, nullptr);
   }
 
   assert_true(cs->owning_thread == 0);
   cs->owning_thread = cur_thread;
   cs->recursion_count = 1;
+}
+
+void RtlEnterCriticalSection_entry(pointer_t<X_RTL_CRITICAL_SECTION> cs) {
+  if (!cs.guest_address()) {
+    XELOGE("Null critical section in RtlEnterCriticalSection!");
+    return;
+  }
+  xeRtlEnterCriticalSection(cs);
 }
 DECLARE_XBOXKRNL_EXPORT2(RtlEnterCriticalSection, kNone, kImplemented,
                          kHighFrequency);
@@ -648,7 +688,7 @@ dword_result_t RtlTryEnterCriticalSection_entry(
     return 1;
   } else if (cs->owning_thread == thread) {
     // Already own the lock.
-    xe::atomic_inc(&cs->lock_count);
+    CriticalSectionAddLockCount(cs, 1);
     ++cs->recursion_count;
     return 1;
   }
@@ -659,11 +699,7 @@ dword_result_t RtlTryEnterCriticalSection_entry(
 DECLARE_XBOXKRNL_EXPORT2(RtlTryEnterCriticalSection, kNone, kImplemented,
                          kHighFrequency);
 
-void RtlLeaveCriticalSection_entry(pointer_t<X_RTL_CRITICAL_SECTION> cs) {
-  if (!cs.guest_address()) {
-    XELOGE("Null critical section in RtlLeaveCriticalSection!");
-    return;
-  }
+void xeRtlLeaveCriticalSection(X_RTL_CRITICAL_SECTION* cs, uint32_t cs_ptr) {
   // Retail RtlLeaveCriticalSection does not check ownership, it just
   // decrements. A non-owner leave is a caller error but titles rely on it, so
   // log not assert.
@@ -673,7 +709,7 @@ void RtlLeaveCriticalSection_entry(pointer_t<X_RTL_CRITICAL_SECTION> cs) {
         "RtlLeaveCriticalSection {:08X} left by non-owner (owner {:08X}, "
         "caller "
         "{:08X})",
-        cs.guest_address(), uint32_t(cs->owning_thread.m_ptr), leaving_thread);
+        cs_ptr, uint32_t(cs->owning_thread.m_ptr), leaving_thread);
   }
 
   // Drop recursion count - if it isn't zero we still have the lock.
@@ -681,16 +717,24 @@ void RtlLeaveCriticalSection_entry(pointer_t<X_RTL_CRITICAL_SECTION> cs) {
   if (--cs->recursion_count != 0) {
     assert_true(cs->recursion_count >= 0);
 
-    xe::atomic_dec(&cs->lock_count);
+    CriticalSectionAddLockCount(cs, -1);
     return;
   }
 
   // Not owned - unlock!
   cs->owning_thread = 0;
-  if (xe::atomic_dec(&cs->lock_count) != -1) {
+  if (CriticalSectionAddLockCount(cs, -1) != -1) {
     // There were waiters - wake one of them.
-    xeKeSetEvent(reinterpret_cast<X_KEVENT*>(cs.host_address()), 1, 0);
+    xeKeSetEvent(reinterpret_cast<X_KEVENT*>(cs), 1, 0);
   }
+}
+
+void RtlLeaveCriticalSection_entry(pointer_t<X_RTL_CRITICAL_SECTION> cs) {
+  if (!cs.guest_address()) {
+    XELOGE("Null critical section in RtlLeaveCriticalSection!");
+    return;
+  }
+  xeRtlLeaveCriticalSection(cs, cs.guest_address());
 }
 DECLARE_XBOXKRNL_EXPORT2(RtlLeaveCriticalSection, kNone, kImplemented,
                          kHighFrequency);
@@ -710,10 +754,9 @@ static_assert_size(X_TIME_FIELDS, 16);
 // https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-rtltimetotimefields
 void RtlTimeToTimeFields_entry(lpqword_t time_ptr,
                                pointer_t<X_TIME_FIELDS> time_fields_ptr) {
-  // Use host clock because we don't want scaling to be applied, just conversion
-  using xe::chrono::WinSystemClock;
   auto tp =
-      WinSystemClock::to_sys(WinSystemClock::from_file_time(time_ptr.value()));
+      xe::chrono::filetime_epoch +
+      xe::chrono::hundrednanoseconds{static_cast<int64_t>(time_ptr.value())};
   auto dp = date::floor<date::days>(tp);
   auto year_month_day = date::year_month_day{dp};
   auto weekday = date::weekday{dp};
@@ -733,7 +776,6 @@ DECLARE_XBOXKRNL_EXPORT1(RtlTimeToTimeFields, kNone, kImplemented);
 // https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-rtltimefieldstotime
 dword_result_t RtlTimeFieldsToTime_entry(
     pointer_t<X_TIME_FIELDS> time_fields_ptr, lpqword_t time_ptr) {
-  using xe::chrono::WinSystemClock;
   if (time_fields_ptr->year < 1601 || time_fields_ptr->month < 1 ||
       time_fields_ptr->month > 12 || time_fields_ptr->day < 1 ||
       time_fields_ptr->day > 31 || time_fields_ptr->hour > 23 ||
@@ -749,12 +791,13 @@ dword_result_t RtlTimeFieldsToTime_entry(
     return 0;
   }
   auto dp = static_cast<date::sys_days>(year_month_day);
-  std::chrono::system_clock::time_point time = dp;
-  time += std::chrono::hours{time_fields_ptr->hour};
-  time += std::chrono::minutes{time_fields_ptr->minute};
-  time += std::chrono::seconds{time_fields_ptr->second};
-  time += std::chrono::milliseconds{time_fields_ptr->milliseconds};
-  *time_ptr = WinSystemClock::to_file_time(WinSystemClock::from_sys(time));
+  auto time = std::chrono::duration_cast<xe::chrono::hundrednanoseconds>(
+      (dp - xe::chrono::filetime_epoch) +
+      std::chrono::hours{time_fields_ptr->hour} +
+      std::chrono::minutes{time_fields_ptr->minute} +
+      std::chrono::seconds{time_fields_ptr->second} +
+      std::chrono::milliseconds{time_fields_ptr->milliseconds});
+  *time_ptr = static_cast<uint64_t>(time.count());
   return 1;
 }
 DECLARE_XBOXKRNL_EXPORT1(RtlTimeFieldsToTime, kNone, kImplemented);
@@ -911,9 +954,13 @@ void StoreContextRecord(uint8_t* p, const PPCContext* ctx, uint32_t iar,
     xe::store_and_swap<double>(p + kContextFpr + i * 8, ctx->f[i]);
   }
   xe::store_and_swap<uint32_t>(p + kContextUserModeControl, 0);
+  // SAT lives apart in vscr_sat, as mfvscr merges it into the low bit
   for (size_t i = 0; i < 4; ++i) {
-    xe::store_and_swap<uint32_t>(p + kContextVscr + i * 4,
-                                 ctx->vscr_vec.u32[i]);
+    uint32_t word = ctx->vscr_vec.u32[i];
+    if (i == 3) {
+      word |= ctx->vscr_sat & 1u;
+    }
+    xe::store_and_swap<uint32_t>(p + kContextVscr + i * 4, word);
   }
   for (size_t i = 0; i < 128; ++i) {
     for (size_t j = 0; j < 4; ++j) {
@@ -939,6 +986,7 @@ uint32_t LoadContextRecord(const uint8_t* p, PPCContext* ctx) {
     ctx->vscr_vec.u32[i] =
         xe::load_and_swap<uint32_t>(p + kContextVscr + i * 4);
   }
+  ctx->vscr_sat = static_cast<uint8_t>(ctx->vscr_vec.u32[3] & 1);
   for (size_t i = 0; i < 128; ++i) {
     for (size_t j = 0; j < 4; ++j) {
       ctx->v[i].u32[j] =

@@ -107,6 +107,8 @@ class GameListPanel : public wxPanel {
   void OnSearch(wxCommandEvent& event);
   void OnItemActivated(int index);
   void OnSelectionChanged(bool clicked);
+  // Writes the sort key and direction to the wx config.
+  void SaveSort();
   void OnSortChanged();
   // Compat DB state for `e`, optimistically upgraded by the user's local
   // achievement progress (10%+ promotes Unknown to Gameplay; 80%+ promotes

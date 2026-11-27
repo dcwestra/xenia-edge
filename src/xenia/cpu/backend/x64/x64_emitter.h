@@ -10,6 +10,7 @@
 #ifndef XENIA_CPU_BACKEND_X64_X64_EMITTER_H_
 #define XENIA_CPU_BACKEND_X64_X64_EMITTER_H_
 
+#include <deque>
 #include <vector>
 
 #include "xenia/base/arena.h"
@@ -112,6 +113,7 @@ enum XmmConst {
   XMMUnpackFLOAT16_4,
   XMMPackSHORT_Min,
   XMMPackSHORT_Max,
+  XMMPackSHORT_NaN,
   XMMPackSHORT_2,
   XMMPackSHORT_4,
   XMMUnpackSHORT_2,
@@ -119,12 +121,14 @@ enum XmmConst {
   XMMUnpackSHORT_Overflow,
   XMMPackUINT_2101010_MinUnpacked,
   XMMPackUINT_2101010_MaxUnpacked,
+  XMMPackUINT_2101010_NaN,
   XMMPackUINT_2101010_MaskUnpacked,
   XMMPackUINT_2101010_MaskPacked,
   XMMPackUINT_2101010_Shift,
   XMMUnpackUINT_2101010_Overflow,
   XMMPackULONG_4202020_MinUnpacked,
   XMMPackULONG_4202020_MaxUnpacked,
+  XMMPackULONG_4202020_NaN,
   XMMPackULONG_4202020_MaskUnpacked,
   XMMPackULONG_4202020_PermuteXZ,
   XMMPackULONG_4202020_PermuteYW,
@@ -170,20 +174,46 @@ enum XmmConst {
   XMMXOPByteShiftMask,
   XMMXOPWordShiftMask,
   XMMXOPDwordShiftMask,
-  XMMVSRShlByteshuf,
-  XMMVSRMask,
-  // vexptefp/vlogefp. The guest ops are 11-bit estimates, so the results get
-  // snapped to a 2^-11 grid; these polynomials only have to beat that.
-  XMMExp2Poly,                    // 6 entries, 2^f minimax on [0,1)
-  XMMLog2Poly = XMMExp2Poly + 6,  // 7 entries, log2(1+u) minimax on [0,1]
-  XMMEstScale = XMMLog2Poly + 7,  // 2048.0f
-  XMMEstUnscale,                  // 1.0f / 2048.0f
-  XMMExp2Max,                     // 128.0f, at or above this 2^x is inf
-  XMMExp2Min,                     // -126.0f, below this 2^x is flushed to 0
-  XMMQuietBit,                    // 0x00400000
-  XMMFloatNegInf,                 // 0xFF800000
-  XMMMantissaMask,                // 0x007FFFFF
-  XMMVRsqrteTableStart,
+  // For vsl and vsr, see EmitShiftBitsPerByte
+  XMMShiftBitsPowers,
+  XMMShiftBitsInversePowers,
+  XMMShlBitsEvenWindows,
+  XMMShlBitsOddWindows,
+  XMMShrBitsEvenWindows,
+  XMMShiftBitsEvenCounts,
+  XMMShiftBitsOddCounts,
+  XMMShiftBitsHighBytes,
+  XMMQuietBit,  // 0x00400000
+  // Clears the bits of a double below single precision, so converting it to
+  // single rounds toward zero
+  XMMDoubleToSingleTruncateMask,
+  // For ARITHMETIC_SINGLE_RANGE, see EmitSingleRangeCheck
+  XMMSingleRangeBias,
+  XMMSingleRangeLimit,
+  // For vmsum3fp128 and vmsum4fp128, see EmitVectorMultiplySum
+  XMMVmsumInverseGridBase,
+  XMMVmsumGridSum,
+  XMMVmsum3Adjust,  // 4 entries, by the number of negative products
+  XMMVmsum4Adjust = XMMVmsum3Adjust + 4,  // 5 entries
+  // For the inline vrefp, see RECIP_V128
+  XMMVRefpStepMask = XMMVmsum4Adjust + 5,
+  XMMVRefpSlopeMask,
+  XMMVRefpMantissaMask,
+  XMMVRefpExponentBias,
+  XMMVRefpLargeLimit,
+  XMMVRefpSmallestNormal,
+  // For the inline vlogefp and vexptefp, see LOG2_V128 and POW2_V128
+  XMMEstimateIndexMask,
+  XMMEstimateExponentMask,
+  XMMVLogeExponentBias,
+  XMMVLogeScale,
+  XMMVLogeZeroResult,
+  XMMVExpteShiftBase,
+  XMMVExpteExponentBias,
+  XMMVExpteSmallestExponent,
+  XMMVExpteLargestInputExponent,
+  XMMVRefpTable,
+  XMMVRsqrteTableStart = XMMVRefpTable + (32 / 4),
   XMMVRsqrteTableBase =
       XMMVRsqrteTableStart +
       (32 /
@@ -283,6 +313,11 @@ class X64Emitter : public Xbyak::CodeGenerator {
   // calling it. Returns false when the callee is not a GPR saverest helper.
   bool TryInlinePPCGprLrSaveRestore(const hir::Instr* instr,
                                     const GuestFunction* function);
+  bool InlinesPPCGprLrSaveRestore(const hir::Instr* instr,
+                                  const GuestFunction* function) const;
+  // Whether |instr| calls or branches to guest code, a saverest helper inlined
+  // in place aside, or calls host code, traps included.
+  bool MakesCall(const hir::Instr* instr) const;
   void CallIndirect(const hir::Instr* instr, const Xbyak::Reg64& reg);
   void CallExtern(const hir::Instr* instr, const Function* function);
   void CallNative(void* fn);
@@ -325,8 +360,29 @@ class X64Emitter : public Xbyak::CodeGenerator {
     return (feature_flags_ & feature_flag) == feature_flag;
   }
 
+  // The label stays valid for the whole function, even as more tails are
+  // added, and a tail's callback may add tails of its own.
   Xbyak::Label& AddToTail(TailEmitCallback callback, uint32_t alignment = 0);
   Xbyak::Label& NewCachedLabel();
+
+  // A TO_SINGLE_KEEP_NAN reading the result of the F64 operation right before
+  // it leaves the NaN to that operation, which tests its result anyway: the
+  // operation's NaN exits hand the NaN to the TO_SINGLE's dest and jump to
+  // exit, past the conversion, where the TO_SINGLE binds it. Set by the
+  // operation, taken by the TO_SINGLE.
+  void MarkFusedToSingle(const hir::Instr* to_single, Xbyak::Label* exit) {
+    fused_to_single_ = to_single;
+    fused_to_single_exit_ = exit;
+  }
+  const hir::Instr* fused_to_single() const { return fused_to_single_; }
+  Xbyak::Label* fused_to_single_exit() const { return fused_to_single_exit_; }
+  Xbyak::Label* ConsumeFusedToSingle(const hir::Instr* to_single) {
+    if (!fused_to_single_ || fused_to_single_ != to_single) {
+      return nullptr;
+    }
+    fused_to_single_ = nullptr;
+    return fused_to_single_exit_;
+  }
 
   // Emits a cooperative-scheduler preemption safepoint: yields the fiber once
   // the context's preempt_requested flag is raised. Only valid at a block head.
@@ -458,11 +514,20 @@ class X64Emitter : public Xbyak::CodeGenerator {
     which would have to represent 0 as 4 bytes
   */
   bool may_use_membase32_as_zero_reg_;
-  std::vector<TailEmitter> tail_code_;
+  // A deque, so adding a tail doesn't move the labels already handed out
+  std::deque<TailEmitter> tail_code_;
   std::vector<Xbyak::Label*>
       label_cache_;  // for creating labels that need to be referenced much
                      // later by tail emitters
   MXCSRMode mxcsr_mode_ = MXCSRMode::Unknown;
+  // Whether this function records a stackpoint. One that makes no call has no
+  // return sites, so no unwind ever restores its frame, and it is never below
+  // another frame, so a pseudo stack trace, taken from the frames that called
+  // out, has nothing to show for it either. Every tail branch, and so every
+  // dynamic one, leaves from a frame that has its record.
+  bool function_has_stackpoint_ = true;
+  const hir::Instr* fused_to_single_ = nullptr;
+  Xbyak::Label* fused_to_single_exit_ = nullptr;
 };
 
 }  // namespace x64

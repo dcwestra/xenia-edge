@@ -24,8 +24,6 @@
 #include "xenia/base/profiling.h"
 #include "xenia/base/threading.h"
 #include "xenia/config.h"
-#include "xenia/debug/gdb/gdbstub.h"
-#include "xenia/debug/ui/debug_window.h"
 #include "xenia/emulator.h"
 #include "xenia/kernel/xam/xam_module.h"
 #include "xenia/ui/file_picker.h"
@@ -89,11 +87,6 @@ DEFINE_path(
     "for the OS, will be used.",
     "Storage");
 
-DECLARE_bool(mount_scratch);
-DECLARE_bool(mount_cache);
-DECLARE_bool(mount_memory_unit);
-DECLARE_bool(force_mount_devkit);
-
 // Positional cvar bound to the first non-flag argv entry (see
 // EmulatorApp::EmulatorApp -> AddPositionalOption("target")).
 DEFINE_transient_path(target, "", "Specifies the target file to run.",
@@ -106,11 +99,7 @@ DEFINE_transient_bool(portable, false,
                       "Specifies if Xenia should run in portable mode.",
                       "General");
 
-DECLARE_bool(debug);
-DEFINE_int32(
-    gdbport, 0,
-    "Port for GDBStub debugger to listen on, requires --debug (0 = disable)",
-    "General");
+DECLARE_bool(disable_ui);
 
 DEFINE_bool(discord, true, "Enable Discord rich presence", "General");
 
@@ -323,17 +312,6 @@ class EmulatorApp final : public xe::ui::WindowedApp {
     }
   };
 
-  class DebugWindowClosedListener final : public xe::ui::WindowListener {
-   public:
-    explicit DebugWindowClosedListener(EmulatorApp& emulator_app)
-        : emulator_app_(emulator_app) {}
-
-    void OnClosing(xe::ui::UIEvent& e) override;
-
-   private:
-    EmulatorApp& emulator_app_;
-  };
-
   explicit EmulatorApp(xe::ui::WindowedAppContext& app_context);
 
   static std::unique_ptr<apu::AudioSystem> CreateAudioSystem(
@@ -345,16 +323,8 @@ class EmulatorApp final : public xe::ui::WindowedApp {
   void EmulatorThread();
   void ShutdownEmulatorThreadFromUIThread();
 
-  DebugWindowClosedListener debug_window_closed_listener_;
-
   std::unique_ptr<Emulator> emulator_;
   std::unique_ptr<EmulatorWindow> emulator_window_;
-
-  // Created on demand, used by the emulator.
-  std::unique_ptr<xe::debug::ui::DebugWindow> debug_window_;
-#if XE_PLATFORM_WIN32
-  std::unique_ptr<xe::debug::gdb::GDBStub> debug_gdbstub_;
-#endif
 
   // Refreshing the emulator - placed after its dependencies.
   std::atomic<bool> emulator_thread_quit_requested_;
@@ -362,15 +332,8 @@ class EmulatorApp final : public xe::ui::WindowedApp {
   std::thread emulator_thread_;
 };
 
-void EmulatorApp::DebugWindowClosedListener::OnClosing(xe::ui::UIEvent& e) {
-  EmulatorApp* emulator_app = &emulator_app_;
-  emulator_app->emulator_->processor()->set_debug_listener(nullptr);
-  emulator_app->debug_window_.reset();
-}
-
 EmulatorApp::EmulatorApp(xe::ui::WindowedAppContext& app_context)
-    : xe::ui::WindowedApp(app_context, "xenia", "[Path to .iso/.xex]"),
-      debug_window_closed_listener_(*this) {
+    : xe::ui::WindowedApp(app_context, "xenia", "[Path to .iso/.xex]") {
   AddPositionalOption("target");
 }
 
@@ -532,6 +495,17 @@ std::vector<std::unique_ptr<hid::InputDriver>> EmulatorApp::CreateInputDrivers(
 }
 
 bool EmulatorApp::OnInitialize() {
+  // Nobody could answer a dialog in a window that isn't shown or close it.
+  if (cvars::disable_ui && !xe::IsUnattended()) {
+    xe::FatalError("disable_ui needs unattended.");
+    return false;
+  }
+  // Unattended, there's no game list to pick a title from.
+  if (xe::IsUnattended() && cvars::target.empty()) {
+    XELOGE("Unattended runs need a target");
+    xe::ExitUnattended(EXIT_FAILURE, "no target");
+  }
+
   Profiler::Initialize();
   Profiler::ThreadEnter("Main");
 
@@ -629,6 +603,12 @@ bool EmulatorApp::OnInitialize() {
 }
 
 void EmulatorApp::OnDestroy() {
+  // Title exits and crashes end an unattended run before this, any other quit
+  // is a failure to run it.
+  if (xe::IsUnattended()) {
+    xe::ExitUnattended(EXIT_FAILURE, "emulator quit");
+  }
+
   ShutdownEmulatorThreadFromUIThread();
 
   if (cvars::discord) {
@@ -664,42 +644,8 @@ void EmulatorApp::EmulatorThread() {
 
   emulator_->MountStandardDrives();
 
-  // Set a debug handler.
-  // This will respond to debugging requests so we can open the debug UI.
-  if (cvars::debug) {
-    if (cvars::gdbport > 0) {
-#if XE_PLATFORM_WIN32
-      emulator_->processor()->set_debug_listener_request_handler(
-          [this](xe::cpu::Processor* processor) {
-            if (debug_gdbstub_) {
-              return debug_gdbstub_.get();
-            }
-            debug_gdbstub_ = xe::debug::gdb::GDBStub::Create(emulator_.get(),
-                                                             cvars::gdbport);
-            return debug_gdbstub_.get();
-          });
-      emulator_->processor()->ShowDebugger();
-#endif
-    } else {
-      emulator_->processor()->set_debug_listener_request_handler(
-          [this](xe::cpu::Processor* processor) {
-            if (debug_window_) {
-              return debug_window_.get();
-            }
-            app_context().CallInUIThreadSynchronous([this]() {
-              debug_window_ = xe::debug::ui::DebugWindow::Create(
-                  emulator_.get(), app_context());
-              debug_window_->window()->AddListener(
-                  &debug_window_closed_listener_);
-            });
-            // If failed to enqueue the UI thread call, this will just be null.
-            return debug_window_.get();
-          });
-    }
-  }
-
   emulator_->on_launch.AddListener([&](auto title_id, const auto& game_title) {
-    if (cvars::discord) {
+    if (cvars::discord && !xe::IsUnattended()) {
       discord::DiscordPresence::Initialize();
       discord::DiscordPresence::PlayingTitle(
           game_title.empty() ? "Unknown Title" : std::string(game_title));
@@ -835,8 +781,11 @@ void EmulatorApp::EmulatorThread() {
 
   // Now, we're going to use this thread to drive events related to emulation.
   while (!emulator_thread_quit_requested_.load(std::memory_order_relaxed)) {
-    xe::threading::Wait(emulator_thread_event_.get(), false);
+    xe::threading::Wait(emulator_thread_event_.get());
     emulator_->WaitUntilExit();
+    if (xe::IsUnattended()) {
+      xe::ExitUnattended(EXIT_SUCCESS, "title exited");
+    }
   }
 }
 

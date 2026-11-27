@@ -18,6 +18,11 @@
 
 #include "xenia/base/cvar.h"
 
+DEFINE_transient_bool(disable_ui, false,
+                      "Shows no window. Needs unattended, since nobody could "
+                      "answer a dialog or close Xenia.",
+                      "General");
+
 DEFINE_bool(disable_doubleclick_fullscreen, false,
             "Allows the user to disable the behavior where a fast double-click "
             "causes Xenia to enter fullscreen mode.",
@@ -119,7 +124,9 @@ static wxPoint ReadInitialFramePositionFromConfig() {
 }
 
 void WxWindow::SaveGeometryToConfig() {
-  if (!frame_ || frame_->IsFullScreen()) {
+  // A frame disable_ui keeps hidden was never placed and has no geometry worth
+  // keeping.
+  if (!frame_ || frame_->IsFullScreen() || cvars::disable_ui) {
     return;
   }
   auto* config = wxConfigBase::Get();
@@ -189,12 +196,8 @@ WxWindow::WxWindow(WindowedAppContext& app_context,
 WxWindow::~WxWindow() {
   EnterDestructor();
 #if XE_PLATFORM_LINUX
-  {
-    std::lock_guard<std::mutex> lock(pending_paint_mutex_);
-    if (pending_paint_source_) {
-      g_source_remove(pending_paint_source_);
-      pending_paint_source_ = 0;
-    }
+  if (paint_idle_pending_) {
+    g_idle_remove_by_data(this);
   }
 #endif
 #if XE_PLATFORM_WIN32
@@ -379,18 +382,22 @@ bool WxWindow::OpenImpl() {
   }
 #endif
 
-  RestoreGeometryFromConfig();
+  // disable_ui keeps the frame hidden for the whole run.
+  if (!cvars::disable_ui) {
+    RestoreGeometryFromConfig();
 
 #if XE_PLATFORM_LINUX
-  frame_->Show(true);
-  if (IsFullscreen()) {
-    frame_->ShowFullScreen(true,
-                           wxFULLSCREEN_ALL & ~long(wxFULLSCREEN_NOMENUBAR));
-    ApplyMenuBarVisibility();
-  }
+    frame_->Show(true);
+    if (IsFullscreen()) {
+      frame_->ShowFullScreen(true,
+                             wxFULLSCREEN_ALL & ~long(wxFULLSCREEN_NOMENUBAR));
+      ApplyMenuBarVisibility();
+    }
 #else
-  if (IsFullscreen()) {
-    frame_->ShowFullScreen(true);
+    if (IsFullscreen()) {
+      frame_->ShowFullScreen(true);
+    }
+#endif
   }
 
 #if XE_PLATFORM_MAC
@@ -399,9 +406,12 @@ bool WxWindow::OpenImpl() {
   frame_->EnableFullScreenView(true);
 #endif
 
-  frame_->Show(true);
+  if (!cvars::disable_ui) {
+#if !XE_PLATFORM_LINUX
+    frame_->Show(true);
 #endif
-  render_target()->SetFocus();
+    render_target()->SetFocus();
+  }
 
   wxSize client_size = render_target()->GetClientSize();
   WindowDestructionReceiver destruction_receiver(this);
@@ -425,6 +435,9 @@ uint32_t WxWindow::GetLatestDpiImpl() const { return dpi_; }
 
 void WxWindow::ApplyNewFullscreen() {
   if (!frame_) {
+    return;
+  }
+  if (cvars::disable_ui) {
     return;
   }
   bool fullscreen = IsFullscreen();
@@ -630,22 +643,16 @@ void WxWindow::RequestPaintImpl() {
   }
 #elif XE_PLATFORM_LINUX
   // Schedule via glib's main loop (not wx's pending-event queue) so X11 input
-  // events at higher priority preempt back-to-back paints. May be called from
-  // the guest output thread, see pending_paint_mutex_.
-  std::lock_guard<std::mutex> lock(pending_paint_mutex_);
-  if (pending_paint_source_) {
+  // events at higher priority preempt back-to-back paints.
+  // Called from the GPU thread too, the idle can run before its id is returned.
+  if (paint_idle_pending_.exchange(true)) {
     return;
   }
-  pending_paint_source_ = g_idle_add_full(
+  g_idle_add_full(
       G_PRIORITY_LOW,
       [](gpointer user_data) -> gboolean {
         auto* self = static_cast<WxWindow*>(user_data);
-        {
-          // Cleared before painting, so a request made during the paint
-          // schedules another one.
-          std::lock_guard<std::mutex> lock(self->pending_paint_mutex_);
-          self->pending_paint_source_ = 0;
-        }
+        self->paint_idle_pending_.store(false);
         if (self->render_panel_) {
           self->OnPaint(true);
         }
@@ -880,7 +887,12 @@ void WxWindow::OnPanelPaint(wxPaintEvent& event) {
 }
 
 void WxWindow::OnPanelDoubleClick(wxMouseEvent& event) {
-  if (cvars::disable_doubleclick_fullscreen) {
+  MouseEvent mouse_event(this, MouseEvent::Button::kLeft, event.GetX(),
+                         event.GetY());
+  WindowDestructionReceiver destruction_receiver(this);
+  OnMouseDoubleClick(mouse_event, destruction_receiver);
+  if (destruction_receiver.IsWindowDestroyed() || mouse_event.is_handled() ||
+      cvars::disable_doubleclick_fullscreen) {
     return;
   }
   bool entering_fullscreen = !IsFullscreen();

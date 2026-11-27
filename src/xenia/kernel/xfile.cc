@@ -12,7 +12,6 @@
 
 #include <algorithm>
 
-#include "xenia/base/byte_stream.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/filesystem.h"
 #include "xenia/base/threading.h"
@@ -31,11 +30,6 @@ XFile::XFile(KernelState* kernel_state, vfs::File* file, bool synchronous,
       is_synchronous_(synchronous),
       is_alertable_(alertable),
       is_buffered_(buffered) {
-  async_event_ = threading::Event::CreateManualResetEvent(false);
-  assert_not_null(async_event_);
-}
-
-XFile::XFile() : XObject(kObjectType), completion_port_lock_() {
   async_event_ = threading::Event::CreateManualResetEvent(false);
   assert_not_null(async_event_);
 }
@@ -114,7 +108,8 @@ X_STATUS XFile::QueryDirectoryInternal(X_FILE_DIRECTORY_INFORMATION* out_info,
   out_info->next_entry_offset = 0;
   out_info->file_index = static_cast<uint32_t>(find_index_);
   out_info->creation_time = entry->create_timestamp();
-  out_info->last_access_time = entry->access_timestamp();
+  // FATX lists the write time as the access time.
+  out_info->last_access_time = entry->write_timestamp();
   out_info->last_write_time = entry->write_timestamp();
   out_info->change_time = entry->write_timestamp();
   out_info->end_of_file = entry->size();
@@ -250,11 +245,12 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address,
   return result;
 }
 
-void XFile::PostIo(XThread* thread, std::function<void(bool cancelled)> fn) {
+void XFile::PostIo(XThread* thread, uint64_t deadline_ms,
+                   std::function<void(bool cancelled)> fn) {
   thread->AddPostedIo();
   {
     std::lock_guard<std::mutex> lock(posted_lock_);
-    posted_.emplace_back(thread, std::move(fn));
+    posted_.push_back({thread, deadline_ms, std::move(fn)});
     if (posted_running_) {
       return;
     }
@@ -266,14 +262,27 @@ void XFile::PostIo(XThread* thread, std::function<void(bool cancelled)> fn) {
 }
 
 void XFile::RunPostedIo() {
+  auto* scheduler = kernel_state()->guest_scheduler();
   std::unique_lock<std::mutex> lock(posted_lock_);
   while (!posted_.empty()) {
-    auto [thread, fn] = std::move(posted_.front());
+    // A request runs at its deadline and the ones behind it wait their turn.
+    // This comes back then instead of holding the worker. Shutdown runs them
+    // at once.
+    const uint64_t deadline_ms = posted_.front().deadline_ms;
+    if (deadline_ms > Clock::QueryHostUptimeMillis() &&
+        !scheduler->shutting_down()) {
+      lock.unlock();
+      scheduler->PostHostCallAt(
+          deadline_ms, [file = retain_object(this)]() { file->RunPostedIo(); },
+          io_call_class());
+      return;
+    }
+    PostedIo posted = std::move(posted_.front());
     posted_.pop_front();
-    posted_running_thread_ = thread;
+    posted_running_thread_ = posted.thread;
     lock.unlock();
-    fn(false);
-    thread->RemovePostedIo();
+    posted.fn(false);
+    posted.thread->RemovePostedIo();
     lock.lock();
     posted_running_thread_ = nullptr;
   }
@@ -285,8 +294,8 @@ void XFile::CancelPostedIo(XThread* thread) {
   {
     std::lock_guard<std::mutex> lock(posted_lock_);
     for (auto it = posted_.begin(); it != posted_.end();) {
-      if (it->first == thread) {
-        cancelled.push_back(std::move(it->second));
+      if (it->thread == thread) {
+        cancelled.push_back(std::move(it->fn));
         it = posted_.erase(it);
       } else {
         ++it;
@@ -305,7 +314,7 @@ bool XFile::HasPostedIo(XThread* thread) {
     return true;
   }
   for (const auto& posted : posted_) {
-    if (posted.first == thread) {
+    if (posted.thread == thread) {
       return true;
     }
   }
@@ -313,8 +322,10 @@ bool XFile::HasPostedIo(XThread* thread) {
 }
 
 uint64_t XFile::ReserveDriveTime(uint64_t byte_offset, uint32_t length) {
-  // An async completion runs on a shared I/O worker, which must not block.
-  if (GuestScheduler::CurrentThreadIsBlockingCallWorker()) {
+  // A worker runs a request that pends, which was booked as it was issued.
+  // Shutdown runs requests inline and untimed.
+  if (GuestScheduler::CurrentThreadIsBlockingCallWorker() ||
+      kernel_state()->guest_scheduler()->shutting_down()) {
     return 0;
   }
   // A caller holding the global lock cannot release it to wait.
@@ -549,61 +560,6 @@ void XFile::RemoveIOCompletionPort(uint32_t key) {
       break;
     }
   }
-}
-
-bool XFile::Save(ByteStream* stream) {
-  // XELOGD("XFile {:08X} ({})", handle(),
-  //        file_->entry()->absolute_path().c_str());
-
-  if (!SaveObject(stream)) {
-    return false;
-  }
-
-  stream->Write(std::string_view(file_->entry()->absolute_path()));
-  stream->Write<uint64_t>(position_);
-  stream->Write(file_access());
-  stream->Write<bool>(
-      (file_->entry()->attributes() & vfs::kFileAttributeDirectory) != 0);
-  stream->Write<bool>(is_synchronous_);
-  stream->Write<bool>(is_buffered_);
-
-  return true;
-}
-
-object_ref<XFile> XFile::Restore(KernelState* kernel_state,
-                                 ByteStream* stream) {
-  auto file = new XFile();
-  file->kernel_state_ = kernel_state;
-  if (!file->RestoreObject(stream)) {
-    delete file;
-    return nullptr;
-  }
-
-  auto abs_path = stream->Read<std::string>();
-  uint64_t position = stream->Read<uint64_t>();
-  auto access = stream->Read<uint32_t>();
-  auto is_directory = stream->Read<bool>();
-  auto is_synchronous = stream->Read<bool>();
-  auto is_buffered = stream->Read<bool>();
-
-  // XELOGD("XFile {:08X} ({})", file->handle(), abs_path);
-
-  vfs::File* vfs_file = nullptr;
-  vfs::FileAction action;
-  auto res = kernel_state->file_system()->OpenFile(
-      nullptr, abs_path, vfs::FileDisposition::kOpen, access, is_directory,
-      false, &vfs_file, &action);
-  if (XFAILED(res)) {
-    // XELOGE("Failed to open XFile: error {:08X}", res);
-    return object_ref<XFile>(file);
-  }
-
-  file->file_ = vfs_file;
-  file->position_ = position;
-  file->is_synchronous_ = is_synchronous;
-  file->is_buffered_ = is_buffered;
-
-  return object_ref<XFile>(file);
 }
 
 void XFile::NotifyCompletion(X_STATUS status, uint32_t num_bytes,

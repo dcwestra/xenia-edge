@@ -63,7 +63,6 @@ class Window;
 
 namespace xe {
 
-constexpr fourcc_t kEmulatorSaveSignature = make_fourcc("XSAV");
 static constexpr std::string_view kDefaultGameSymbolicLink = "GAME:";
 static constexpr std::string_view kDefaultPartitionSymbolicLink = "D:";
 static constexpr std::string_view kDefaultUpdateSymbolicLink = "UPDATE:";
@@ -225,6 +224,12 @@ class Emulator {
     return audio_media_player_.get();
   }
 
+  // The host's media apps, one of which the user picks to play their music.
+  // Null where the platform has no media sessions.
+  apu::HostMediaSession* host_media_session() const {
+    return host_media_session_.get();
+  }
+
   // GPU emulation for command list processing.
   gpu::GraphicsSystem* graphics_system() const {
     return graphics_system_.get();
@@ -284,8 +289,12 @@ class Emulator {
   // Tears down all subsystems. Called by the destructor and by RelaunchTitle.
   void Shutdown();
 
-  // Mounts scratch, cache, and devkit drives based on cvars.
+  // Mounts the devkit drive when force_mount_devkit is set.
   void MountStandardDrives();
+
+  // Maps DEVKIT: and e: to the devkit folder under the storage root unless
+  // they're already mapped.
+  bool MountDevkitDrive();
 
   // Terminates the currently running title.
   X_STATUS TerminateTitle();
@@ -449,12 +458,6 @@ class Emulator {
   X_STATUS InstallContentPackage(const std::filesystem::path& path,
                                  ContentInstallEntry& installation_info);
 
-  void Pause();
-  void Resume();
-  bool is_paused() const { return paused_; }
-  bool SaveToFile(const std::filesystem::path& path);
-  bool RestoreFromFile(const std::filesystem::path& path);
-
   // Full in-process relaunch: terminates threads, Shutdown(), Setup(),
   // then launches with new params. Must be called from a non-guest thread.
   // keep_xbox_game leaves an original Xbox game in the drive for the XeFu
@@ -464,6 +467,10 @@ class Emulator {
                      std::vector<uint8_t> launch_data,
                      bool keep_xbox_game = true,
                      const std::string& package_path = {});
+
+  // Whether a title launch replaces the running title in-process rather than
+  // in a new process.
+  static bool CanRelaunchInProcess();
 
   // Stops the current title and returns the kernel to a fresh, idle state
   // (no title loaded). Must be called from a non-guest thread.
@@ -616,7 +623,7 @@ class Emulator {
   static void SetPersistentEmulatorFlags(uint64_t new_flags);
   static bool ExceptionCallbackThunk(Exception* ex, void* data);
   bool ExceptionCallback(Exception* ex);
-  // Logs a guest crash dump and tells the user, pausing first with --debug.
+  // Logs a guest crash dump and tells the user.
   void ReportGuestCrash(const std::string& crash_msg);
 
   std::string RemountAndResolveLaunchPath(const std::string& launch_path);
@@ -624,6 +631,9 @@ class Emulator {
 
   // Applies the media_type cvar override, if any.
   void SetDeploymentType(XDeploymentType detected_type);
+
+  // Empties the title's cache: volume when it formats a cache partition.
+  void EmptyTitleCache();
 
   X_STATUS CompleteLaunch(const std::filesystem::path& path,
                           const std::string_view module_path);
@@ -684,6 +694,8 @@ class Emulator {
 
   std::unique_ptr<cpu::Processor> processor_;
   std::unique_ptr<apu::AudioSystem> audio_system_;
+  // Outlives titles, as the user's pick does.
+  std::unique_ptr<apu::HostMediaSession> host_media_session_;
   std::unique_ptr<apu::AudioMediaPlayer> audio_media_player_;
   std::unique_ptr<gpu::GraphicsSystem> graphics_system_;
   std::unique_ptr<hid::InputSystem> input_system_;
@@ -701,8 +713,6 @@ class Emulator {
   uint8_t current_disc_number_ = 0;
   std::unique_ptr<kernel::util::GameInfoDatabase> game_info_database_;
 
-  bool paused_;
-  bool restoring_;
   std::atomic<bool> relaunching_{false};
   bool boot_animation_requested_ = false;
   // Held across a launch and a whole relaunch so title teardown waits for a
@@ -711,7 +721,6 @@ class Emulator {
   // Relaunch requests so far, to drop one a newer request replaced while it
   // waited for the lock.
   std::atomic<uint64_t> relaunch_requests_{0};
-  threading::Fence restore_fence_;  // Fired on restore finish.
 
   // Persisted across Shutdown/Setup for relaunch.
   bool require_cpu_backend_ = false;

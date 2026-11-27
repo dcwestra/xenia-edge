@@ -40,6 +40,7 @@ class HostPathEntry : public Entry {
                                            size_t offset,
                                            size_t length) override;
   void update() override;
+  bool is_empty_folder() const override;
   bool has_open_files() const override;
   void RetainFile() override { open_files_.fetch_add(1); }
   void ReleaseFile() override;
@@ -51,11 +52,16 @@ class HostPathEntry : public Entry {
                 uint64_t create_timestamp, uint64_t access_timestamp,
                 uint64_t write_timestamp);
 
+ protected:
+  // Takes the attributes, size and times |file_info| gives.
+  void SetInfo(const xe::filesystem::FileInfo& file_info);
+
  private:
   friend class HostPathDevice;
   friend class HostPathFile;
 
-  void SetOverwrittenSize(size_t size);
+  // Sets the size the entry reports without asking the host.
+  void SetSize(size_t size);
 
   std::unique_ptr<Entry> CreateEntryInternal(const std::string_view name,
                                              uint32_t attributes) override;

@@ -10,9 +10,11 @@
 #include <cstring>
 
 #include "xenia/base/logging.h"
+#include "xenia/base/string.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/util/xfiletime.h"
+#include "xenia/kernel/xam/system_manifest.h"
 #include "xenia/kernel/xam/xam_private.h"
 #include "xenia/kernel/xam/xam_state.h"
 #include "xenia/kernel/xconfig.h"
@@ -262,7 +264,7 @@ DECLARE_XAM_EXPORT1(XamGetOnlineCountryFromLocale, kLocale, kImplemented);
 
 dword_result_t XamGetOnlineCountryString_entry(dword_t id,
                                                dword_t buffer_length,
-                                               lpu16string_t buffer) {
+                                               pointer_t<char16_t> buffer) {
   if (buffer_length >= 0x80000000u) {
     return X_E_INVALIDARG;
   }
@@ -284,7 +286,7 @@ dword_result_t XamGetOnlineCountryString_entry(dword_t id,
 DECLARE_XAM_EXPORT1(XamGetOnlineCountryString, kLocale, kImplemented);
 
 dword_result_t XamGetCountryString_entry(dword_t id, dword_t buffer_length,
-                                         lpu16string_t buffer) {
+                                         pointer_t<char16_t> buffer) {
   if (buffer_length >= 0x80000000u) {
     return X_E_INVALIDARG;
   }
@@ -306,7 +308,7 @@ dword_result_t XamGetCountryString_entry(dword_t id, dword_t buffer_length,
 DECLARE_XAM_EXPORT1(XamGetCountryString, kLocale, kImplemented);
 
 dword_result_t XamGetLanguageString_entry(dword_t id, dword_t buffer_length,
-                                          lpu16string_t buffer) {
+                                          pointer_t<char16_t> buffer) {
   if (buffer_length >= 0x80000000u) {
     return X_E_INVALIDARG;
   }
@@ -330,7 +332,7 @@ DECLARE_XAM_EXPORT1(XamGetLanguageString, kLocale, kImplemented);
 dword_result_t XamGetLanguageLocaleString_entry(dword_t language_id,
                                                 dword_t locale_id,
                                                 dword_t buffer_length,
-                                                lpu16string_t buffer) {
+                                                pointer_t<char16_t> buffer) {
   if (buffer_length >= 0x80000000u) {
     return X_E_INVALIDARG;
   }
@@ -390,7 +392,7 @@ DECLARE_XAM_EXPORT1(XamGetOnlineLanguageAndCountry, kLocale, kImplemented);
 
 dword_result_t XamGetOnlineLanguageAndCountryString_entry(
     dword_t language_id, dword_t country_id, dword_t buffer_length,
-    lpu16string_t buffer) {
+    pointer_t<char16_t> buffer) {
   if (buffer_length >= 0x80000000u) {
     return X_E_INVALIDARG;
   }
@@ -413,7 +415,7 @@ DECLARE_XAM_EXPORT1(XamGetOnlineLanguageAndCountryString, kLocale,
 
 dword_result_t XamProfileGetLiveLegalLocale_entry(qword_t xuid,
                                                   dword_t buffer_length,
-                                                  lpu16string_t buffer) {
+                                                  pointer_t<char16_t> buffer) {
   const auto user = kernel_state()->xam_state()->GetUserProfileLive(xuid);
 
   const uint8_t country_id =
@@ -433,7 +435,7 @@ dword_result_t XamProfileGetLiveLegalLocale_entry(qword_t xuid,
 DECLARE_XAM_EXPORT1(XamProfileGetLiveLegalLocale, kLocale, kImplemented);
 
 dword_result_t XapipGetLocale_entry(dword_t buffer_length,
-                                    lpstring_t buffer_ptr) {
+                                    pointer_t<char> buffer_ptr) {
   // Console settings only, no profile.
   const auto value = xeXamGetOnlineLanguageAndCountryString(
       static_cast<uint8_t>(kernel_state()->xconfig()->ReadSetting<uint32_t>(
@@ -450,7 +452,7 @@ dword_result_t XapipGetLocale_entry(dword_t buffer_length,
 DECLARE_XAM_EXPORT1(XapipGetLocale, kLocale, kImplemented);
 
 dword_result_t XamGetLocaleString_entry(dword_t id, dword_t buffer_length,
-                                        lpu16string_t buffer) {
+                                        pointer_t<char16_t> buffer) {
   if (buffer_length >= 0x80000000u) {
     return X_E_INVALIDARG;
   }
@@ -483,7 +485,7 @@ DECLARE_XAM_EXPORT1(XamGetLanguageFromOnlineLanguage, kLocale, kImplemented);
 
 dword_result_t XamGetOnlineLanguageString_entry(dword_t id,
                                                 dword_t buffer_length,
-                                                lpu16string_t buffer) {
+                                                pointer_t<char16_t> buffer) {
   if (buffer_length >= 0x80000000u) {
     return X_E_INVALIDARG;
   }
@@ -734,14 +736,17 @@ DECLARE_XAM_EXPORT1(XamGetLanguageLocaleFallbackString, kNone, kImplemented);
 dword_result_t XamGetLanguageTypeface_entry(dword_t language,
                                             dword_t buffer_size,
                                             dword_t buffer) {
-  std::u16string path{};
+  std::u16string path = u"file://media:/XenonJKLatin.xtt";
 
   if (language == static_cast<uint32_t>(XLanguage::kSChinese)) {
-    path = u"file://media:/XenonSCLatin.xtt";
+    // The SC font comes with the system update. Without it the JK one is
+    // used.
+    const std::string sc_path = FindSystemExtFile("XenonSCLatin.xtt");
+    if (!sc_path.empty()) {
+      path = u"file://" + xe::to_utf16(sc_path);
+    }
   } else if (language == static_cast<uint32_t>(XLanguage::kTChinese)) {
     path = u"file://media:/XenonCLatin.xtt";
-  } else {
-    path = u"file://media:/XenonJKLatin.xtt";
   }
   xe::string_util::copy_and_swap_truncating(
       kernel_state()->memory()->TranslateVirtual<char16_t*>(buffer), path,

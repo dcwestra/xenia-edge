@@ -55,14 +55,15 @@ Value* SignedDivDidOverflow(PPCHIRBuilder& f, Value* dividend, Value* divisor,
                     f.CompareEQ(divisor, f.Not(f.LoadZero(divisor->type)))));
 }
 
-// https://github.com/sebastianbiallas/pearpc/blob/0b3c823f61456faa677f6209545a7b906e797421/src/cpu/cpu_generic/ppc_tools.h#L26
 Value* AddWithCarryDidCarry(PPCHIRBuilder& f, Value* v1, Value* v2, Value* v3) {
-  v1 = f.Truncate(v1, INT32_TYPE);
-  v2 = f.Truncate(v2, INT32_TYPE);
   assert_true(v3->type == INT8_TYPE);
-  v3 = f.ZeroExtend(v3, INT32_TYPE);
-  Value* sum = f.Add(v1, v2);
-  return f.Or(f.CompareULT(f.Add(sum, v3), v3), f.CompareULT(sum, v1));
+  // The carry out of bit 31 is bit 32 of the low words' sum, zero extended:
+  // two adds and a shift, with no compares
+  Value* sum =
+      f.Add(f.Add(f.ZeroExtend(f.Truncate(v1, INT32_TYPE), INT64_TYPE),
+                  f.ZeroExtend(f.Truncate(v2, INT32_TYPE), INT64_TYPE)),
+            f.ZeroExtend(v3, INT64_TYPE));
+  return f.Truncate(f.Shr(sum, 32), INT8_TYPE);
 }
 
 int InstrEmit_addx(PPCHIRBuilder& f, const InstrData& i) {
@@ -286,10 +287,8 @@ int InstrEmit_divwux(PPCHIRBuilder& f, const InstrData& i) {
 
 int InstrEmit_mulhdx(PPCHIRBuilder& f, const InstrData& i) {
   // RT <- ((RA) × (RB) as 128)[0:63]
-  if (i.XO.OE) {
-    // With XER update.
-    XEINSTRNOTIMPLEMENTED();
-  }
+  // Bit 21 (OE) is reserved here: the OE forms act like the plain ones and
+  // leave XER alone.
   Value* v = f.MulHi(f.LoadGPR(i.XO.RA), f.LoadGPR(i.XO.RB));
   f.StoreGPR(i.XO.RT, v);
   if (i.XO.Rc) {
@@ -300,10 +299,8 @@ int InstrEmit_mulhdx(PPCHIRBuilder& f, const InstrData& i) {
 
 int InstrEmit_mulhdux(PPCHIRBuilder& f, const InstrData& i) {
   // RT <- ((RA) × (RB) as 128)[0:63]
-  if (i.XO.OE) {
-    // With XER update.
-    XEINSTRNOTIMPLEMENTED();
-  }
+  // Bit 21 (OE) is reserved here: the OE forms act like the plain ones and
+  // leave XER alone.
   Value* v =
       f.MulHi(f.LoadGPR(i.XO.RA), f.LoadGPR(i.XO.RB), ARITHMETIC_UNSIGNED);
   f.StoreGPR(i.XO.RT, v);
@@ -315,10 +312,8 @@ int InstrEmit_mulhdux(PPCHIRBuilder& f, const InstrData& i) {
 
 int InstrEmit_mulhwx(PPCHIRBuilder& f, const InstrData& i) {
   // RT[32:64] <- ((RA)[32:63] × (RB)[32:63])[0:31]
-  if (i.XO.OE) {
-    // With XER update.
-    XEINSTRNOTIMPLEMENTED();
-  }
+  // Bit 21 (OE) is reserved here: the OE forms act like the plain ones and
+  // leave XER alone.
   Value* ratrunc =
       f.SignExtend(f.Truncate(f.LoadGPR(i.XO.RA), INT32_TYPE), INT64_TYPE);
 
@@ -336,10 +331,8 @@ int InstrEmit_mulhwx(PPCHIRBuilder& f, const InstrData& i) {
 
 int InstrEmit_mulhwux(PPCHIRBuilder& f, const InstrData& i) {
   // RT[32:64] <- ((RA)[32:63] × (RB)[32:63])[0:31]
-  if (i.XO.OE) {
-    // With XER update.
-    XEINSTRNOTIMPLEMENTED();
-  }
+  // Bit 21 (OE) is reserved here: the OE forms act like the plain ones and
+  // leave XER alone.
 
   Value* ratrunc =
       f.ZeroExtend(f.Truncate(f.LoadGPR(i.XO.RA), INT32_TYPE), INT64_TYPE);
@@ -754,7 +747,9 @@ int InstrEmit_orx(PPCHIRBuilder& f, const InstrData& i) {
     // chrispy: this special version of orx is db16cyc and is heavily used in
     // spinlocks. since we do not emit any code for this we end up wasting a ton
     // of power
-    if (i.code == 0x7FFFFB78) {
+    // The low thread priority hint (or r1,r1,r1) heads spin loops the same way,
+    // such as XeFu's mailbox service.
+    if (i.code == 0x7FFFFB78 || i.code == 0x7C210B78) {
       f.DelayExecution();
     } else {
       // Sometimes used as no-op.
@@ -1193,9 +1188,11 @@ int InstrEmit_sradx(PPCHIRBuilder& f, const InstrData& i) {
   Value* v = f.Sha(rt, clamp_sh);
 
   // CA is set if any bits are shifted out of the right and if the result
-  // is negative.
-  Value* ca =
-      f.And(f.IsTrue(f.Shr(rt, 63)), f.CompareNE(f.Shl(v, clamp_sh), rt));
+  // is negative. A shift of 64 or more shifts out every bit, which the
+  // clamped compare misses for 0x8000000000000000.
+  Value* ca = f.And(f.IsTrue(f.Shr(rt, 63)),
+                    f.Or(f.CompareNE(f.Shl(v, clamp_sh), rt),
+                         f.CompareUGT(sh, f.LoadConstantInt8(0x3F))));
   f.StoreCA(ca);
 
   f.StoreGPR(i.X.RA, v);
@@ -1246,19 +1243,22 @@ int InstrEmit_srawx(PPCHIRBuilder& f, const InstrData& i) {
   // CA <- s & ((r&¬m)[32:63]≠0)
   // if n == 0: rA <- sign_extend(rS), XER[CA] = 0
   // if n >= 32: rA <- 64 sign bits of rS, XER[CA] = sign bit of lo_32(rS)
-  Value* rt = f.Truncate(f.LoadGPR(i.X.RT), INT32_TYPE);
+  // Sign extended, a shift of 32 already gives the 64 sign bits any shift of
+  // 32 or more does, and shifting a negative value back can't restore it, so
+  // CA needs no separate test for those shifts.
+  Value* rt =
+      f.SignExtend(f.Truncate(f.LoadGPR(i.X.RT), INT32_TYPE), INT64_TYPE);
   Value* sh =
       f.And(f.Truncate(f.LoadGPR(i.X.RB), INT8_TYPE), f.LoadConstantInt8(0x3F));
-  Value* clamp_sh = f.Min(sh, f.LoadConstantInt8(0x1F));
+  Value* clamp_sh = f.Min(sh, f.LoadConstantInt8(0x20));
   Value* v = f.Sha(rt, clamp_sh);
 
   // CA is set if any bits are shifted out of the right and if the result
   // is negative.
   Value* ca =
-      f.And(f.IsTrue(f.Shr(rt, 31)), f.CompareNE(f.Shl(v, clamp_sh), rt));
+      f.And(f.IsTrue(f.Shr(rt, 63)), f.CompareNE(f.Shl(v, clamp_sh), rt));
   f.StoreCA(ca);
 
-  v = f.SignExtend(v, INT64_TYPE);
   f.StoreGPR(i.X.RA, v);
   if (i.X.Rc) {
     f.UpdateCR(0, v);

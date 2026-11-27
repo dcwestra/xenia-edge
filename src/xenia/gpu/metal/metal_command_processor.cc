@@ -2707,7 +2707,7 @@ void MetalCommandProcessor::AwaitAllQueueOperationsCompletion() {
 // ============================================================================
 
 void MetalCommandProcessor::EnsureQueryResources() {
-  if (GetZPDMode() == ZPDMode::kFake || !zpd_visibility_pool_) {
+  if (zpd_mode_ == ZPDMode::kFake || !zpd_visibility_pool_) {
     return;
   }
   if (!zpd_visibility_pool_->EnsureInitialized(device_, kQueryPoolCapacity)) {
@@ -2758,7 +2758,7 @@ CommandProcessor::QueryOpenResult MetalCommandProcessor::OpenQuery(
   bool waited_for_submission = false;
 
   if (is_pool_exhausted) {
-    if (GetZPDMode() == ZPDMode::kFast || GetZPDMode() == ZPDMode::kFastAlt) {
+    if (zpd_mode_ == ZPDMode::kFast || zpd_mode_ == ZPDMode::kFastAlt) {
       return QueryOpenResult::kPoolExhausted;
     }
 
@@ -2880,7 +2880,7 @@ void MetalCommandProcessor::PumpQueryResolves() {
 
 bool MetalCommandProcessor::AwaitQueryResolve(ReportHandle report_handle,
                                               uint64_t wait_for_submission) {
-  if (GetZPDMode() == ZPDMode::kFake) {
+  if (zpd_mode_ == ZPDMode::kFake) {
     return false;
   }
 
@@ -3197,7 +3197,8 @@ void MetalCommandProcessor::ComputeDrawViewportInfo(
       true, kViewportBoundsMax, kViewportBoundsMax, false,
       normalized_depth_control, convert_z_to_float24, true,
       pixel_shader && pixel_shader->writes_depth(), false);
-  gviargs.SetupRegisterValues(regs, false);
+  gviargs.SetupRegisterValues(regs, false,
+                              /*raw_clipping_supported=*/true);
   if (gviargs == previous_viewport_info_args_) {
     viewport_info_out = previous_viewport_info_;
   } else {
@@ -3607,7 +3608,7 @@ bool MetalCommandProcessor::IssueDrawMsl(
   // A counted draw needs the guest's own shaders. The placeholder has no pixel
   // kills or alpha test and overcounts, and a skipped draw counts nothing.
   const bool exact_shaders_required =
-      GetZPDMode() != ZPDMode::kFake && !zpd_force_fake_fallback_ &&
+      zpd_mode_ != ZPDMode::kFake && !zpd_force_fake_fallback_ &&
       zpd_current_report_.handle != kInvalidReportHandle;
 
   // Get or create shader translations. Both are asked for before either is
@@ -4844,7 +4845,7 @@ bool MetalCommandProcessor::IssueDrawDxil(
   // A counted draw needs the guest's own shaders. The placeholder has no pixel
   // kills or alpha test and overcounts, and a skipped draw counts nothing.
   const bool exact_shaders_required =
-      GetZPDMode() != ZPDMode::kFake && !zpd_force_fake_fallback_ &&
+      zpd_mode_ != ZPDMode::kFake && !zpd_force_fake_fallback_ &&
       zpd_current_report_.handle != kInvalidReportHandle;
 
   ShaderCompileStatus compile_status = ShaderCompileStatus::kReady;
@@ -5431,7 +5432,7 @@ void MetalCommandProcessor::EndRenderEncoder() {
   // Visibility results are scoped to the render encoder and an offset can't be
   // selected again after it ends, so the segment closes here. The logical
   // report stays open and resumes on the next encoder.
-  if (GetZPDMode() != ZPDMode::kFake) {
+  if (zpd_mode_ != ZPDMode::kFake) {
     CloseQuerySegment();
   }
   current_render_encoder_->endEncoding();
@@ -5475,7 +5476,7 @@ void MetalCommandProcessor::BeginCommandBuffer() {
   // The visibility result buffer has to be on the descriptor before the encoder
   // is created, so a segment waiting to open needs the pool allocated now.
   const bool zpd_segment_pending =
-      GetZPDMode() != ZPDMode::kFake &&
+      zpd_mode_ != ZPDMode::kFake &&
       zpd_current_report_.handle != kInvalidReportHandle &&
       active_segment_.segment_pending_begin;
   if (zpd_segment_pending) {
@@ -6278,7 +6279,6 @@ void MetalCommandProcessor::ApplyRasterizerState(bool primitive_polygonal) {
 
   const RegisterFile& regs = *register_file_;
   auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
-  auto pa_cl_clip_cntl = regs.Get<reg::PA_CL_CLIP_CNTL>();
 
   MTL::CullMode cull_mode = MTL::CullModeNone;
   if (primitive_polygonal) {
@@ -6330,10 +6330,9 @@ void MetalCommandProcessor::ApplyRasterizerState(bool primitive_polygonal) {
   current_render_encoder_->setDepthBias(depth_bias_constant, depth_bias_slope,
                                         0.0f);
 
-  // With force_depth_clamp, use the host viewport clamp instead of near and far
-  // Z plane clipping. X/Y/W clipping is unchanged.
   current_render_encoder_->setDepthClipMode(
-      (pa_cl_clip_cntl.clip_disable || cvars::force_depth_clamp)
+      draw_util::IsDepthClampedAtZPlanes(regs,
+                                         /*raw_clipping_supported=*/true)
           ? MTL::DepthClipModeClamp
           : MTL::DepthClipModeClip);
 }
@@ -6532,6 +6531,19 @@ MetalCommandProcessor::GetCurrentSpirvVertexShaderModification(
   modification.vertex.user_clip_plane_count = xe::bit_count(user_clip_planes);
   modification.vertex.user_clip_plane_cull =
       uint32_t(user_clip_planes && pa_cl_clip_cntl.ucp_cull_only_ena);
+
+  if (draw_util::IsZClippedWithClipDistances(regs,
+                                             /*raw_clipping_supported=*/true)) {
+    modification.vertex.z_clip_distances = 1;
+    modification.vertex.z_clip_near_at_minus_w =
+        uint32_t(!pa_cl_clip_cntl.dx_clip_space_def);
+  }
+  modification.vertex.guard_band_clip_distances =
+      uint32_t(draw_util::IsGuardBandClippedWithClipDistances(
+          regs, /*raw_clipping_supported=*/true));
+  modification.vertex.discard_band_cull_distances =
+      uint32_t(draw_util::IsDiscardBandCulledWithCullDistances(
+          regs, /*cull_distances_supported=*/false));
 
   modification.vertex.output_point_parameters =
       uint32_t((shader.writes_point_size_edge_flag_kill_vertex() & 0b001) &&
@@ -7012,6 +7024,14 @@ void MetalCommandProcessor::UpdateSpirvSystemConstantValues(
     consts.ndc_scale[i] = viewport_info.ndc_scale[i];
     consts.ndc_offset[i] = viewport_info.ndc_offset[i];
   }
+  consts.guard_band_clip_adj[0] =
+      regs.Get<float>(XE_GPU_REG_PA_CL_GB_HORZ_CLIP_ADJ);
+  consts.guard_band_clip_adj[1] =
+      regs.Get<float>(XE_GPU_REG_PA_CL_GB_VERT_CLIP_ADJ);
+  consts.guard_band_discard_adj[0] =
+      regs.Get<float>(XE_GPU_REG_PA_CL_GB_HORZ_DISC_ADJ);
+  consts.guard_band_discard_adj[1] =
+      regs.Get<float>(XE_GPU_REG_PA_CL_GB_VERT_DISC_ADJ);
 
   // Point rendering (matching Vulkan backend).
   auto pa_su_point_size = regs.Get<reg::PA_SU_POINT_SIZE>();

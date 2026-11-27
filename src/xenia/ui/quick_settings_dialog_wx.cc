@@ -328,11 +328,11 @@ void QuickSettingsDialog::Build() {
     auto* in_proc_label = add_label(box, _("In-Process Title Relaunch:"));
     remember_label("in_process_title_relaunch", in_proc_label);
     add_form_row(grid, in_proc_label, in_proc);
-#if XE_PLATFORM_MAC
-    // macOS always relaunches out-of-process; the cvar has no effect there.
-    in_proc->Disable();
-    in_proc->SetToolTip(_("Not supported on macOS"));
-#endif
+
+    auto* offer_updates = add_check(box, "offer_title_updates");
+    auto* offer_updates_label = add_label(box, _("Offer Title Updates:"));
+    remember_label("offer_title_updates", offer_updates_label);
+    add_form_row(grid, offer_updates_label, offer_updates);
 
     auto* lang = add_combo(box, "user_language", find_options("user_language"));
     auto* lang_label = add_label(box, _("Language:"));
@@ -583,7 +583,8 @@ void QuickSettingsDialog::Save() {
       }
     } else if (name == "fullscreen" || name == "present_letterbox" ||
                name == "discord" || name == "use_dedicated_xma_thread" ||
-               name == "in_process_title_relaunch" || name == "use_mangohud" ||
+               name == "in_process_title_relaunch" ||
+               name == "offer_title_updates" || name == "use_mangohud" ||
                name == "use_gamemode" || name == "use_metal_hud" ||
                name == "use_rosetta") {
       apply(var, toml::value(opt.pending_value == "true"));

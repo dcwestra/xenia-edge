@@ -82,7 +82,6 @@ target_link_libraries(xenia-app PRIVATE
   xxhash
   xenia-app-discord
   xenia-apu-sdl
-  xenia-debug-ui
   xenia-helper-sdl
   xenia-hid-sdl
 )
@@ -104,7 +103,6 @@ endif()
 if(WIN32)
   target_link_libraries(xenia-app PRIVATE
     xenia-apu-xaudio2
-    xenia-debug-gdb
     xenia-gpu-d3d12
     xenia-hid-keyboard
     xenia-ui-d3d12
@@ -170,12 +168,17 @@ elseif(APPLE)
     GENERATED TRUE
     MACOSX_PACKAGE_LOCATION Resources)
 
+  # CI sets XE_BUILD_VERSION for releases.
+  set(_xe_app_version "$ENV{XE_BUILD_VERSION}")
+  if(_xe_app_version STREQUAL "")
+    set(_xe_app_version "1.0")
+  endif()
   set_target_properties(xenia-app PROPERTIES
     MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/Info.plist"
     MACOSX_BUNDLE_BUNDLE_NAME "Xenia-edge"
     MACOSX_BUNDLE_GUI_IDENTIFIER "com.xenia.edge"
-    MACOSX_BUNDLE_BUNDLE_VERSION "1"
-    MACOSX_BUNDLE_SHORT_VERSION_STRING "1.0"
+    MACOSX_BUNDLE_BUNDLE_VERSION "${_xe_app_version}"
+    MACOSX_BUNDLE_SHORT_VERSION_STRING "${_xe_app_version}"
     MACOSX_BUNDLE_ICON_FILE "AppIcon.icns")
 
   target_link_options(xenia-app PRIVATE
@@ -235,6 +238,14 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
 xe_embed_compressed_bundle(xenia-app
     "${PROJECT_SOURCE_DIR}/assets/xdb/games.json"
     xbox_db)
+
+# Bake the title update index (made from archive.org's xbox_360_title_updates
+# by tools/tu-index.py). Regenerating it re-runs configure.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${PROJECT_SOURCE_DIR}/assets/title_updates/title_updates.json")
+xe_embed_compressed_bundle(xenia-app
+    "${PROJECT_SOURCE_DIR}/assets/title_updates/title_updates.json"
+    title_update_db)
 
 target_include_directories(xenia-app PRIVATE
     "${PROJECT_SOURCE_DIR}/third_party/rapidjson/include")

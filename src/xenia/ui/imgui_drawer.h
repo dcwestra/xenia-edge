@@ -103,12 +103,9 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
     return locked_achievement_icon_.get();
   }
 
-  ImFont* GetTitleFont() {
-    if (!GetIO().Fonts->Fonts[1]->IsLoaded()) {
-      return GetIO().Fonts->Fonts[0];
-    }
-    return GetIO().Fonts->Fonts[1];
-  }
+  // For PushFont(nullptr, size). style.FontSizeBase changes with each PushFont.
+  float GetFontSize() const { return font_size_; }
+  float GetTitleFontSize() const { return font_size_ + kTitleFontSizeIncrease; }
 
   bool HasOpenDialogs() const { return !dialogs_.empty(); }
   void LoadInputSystem(hid::InputSystem* input_system);
@@ -128,6 +125,8 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   // For now, no need for OnDpiChanged because redrawing is done continuously.
 
  private:
+  static constexpr float kTitleFontSizeIncrease = 6.0f;
+
   void Initialize();
   void InitializeFonts(const float font_size);
   bool LoadCustomFont(ImGuiIO& io, ImFontConfig& font_config, float font_size);
@@ -135,7 +134,8 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   bool LoadJapaneseFont(ImGuiIO& io, float font_size);
 
   void SetupNotificationTextures();
-  void SetupFontTexture();
+  void UpdateTexture(ImTextureData* texture);
+  void DestroyTextures();
 
   void RenderDrawLists(ImDrawData* data, UIDrawContext& ui_draw_context);
 
@@ -145,6 +145,9 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   void SwitchToPhysicalMouseAndUpdateMousePosition(const MouseEvent& e);
 
   bool IsDrawingDialogs() const { return dialog_loop_next_index_ != SIZE_MAX; }
+  bool HasAnythingToDraw() const {
+    return !dialogs_.empty() || !notifications_.empty() || !overlays_.empty();
+  }
   void ResetFrameTimeIfIdle();
   void DetachIfLastWindowRemoved();
   void UpdateGamepads();
@@ -170,12 +173,14 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   // SIZE_MAX if not currently in the dialog loop.
   size_t dialog_loop_next_index_ = SIZE_MAX;
 
+  // Attached while dialogs are shown.
+  bool is_input_listener_added_ = false;
+
   Presenter* presenter_ = nullptr;
 
   ImmediateDrawer* immediate_drawer_ = nullptr;
   // Resources specific to an immediate drawer - must be destroyed before
   // detaching the presenter.
-  std::unique_ptr<ImmediateTexture> font_texture_;
   std::unique_ptr<ImmediateTexture> locked_achievement_icon_;
 
   std::vector<std::unique_ptr<ImmediateTexture>> notification_icon_textures_;
@@ -193,6 +198,10 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   uint32_t mouse_buttons_held_ = 0;
   // Keys pressed while attached.
   std::unordered_set<VirtualKey> keys_down_;
+  // Gamepad buttons already held when the first dialog opened, which aren't
+  // presses until released. Taken on the next poll after that.
+  uint16_t gamepad_buttons_held_ = 0;
+  bool gamepad_buttons_held_pending_ = true;
 
   // Dialogs force the cursor visible since it auto-hides during gameplay
   Window::CursorVisibility cursor_visibility_before_dialogs_ =
@@ -203,6 +212,8 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   uint64_t last_frame_time_ticks_;
 
   bool are_notifications_enabled_ = true;
+
+  float font_size_ = 0.0f;
 
   // Store original style for proper scaling (ScaleAllSizes is cumulative)
   ImGuiStyle base_style_;

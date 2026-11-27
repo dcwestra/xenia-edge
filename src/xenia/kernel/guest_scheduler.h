@@ -14,6 +14,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <queue>
@@ -45,9 +46,6 @@ class GuestScheduler {
   explicit GuestScheduler(KernelState* kernel_state);
   ~GuestScheduler();
 
-  // True if the cooperative scheduler is active (gated by the cvar).
-  static bool enabled();
-
   // Starts the per-CPU dispatch threads the first time it is called (no-op
   // after).
   void EnsureStarted();
@@ -57,6 +55,13 @@ class GuestScheduler {
   // CPU. Idempotent and safe to call from any host thread. A thread already
   // running, queued, blocked or suspended is left alone.
   void MarkReady(XThread* thread);
+
+  // Delivers the first suspend of another thread like a kernel APC: a running
+  // target stops at its next safepoint, a waiting one leaves its wait, a ready
+  // one stops at dispatch and a masked one once it unmasks. Returns once an
+  // unmasked target has stopped so whatever it ran meanwhile comes before the
+  // suspend.
+  void SuspendThread(XThread* thread);
 
   // Returns |thread| to its CPU's ready queue once its guest suspend count has
   // dropped to zero. No-op for a thread suspended while running or queued,
@@ -100,6 +105,11 @@ class GuestScheduler {
   // pool so one slow call cannot hold up the rest. Runs inline once shutdown
   // has begun.
   void PostHostCall(std::function<void()> fn, BlockingCallClass call_class);
+  // PostHostCall once host uptime reaches |deadline_ms|, with no worker held
+  // until then. Runs inline once shutdown has begun. Shutdown drops one still
+  // waiting as it drops queued calls.
+  void PostHostCallAt(uint64_t deadline_ms, std::function<void()> fn,
+                      BlockingCallClass call_class);
 
   // True when the calling thread is a scheduler-managed fiber, so a blocking
   // host call would stall other fibers and should be offloaded instead.
@@ -147,9 +157,11 @@ class GuestScheduler {
   // user APC lands on an alertable waiter or a kernel APC on an interruptible
   // one. Anything else re-polls every pass. |interruptible| false keeps a
   // terminate from ending the fiber at a park whose waker holds a pointer into
-  // this stack.
-  void BlockCurrentThread(uint64_t deadline_ms = 0, uint32_t wait_epoch = 0,
-                          bool alertable = false, bool interruptible = true);
+  // this stack. Returns true when a suspend unwound an |object_wait|
+  // (CooperativeWait) park, which then leaves with X_STATUS_KERNEL_APC.
+  bool BlockCurrentThread(uint64_t deadline_ms = 0, uint32_t wait_epoch = 0,
+                          bool alertable = false, bool interruptible = true,
+                          bool object_wait = false);
 
   // Marks the running guest fiber finished so its CPU can reclaim it, dropping
   // the final handle once control is back on the idle fiber. Call before the
@@ -181,7 +193,7 @@ class GuestScheduler {
   // and the APC check of alertable waiters. Quiet gated waiters do not tick
   // at this rate, they wake on signals, deadlines and the backstop.
   static constexpr uint64_t kPollBackoffMs = 1;
-  // At least this often every blocked fiber re-polls regardless of the epoch
+  // At least this often every epoch-gated waiter re-polls regardless of its
   // gate, so a missed epoch bump costs a latency blip, not a hang.
   static constexpr uint64_t kRepollBackstopMs = 64;
   // Floor on the watchdog's wake period. Below this the wakeups cost more than
@@ -267,8 +279,16 @@ class GuestScheduler {
   void SwitchTo(XThread* next);
   void RereadyBlocked(int cpu_index);
   // Parks a thread whose suspend count is nonzero until Resume drops it.
-  // Returns false if the count already reached zero, meaning run it instead.
+  // Returns false if it must run instead: the count reached zero, the suspend
+  // is masked, or it has a wait to unwind first.
   bool ParkSuspended(XThread* thread, int cpu_index);
+  // Whether a suspend on |thread| has landed and SuspendThread can return.
+  bool SuspendLandedLocked(XThread* thread);
+  // Takes |thread| out of an object wait for a suspend, readying it to unwind.
+  // Returns the CPU to wake, -1 if none.
+  int UnwaitForSuspendLocked(XThread* thread);
+  // Wakes CPU |cpu_index| if its dispatch thread sleeps, ignoring -1.
+  void WakeCpu(int cpu_index);
   void RunLoop(int cpu_index);
   // Raises preempt_requested on any CPU whose running fiber outlived its
   // slice, since a dispatch thread cannot tick while it runs a fiber.
@@ -284,6 +304,10 @@ class GuestScheduler {
   // Caller holds io_pool_lock_.
   void StartPoolWorkerLocked();
   void IoPoolWorkerLoop();
+  // Lazily starts the thread that holds PostHostCallAt calls until they are
+  // due.
+  void EnsureIoTimer();
+  void IoTimerLoop();
   // Runs one queued call, accumulates its counters and frees it.
   void RunBlockingCall(BlockingCall* call);
   // Unlinks |thread| from a singly-linked list (ready_next), fixing up tail.
@@ -416,6 +440,17 @@ class GuestScheduler {
   size_t io_pool_busy_ = 0;
   // Mirrors io_pool_threads_.size() so the stats report skips io_pool_lock_.
   std::atomic<size_t> io_pool_size_{0};
+
+  // PostHostCallAt calls by deadline, each queued for its class once due.
+  struct TimedCall {
+    BlockingCall* call;
+    BlockingCallClass call_class;
+  };
+  std::once_flag io_timer_once_;
+  std::mutex io_timer_lock_;
+  std::condition_variable io_timer_cv_;
+  std::multimap<uint64_t, TimedCall> io_timed_;
+  std::unique_ptr<xe::threading::Thread> io_timer_thread_;
 };
 
 }  // namespace kernel

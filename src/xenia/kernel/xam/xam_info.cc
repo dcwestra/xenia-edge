@@ -341,10 +341,14 @@ dword_result_t XamGetCachedTitleName_entry(dword_t title_id,
   std::u16string title_name = xe::to_utf16(
       kernel_state()->emulator()->game_info_database()->GetTitleName());
 
-  xe::string_util::copy_and_swap_truncating(title_name_ptr, title_name,
-                                            title_name.size() + 1);
-
-  *title_name_length_ptr = title_name.size() + 1;
+  // The cache keeps 22 characters, and a longer name or a smaller buffer is
+  // cut short without an error.
+  constexpr uint32_t kCachedTitleNameCount = 23;
+  const uint32_t buffer_count =
+      std::min<uint32_t>(*title_name_length_ptr, kCachedTitleNameCount);
+  const size_t copied = xe::string_util::copy_and_swap_truncating(
+      title_name_ptr, title_name, buffer_count);
+  *title_name_length_ptr = static_cast<uint32_t>(copied + 1);
 
   return X_ERROR_SUCCESS;
 }
@@ -620,12 +624,8 @@ static void StartTitle(XamModule::LoaderData& loader_data,
       "launch_path={}",
       xe::strip_pii(xe::path_to_utf8(host_path)), package_path, launch_path);
 
-  // Handle title launch in-process via full Shutdown/Setup cycle. Disabled
-  // on macOS — pthread_cancel there doesn't run C++ destructors, so
-  // force-terminated guest threads leak locks and deadlock teardown; spawn a
-  // fresh process instead.
-#if !XE_PLATFORM_MAC
-  if (cvars::in_process_title_relaunch) {
+  // Handle title launch in-process via full Shutdown/Setup cycle.
+  if (Emulator::CanRelaunchInProcess()) {
     auto emulator = kernel_state()->emulator();
 
     XELOGI("XamLoaderLaunchTitle: in-process relaunch to '{}'",
@@ -647,14 +647,14 @@ static void StartTitle(XamModule::LoaderData& loader_data,
                               std::move(new_data), true, package_path);
     }).detach();
 
-    // Stop running guest code; RelaunchTitle terminates us. Suspend can
-    // return on POSIX, so park rather than fall through to spawn.
+    // Stop running guest code; RelaunchTitle terminates us. Suspend returns
+    // if the thread is resumed, so park rather than fall through to spawn.
     current_thread->Suspend(nullptr);
+    // SpinYield parks a fiber, a host sleep would stall its dispatch thread.
     while (true) {
-      xe::threading::NanoSleep(int64_t(1'000'000'000));
+      GuestScheduler::SpinYield(std::chrono::seconds(1));
     }
   }
-#endif  // !XE_PLATFORM_MAC
 
   const std::string launch_data_hex =
       HexBytes(loader_data.launch_data, loader_data.launch_data.size());
@@ -822,6 +822,31 @@ X_HRESULT_result_t XdfLaunchNewImageFromCache_entry(lpstring_t name_ptr,
   return X_E_SUCCESS;
 }
 DECLARE_XAM_EXPORT1(XdfLaunchNewImageFromCache, kNone, kImplemented);
+
+// The package manager's error for a name no installed package has.
+constexpr X_HRESULT kPackageFileNotFound = 0x8B050009;
+
+// Gives the path of a system extended partition file, which is how the
+// dashboard finds its language packs.
+X_HRESULT_result_t XamPackageManagerGetFilePathW_entry(lpu16string_t name_ptr,
+                                                       lpvoid_t path_ptr,
+                                                       dword_t path_count) {
+  if (!name_ptr) {
+    return X_E_INVALIDARG;
+  }
+  const std::u16string path =
+      xe::to_utf16(FindSystemExtFile(xe::to_utf8(name_ptr.value())));
+  if (path.empty()) {
+    return kPackageFileNotFound;
+  }
+  if (!path_ptr || path.size() >= path_count) {
+    return X_E_INVALIDARG;
+  }
+  xe::string_util::copy_and_swap_truncating(path_ptr.as<char16_t*>(), path,
+                                            path_count);
+  return X_E_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamPackageManagerGetFilePathW, kNone, kImplemented);
 
 void XamLoaderTerminateTitle_entry() { kernel_state()->ExitToDashboard(); }
 DECLARE_XAM_EXPORT1(XamLoaderTerminateTitle, kNone, kSketchy);
@@ -1571,27 +1596,97 @@ dword_result_t XamSetDvrStorage_entry(
 }
 DECLARE_XAM_EXPORT1(XamSetDvrStorage, kNone, kStub);
 
-dword_result_t XamLookupCommonStringByIndex_entry(dword_t string_index) {
+// The guest address of a string in xam's common string table, or 0.
+static uint32_t LookupCommonString(uint32_t string_index) {
   static std::mutex lock;
-  std::lock_guard<std::mutex> guard(lock);
   auto& table = kernel_state()->xam_state()->common_string_table_;
+  std::unique_lock<std::mutex> guard(lock);
   if (!table) {
+    // The load can wait on the loader lock, which a guest thread mustn't do
+    // holding a host mutex. A caller that loses the race drops its reference.
+    guard.unlock();
     // They're in the xam section of the system UI skin.
     constexpr std::string_view kSkinPath = "\\SystemRoot\\huduiskin.xex";
     uint32_t loaded = 0;
     object_ref<XModule> skin;
-    if (xboxkrnl::xeXexLoadImage(kSkinPath)) {
+    const uint32_t hmodule = xboxkrnl::xeXexLoadImage(kSkinPath);
+    if (hmodule) {
       skin = kernel_state()->GetModule(kSkinPath, true);
     }
     if (!skin ||
         XFAILED(LoadXuiStringTable(*skin, "xam", "xamstrings.xus", &loaded))) {
-      XELOGW("XamLookupCommonStringByIndex: no xam string table to read");
+      XELOGW("LookupCommonString: no xam string table to read");
     }
-    table = loaded;
+    guard.lock();
+    if (!table) {
+      table = loaded;
+    } else if (hmodule) {
+      guard.unlock();
+      xboxkrnl::xeXexUnloadImage(hmodule);
+      guard.lock();
+    }
   }
   return *table ? LookupXuiStringTable(*table, string_index) : 0;
 }
+
+dword_result_t XamLookupCommonStringByIndex_entry(dword_t string_index) {
+  return LookupCommonString(string_index);
+}
 DECLARE_XAM_EXPORT1(XamLookupCommonStringByIndex, kNone, kImplemented);
+
+// The console name's length in characters with its terminator, and the
+// common string naming an unnamed console.
+constexpr size_t kConsoleNameLength = 0x18;
+constexpr uint32_t kDefaultConsoleNameString = 0x18;
+
+// Empty until named, it lasts until edge exits since edge doesn't store the
+// network settings it belongs with.
+static std::mutex console_name_lock;
+static std::u16string console_name;
+
+void XamGetConsoleFriendlyName_entry(pointer_t<char16_t> name_ptr) {
+  if (!name_ptr) {
+    return;
+  }
+  std::u16string name;
+  {
+    std::lock_guard<std::mutex> guard(console_name_lock);
+    name = console_name;
+  }
+  // An unnamed console takes the default name, which then stays its name.
+  // The lookup may load a module so it runs outside the lock.
+  if (name.empty()) {
+    if (const uint32_t common = LookupCommonString(kDefaultConsoleNameString)) {
+      name = xe::load_and_swap<std::u16string>(
+          kernel_memory()->TranslateVirtual(common));
+      name.resize(std::min(name.size(), kConsoleNameLength - 1));
+      std::lock_guard<std::mutex> guard(console_name_lock);
+      if (console_name.empty()) {
+        console_name = name;
+      } else {
+        name = console_name;
+      }
+    }
+  }
+  xe::string_util::copy_and_swap_truncating(
+      name_ptr, name.empty() ? std::u16string_view(u"Xbox 360") : name,
+      kConsoleNameLength);
+}
+DECLARE_XAM_EXPORT1(XamGetConsoleFriendlyName, kNone, kImplemented);
+
+dword_result_t XamSetConsoleFriendlyName_entry(pointer_t<char16_t> name_ptr) {
+  // A name ends within its length.
+  if (!name_ptr ||
+      xe::load_and_swap<uint16_t>(static_cast<char16_t*>(name_ptr) +
+                                  kConsoleNameLength - 1)) {
+    return X_E_INVALIDARG;
+  }
+  std::lock_guard<std::mutex> guard(console_name_lock);
+  console_name =
+      xe::load_and_swap<std::u16string>(static_cast<char16_t*>(name_ptr));
+  return X_E_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamSetConsoleFriendlyName, kNone, kSketchy);
 
 dword_result_t XamLogLocalizationEtx_entry(dword_t error_code, dword_t unk) {
   if (error_code == 0x80300034) {

@@ -591,6 +591,8 @@ bool COMMAND_PROCESSOR::ExecutePacketType3(uint32_t packet) XE_RESTRICT {
             COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE(packet, count);
         break;
       case PM4_EVENT_WRITE_SHD:
+      // Cache flush done event. Same initiator/address/value layout as SHD.
+      case PM4_EVENT_WRITE_CFL:
         result = COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_SHD(packet,
                                                                        count);
         break;
@@ -886,6 +888,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_XE_SWAP(uint32_t packet,
   swap_frontbuffer_height_ = frontbuffer_height;
   COMMAND_PROCESSOR::IssueScalerSwap();
   swap_representable_ = true;
+  graphics_system_->OnGuestSwap();
 
   // Advance the present-frame counter shown in the log prefix.
   logging::IncrementFrameNumber();

@@ -12,6 +12,7 @@
 #include "xenia/app/discord/discord_presence.h"
 #include "xenia/app/game_compat_db.h"
 #include "xenia/app/game_title_db.h"
+#include "xenia/app/title_update_check.h"
 #include "xenia/ui/advanced_settings_dialog_wx.h"
 #include "xenia/ui/avatar_editor_dialog_wx.h"
 #include "xenia/ui/cover_art_downloader.h"
@@ -60,6 +61,7 @@
 #include "xenia/ui/imgui_confirm_dialog.h"
 #include "xenia/ui/imgui_context_menu.h"
 #include "xenia/ui/imgui_debug_dialog.h"
+#include "xenia/ui/imgui_music_dialog.h"
 #include "xenia/ui/imgui_performance_dialog.h"
 #include "xenia/ui/imgui_postprocessing_dialog.h"
 #include "xenia/ui/profile_dialogs.h"
@@ -147,6 +149,7 @@ extern char** environ;
 #include "xenia/kernel/title_id_utils.h"
 #include "xenia/kernel/user_module.h"
 #include "xenia/kernel/xam/content_manager.h"
+#include "xenia/kernel/xam/dash_mouse.h"
 #include "xenia/kernel/xam/indie_game.h"
 #include "xenia/kernel/xam/profile_manager.h"
 #include "xenia/kernel/xam/xam_module.h"
@@ -159,6 +162,7 @@ extern char** environ;
 #include "xenia/ui/immediate_drawer.h"
 #include "xenia/ui/menu_item_wx.h"
 #include "xenia/ui/presenter.h"
+#include "xenia/ui/title_update_dialog_wx.h"
 #include "xenia/ui/ui_event.h"
 #include "xenia/ui/virtual_key.h"
 #include "xenia/ui/window_wx.h"
@@ -192,10 +196,9 @@ extern char** environ;
 DECLARE_bool(log_draws);
 DECLARE_bool(kinect_view);
 DECLARE_bool(log_resolves);
-DECLARE_bool(debug);
 DECLARE_path(target);
-DECLARE_bool(in_process_title_relaunch);
 DECLARE_bool(discord);
+DECLARE_bool(fps_overlay);
 
 DECLARE_string(hid);
 DECLARE_string(gpu);
@@ -326,7 +329,11 @@ DEFINE_string(screenshot_frames, "",
               "General");
 DEFINE_bool(disable_game_window_mouse, false,
             "Disables mouse interactions in the game window, including "
-            "double-click to fullscreen and right-click context menu.",
+            "double-click to fullscreen, the right-click context menu and "
+            "mouse input to the dashboard.",
+            "General");
+DEFINE_bool(offer_title_updates, false,
+            "Offers to install a title update for a game when it's launched.",
             "General");
 
 namespace xe {
@@ -527,6 +534,15 @@ class AboutDialog : public wxGenericAboutDialog {
     AddText("\n");
     AddLinkedLine(_("UI font: %s (SIL Open Font License 1.1)"),
                   _("Inter by Rasmus Andersson"), "https://rsms.me/inter/");
+    AddLinkedLine(_("UI font: %s (SIL Open Font License 1.1)"),
+                  _("M PLUS 1p by Coji Morishita"),
+                  "https://mplusfonts.github.io/");
+    AddLinkedLine(_("System font: %s (SIL Open Font License 1.1)"),
+                  _("Pretendard by Kil Hyung-jin"),
+                  "https://github.com/orioncactus/pretendard");
+    AddLinkedLine(_("System font: %s (SIL Open Font License 1.1)"),
+                  _("Noto Sans TC by Adobe"),
+                  "https://fonts.google.com/noto/specimen/Noto+Sans+TC");
     AddLinkedLine(_("Icons by %s"), _("Icons8"), "https://icons8.com");
   }
 
@@ -594,12 +610,16 @@ EmulatorWindow::EmulatorWindow(Emulator* emulator,
                 " CHECKED"
 #endif
 #endif
+#ifdef XE_BUILD_VERSION
+                " " XE_BUILD_VERSION;
+#else
                 " ("
 #ifdef XE_BUILD_IS_PR
                 "PR#" XE_BUILD_PR_NUMBER " - "
 #endif
                 XE_BUILD_BRANCH "@" XE_BUILD_COMMIT_SHORT " on " XE_BUILD_DATE
                 ")";
+#endif
 }
 
 std::unique_ptr<EmulatorWindow> EmulatorWindow::Create(
@@ -641,7 +661,7 @@ EmulatorWindow::~EmulatorWindow() {
   // this window and Thread::reset() does not join.
   gamepad_poll_running_ = false;
   if (gamepad_poll_thread_) {
-    xe::threading::Wait(gamepad_poll_thread_.get(), false);
+    xe::threading::Wait(gamepad_poll_thread_.get());
     gamepad_poll_thread_.reset();
   }
 
@@ -936,8 +956,10 @@ void EmulatorWindow::OnEmulatorInitialized() {
         app_context_.CallInUIThread(
             [this, title_id, name = std::string(title_name)]() {
               AddLaunchedTitleToLibrary(title_id, name);
+              StartFrameRateTimer();
               UpdateTitle();
               ApplyContentVisibility();
+              NoteMissingTitleUpdate(title_id);
             });
       });
   // Sign-in changes come from the title, the ImGui profiles menu and the wx
@@ -966,6 +988,9 @@ void EmulatorWindow::OnEmulatorInitialized() {
       compiling_shaders_ = false;
       if (compiling_shaders_hide_timer_) {
         compiling_shaders_hide_timer_->Stop();
+      }
+      if (frame_rate_timer_) {
+        frame_rate_timer_->Stop();
       }
       UpdateTitle();
     });
@@ -1024,7 +1049,8 @@ void EmulatorWindow::OnEmulatorInitialized() {
     game_list_panel_->Reload();
   }
   // Skip when the game list is up — fullscreen is for the render surface.
-  if (cvars::fullscreen &&
+  // Entering it activates the window.
+  if (cvars::fullscreen && MayTakeFocus() &&
       (target_pending_launch_ || emulator_->is_title_open())) {
     SetFullscreen(true);
   }
@@ -1143,6 +1169,21 @@ void EmulatorWindow::EmulatorWindowListener::OnMouseUp(ui::MouseEvent& e) {
 void EmulatorWindow::EmulatorWindowListener::OnMouseDoubleClick(
     ui::MouseEvent& e) {
   emulator_window_.OnMouseDoubleClick(e);
+}
+
+void EmulatorWindow::EmulatorWindowListener::OnMouseMove(ui::MouseEvent& e) {
+  emulator_window_.OnMouseMove(e);
+}
+
+void EmulatorWindow::EmulatorWindowListener::OnMouseWheel(ui::MouseEvent& e) {
+  emulator_window_.OnMouseWheel(e);
+}
+
+void EmulatorWindow::EmulatorWindowListener::OnLostFocus(ui::UISetupEvent& e) {
+  // A release made while unfocused isn't seen.
+  if (kernel::xam::DashMouse* dash_mouse = emulator_window_.GetDashMouse()) {
+    dash_mouse->Cancel();
+  }
 }
 
 void EmulatorWindow::EmulatorWindowListener::OnUsbDeviceChanged(
@@ -1802,8 +1843,7 @@ void EmulatorWindow::OnKeyDown(ui::KeyEvent& e) {
       // In game Esc toggles the context menu, which offers leaving fullscreen.
       // Other open dialogs keep Esc to cancel.
       if (emulator_->is_title_open()) {
-        if (!context_menu_ && imgui_drawer() &&
-            imgui_drawer()->HasOpenDialogs()) {
+        if (!context_menu_ && HasOpenDialogs()) {
           return;
         }
         ToggleContextMenu(false);
@@ -1816,9 +1856,6 @@ void EmulatorWindow::OnKeyDown(ui::KeyEvent& e) {
       SetFullscreen(false);
     } break;
 
-    case ui::VirtualKey::kPause: {
-      CpuBreakIntoDebugger();
-    } break;
     case ui::VirtualKey::kCancel: {
       CpuBreakIntoHostDebugger();
     } break;
@@ -1831,13 +1868,99 @@ void EmulatorWindow::OnKeyDown(ui::KeyEvent& e) {
   e.set_handled(true);
 }
 
+kernel::xam::DashMouse* EmulatorWindow::GetDashMouse() const {
+  // A relaunch frees the kernel state on another thread.
+  if (cvars::disable_game_window_mouse || !emulator_ ||
+      !emulator_->is_title_open() || emulator_->is_relaunching() ||
+      !emulator_->kernel_state()) {
+    return nullptr;
+  }
+  auto dash_mouse = emulator_->kernel_state()->xam_state()->dash_mouse();
+  return dash_mouse->active() ? dash_mouse : nullptr;
+}
+
+bool EmulatorWindow::HasOpenDialogs() const {
+  return imgui_drawer_ && imgui_drawer_->HasOpenDialogs();
+}
+
+bool EmulatorWindow::GetGuestOutputMousePosition(const ui::MouseEvent& e,
+                                                 float& x_out, float& y_out,
+                                                 bool& inside_out) const {
+  ui::Presenter* presenter = GetGraphicsSystemPresenter();
+  const uint32_t window_width = window_->GetActualPhysicalWidth();
+  const uint32_t window_height = window_->GetActualPhysicalHeight();
+  float left, top, width, height;
+  if (!presenter || !window_width || !window_height ||
+      !presenter->GetGuestOutputPaintArea(left, top, width, height) ||
+      width <= 0.0f || height <= 0.0f) {
+    return false;
+  }
+  const float x = ((float(e.x()) + 0.5f) / float(window_width) - left) / width;
+  const float y = ((float(e.y()) + 0.5f) / float(window_height) - top) / height;
+  inside_out = x >= 0.0f && x < 1.0f && y >= 0.0f && y < 1.0f;
+  x_out = std::clamp(x, 0.0f, 1.0f);
+  y_out = std::clamp(y, 0.0f, 1.0f);
+  return true;
+}
+
+void EmulatorWindow::OnMouseMove(const ui::MouseEvent& e) {
+  kernel::xam::DashMouse* dash_mouse = GetDashMouse();
+  if (!dash_mouse) {
+    return;
+  }
+  float x, y;
+  bool inside;
+  if (HasOpenDialogs()) {
+    dash_mouse->Cancel();
+  } else if (GetGuestOutputMousePosition(e, x, y, inside)) {
+    dash_mouse->Move(x, y);
+  }
+}
+
+void EmulatorWindow::OnMouseWheel(const ui::MouseEvent& e) {
+  kernel::xam::DashMouse* dash_mouse = GetDashMouse();
+  if (!dash_mouse || !e.scroll_y() || HasOpenDialogs()) {
+    return;
+  }
+  // Touchpads and smooth wheels turn by parts of a detent.
+  if ((dash_mouse_wheel_ < 0) != (e.scroll_y() < 0)) {
+    dash_mouse_wheel_ = 0;
+  }
+  dash_mouse_wheel_ += e.scroll_y();
+  constexpr int32_t kDetent = int32_t(ui::MouseEvent::kScrollPerDetent);
+  while (std::abs(dash_mouse_wheel_) >= kDetent) {
+    dash_mouse->Wheel(dash_mouse_wheel_ > 0);
+    dash_mouse_wheel_ -= dash_mouse_wheel_ > 0 ? kDetent : -kDetent;
+  }
+}
+
 void EmulatorWindow::OnMouseDown(const ui::MouseEvent& e) {
+  // The dashboard takes the mouse unless a dialog is over it, with right and
+  // the back button going back in place of the context menu.
+  kernel::xam::DashMouse* dash_mouse = GetDashMouse();
+  if (dash_mouse && !HasOpenDialogs()) {
+    float x, y;
+    bool inside;
+    switch (e.button()) {
+      case ui::MouseEvent::Button::kLeft:
+        if (GetGuestOutputMousePosition(e, x, y, inside) && inside) {
+          dash_mouse->Press(x, y);
+        }
+        return;
+      case ui::MouseEvent::Button::kRight:
+      case ui::MouseEvent::Button::kX1:
+        dash_mouse->Back();
+        return;
+      default:
+        break;
+    }
+  }
   if (e.button() == ui::MouseEvent::Button::kRight) {
     if (cvars::disable_game_window_mouse) {
       return;
     }
     // Don't show context menu if a dialog (other than context menu) is open
-    if (!context_menu_ && imgui_drawer() && imgui_drawer()->HasOpenDialogs()) {
+    if (!context_menu_ && HasOpenDialogs()) {
       return;
     }
     ToggleContextMenu();
@@ -1878,6 +2001,12 @@ void EmulatorWindow::ToggleContextMenu(bool use_cursor_position) {
                           [this]() { ToggleControllerVibration(); });
 
   context_menu->AddAction(
+      std::string("FPS Counter: ") + (cvars::fps_overlay ? "On" : "Off"), []() {
+        ui::Presenter::ToggleFrameRateOverlay();
+        config::SaveConfig();
+      });
+
+  context_menu->AddAction(
       "Take Screenshot", [this]() { TakeScreenshot(); }, "F12");
 
   context_menu->AddSeparator();
@@ -1900,7 +2029,11 @@ void EmulatorWindow::ToggleContextMenu(bool use_cursor_position) {
   context_menu->AddAction("Profiles Menu",
                           [this]() { ToggleProfilesConfigDialog(); });
 
-  context_menu->AddAction("Audio", [this]() { ToggleAudioDialog(); });
+  context_menu->AddAction("Volume", [this]() { ToggleAudioDialog(); });
+
+  if (emulator()->host_media_session()) {
+    context_menu->AddAction("Select Music", [this]() { ToggleMusicDialog(); });
+  }
 
   context_menu->AddSeparator();
 
@@ -1937,6 +2070,20 @@ void EmulatorWindow::ToggleContextMenu(bool use_cursor_position) {
 }
 
 void EmulatorWindow::OnMouseUp(const ui::MouseEvent& e) {
+  kernel::xam::DashMouse* dash_mouse = GetDashMouse();
+  if (dash_mouse && e.button() == ui::MouseEvent::Button::kLeft) {
+    float x, y;
+    bool inside;
+    if (!HasOpenDialogs() && GetGuestOutputMousePosition(e, x, y, inside)) {
+      const int double_click_time =
+          wxSystemSettings::GetMetric(wxSYS_DCLICK_MSEC);
+      dash_mouse->Release(x, y,
+                          std::chrono::milliseconds(
+                              double_click_time > 0 ? double_click_time : 500));
+    } else {
+      dash_mouse->Cancel();
+    }
+  }
   last_mouse_up = steady_clock::now();
 }
 
@@ -2139,19 +2286,18 @@ void EmulatorWindow::SaveImage(const std::filesystem::path& filepath,
   }
 }
 
-void EmulatorWindow::OnMouseDoubleClick(const ui::MouseEvent& e) {
-  if (cvars::disable_game_window_mouse) {
+void EmulatorWindow::OnMouseDoubleClick(ui::MouseEvent& e) {
+  // A handled double click keeps the window from toggling fullscreen.
+  if (e.button() != ui::MouseEvent::Button::kLeft) {
     return;
   }
-  // Don't toggle fullscreen if any ImGui dialogs are open
-  // This allows users to double-click to select text in dialog input fields
-  if (imgui_drawer_ && imgui_drawer_->HasOpenDialogs()) {
+  if (cvars::disable_game_window_mouse || HasOpenDialogs()) {
+    e.set_handled(true);
     return;
   }
-
-  // Only toggle fullscreen on left button double-click
-  if (e.button() == ui::MouseEvent::Button::kLeft) {
-    ToggleFullscreen();
+  if (kernel::xam::DashMouse* dash_mouse = GetDashMouse()) {
+    dash_mouse->DoubleClick();
+    e.set_handled(true);
   }
 }
 
@@ -2337,13 +2483,7 @@ bool EmulatorWindow::StopTitleAndReturnToList() {
   }
   target_pending_launch_ = false;
   // When in-process relaunch is off, spawn a fresh process with no target.
-  // macOS always spawns (see XamLoaderLaunchTitle).
-#if XE_PLATFORM_MAC
-  const bool in_process = false;
-#else
-  const bool in_process = cvars::in_process_title_relaunch;
-#endif
-  if (!in_process) {
+  if (!Emulator::CanRelaunchInProcess()) {
     if (auto cb = emulator_->on_launch_new_title()) {
       cb(/*host_path=*/{}, /*launch_module=*/{}, /*launch_flags=*/0,
          /*launch_data=*/{}, /*xbox_disc=*/{}, /*package=*/{});
@@ -2384,6 +2524,9 @@ bool EmulatorWindow::StopTitleAndReturnHome() {
 }
 
 void EmulatorWindow::OnLaunchFailed() {
+  if (xe::IsUnattended()) {
+    xe::ExitUnattended(EXIT_FAILURE, "launch failed");
+  }
   // Presence still shows the title a failed relaunch replaced.
   if (cvars::discord) {
     discord::DiscordPresence::Shutdown();
@@ -2434,6 +2577,15 @@ void EmulatorWindow::RestoreListWindow() {
   ApplyContentVisibility();
 }
 
+bool EmulatorWindow::MayTakeFocus() const {
+  auto* wx_window = dynamic_cast<ui::WxWindow*>(window_.get());
+  wxFrame* frame = wx_window ? wx_window->frame() : nullptr;
+  if (!frame || !frame->IsShown()) {
+    return false;
+  }
+  return !xe::IsUnattended() || frame->IsActive();
+}
+
 void EmulatorWindow::ApplyContentVisibility() {
   auto* wx_window = dynamic_cast<ui::WxWindow*>(window_.get());
   if (!wx_window) {
@@ -2478,10 +2630,13 @@ void EmulatorWindow::ApplyContentVisibility() {
   // AUI's pane.Show() doesn't always hide the underlying wxWindow.
   render_pane->Show(show_render);
   game_list_panel_->Show(show_list);
-  if (show_render) {
+  // Focusing a child activates its frame, even a hidden one, taking the focus
+  // from whatever the user is working in.
+  const bool may_take_focus = MayTakeFocus();
+  if (may_take_focus && show_render) {
     render_pane->Raise();
     render_pane->SetFocus();
-  } else if (show_list) {
+  } else if (may_take_focus && show_list) {
     game_list_panel_->Raise();
     game_list_panel_->FocusSearch();
   }
@@ -2865,24 +3020,6 @@ void EmulatorWindow::CpuTimeScalarSetHalf() {
 void EmulatorWindow::CpuTimeScalarSetDouble() {
   Clock::set_guest_time_scalar(Clock::guest_time_scalar() * 2.0);
   UpdateTitle();
-}
-
-void EmulatorWindow::CpuBreakIntoDebugger() {
-  if (!cvars::debug) {
-    xe::ui::ImGuiDialog::ShowMessageBox(imgui_drawer_.get(), "Xenia Debugger",
-                                        "Xenia must be launched with the "
-                                        "--debug flag in order to enable "
-                                        "debugging.");
-    return;
-  }
-  auto processor = emulator()->processor();
-  if (processor->execution_state() == cpu::ExecutionState::kRunning) {
-    // Currently running, so interrupt (and show the debugger).
-    processor->Pause();
-  } else {
-    // Not running, so just bring the debugger into focus.
-    processor->ShowDebugger();
-  }
 }
 
 void EmulatorWindow::CpuBreakIntoHostDebugger() { xe::debugging::Break(); }
@@ -3629,6 +3766,19 @@ void EmulatorWindow::ToggleAudioDialog() {
   audio_dialog_->SetOnChangeCallback([this]() { RefreshAudioIcon(); });
 }
 
+void EmulatorWindow::ToggleMusicDialog() {
+  if (music_dialog_) {
+    music_dialog_->CloseDialog();
+    music_dialog_ = nullptr;
+    return;
+  }
+
+  music_dialog_ =
+      new ui::ImGuiMusicDialog(imgui_drawer(), emulator()->input_system(),
+                               emulator()->host_media_session());
+  music_dialog_->SetOnCloseCallback([this]() { music_dialog_ = nullptr; });
+}
+
 void EmulatorWindow::ToggleMute() {
   uint32_t current = cvars::volume > 100 ? 100 : cvars::volume;
   if (current > 0) {
@@ -3756,8 +3906,12 @@ void EmulatorWindow::ShowAbout() {
     }
   }
   info.SetName("Xenia Edge");
+#ifdef XE_BUILD_VERSION
+  info.SetVersion(XE_BUILD_VERSION);
+#else
   info.SetVersion(wxString::Format("%s@%s (%s)", XE_BUILD_BRANCH,
                                    XE_BUILD_COMMIT_SHORT, XE_BUILD_DATE));
+#endif
   info.SetDescription(_("Experimental fork of Xenia Canary."));
 
   auto* wx_window = static_cast<ui::WxWindow*>(window_.get());
@@ -3793,7 +3947,7 @@ void EmulatorWindow::UpdateTitle() {
         title_version = shown->version ? VersionToString(shown->version) : "";
       }
     }
-    sb.AppendFormat(" | [{:08X}", title_id);
+    sb.AppendFormat(" [{:08X}", title_id);
     if (!title_version.empty()) {
       sb.Append(" v");
       sb.Append(title_version);
@@ -3863,6 +4017,10 @@ void EmulatorWindow::UpdateTitle() {
     sb.Append(">");
   }
 
+  if (graphics_system && emulator()->is_title_open()) {
+    sb.AppendFormat(" {:.2f} FPS", graphics_system->GetFramesPerSecond());
+  }
+
   if (Clock::guest_time_scalar() != 1.0) {
     sb.AppendFormat(" (@{:.2f}x)", Clock::guest_time_scalar());
   }
@@ -3892,6 +4050,17 @@ void EmulatorWindow::SetInitializingShaderStorage(bool initializing) {
   }
   initializing_shader_storage_ = initializing;
   UpdateTitle();
+}
+
+void EmulatorWindow::StartFrameRateTimer() {
+  if (!frame_rate_timer_) {
+    frame_rate_timer_ = std::make_unique<wxTimer>();
+    frame_rate_timer_->Bind(wxEVT_TIMER,
+                            [this](wxTimerEvent&) { UpdateTitle(); });
+  }
+  // The frame rate is measured over half a second.
+  constexpr int kFrameRateUpdateMs = 500;
+  frame_rate_timer_->Start(kFrameRateUpdateMs);
 }
 
 void EmulatorWindow::SetCompilingShaders(bool compiling) {
@@ -4227,6 +4396,85 @@ void EmulatorWindow::LaunchTitleInNewProcess(
   app_context_.QuitFromUIThread();
 }
 
+void EmulatorWindow::NoteMissingTitleUpdate(uint32_t title_id) {
+  auto* kernel_state = emulator_->kernel_state();
+  auto* profiles =
+      kernel_state ? kernel_state->xam_state()->profile_manager() : nullptr;
+  if (!profiles || !imgui_drawer() || kernel::IsSystemTitle(title_id) ||
+      GetKnownTitleUpdates(title_id).empty()) {
+    return;
+  }
+  const auto folder =
+      profiles->GetProfileContentPath(0, title_id, XContentType::kInstaller);
+  std::error_code ec;
+  if (std::filesystem::exists(folder, ec) &&
+      !std::filesystem::is_empty(folder, ec)) {
+    return;
+  }
+  new ui::HostNotificationWindow(
+      imgui_drawer(), "Title Update",
+      "An update exists for this game but none is installed.", 0);
+}
+
+void EmulatorWindow::OfferTitleUpdate(const std::filesystem::path& path) {
+  auto* kernel_state = emulator_->kernel_state();
+  auto* profiles =
+      kernel_state ? kernel_state->xam_state()->profile_manager() : nullptr;
+  if (!cvars::offer_title_updates || !profiles) {
+    return;
+  }
+  // A release the library lists is known without reading its file.
+  const LibraryEntry* entry = nullptr;
+  std::optional<TitleUpdateRelease> release;
+  if (game_library_) {
+    for (const auto& candidate : game_library_->entries()) {
+      const auto disc =
+          std::ranges::find(candidate.paths, path, &LibraryPath::path);
+      if (disc != candidate.paths.end()) {
+        entry = &candidate;
+        release = LibraryTitleUpdateRelease(candidate, *disc);
+        break;
+      }
+    }
+  }
+  if (!entry) {
+    release = ReadTitleUpdateRelease(path);
+  }
+  if (!release || kernel::IsSystemTitle(release->title_id)) {
+    return;
+  }
+  const auto& known = GetKnownTitleUpdates(release->title_id);
+  if (known.empty()) {
+    return;
+  }
+  const auto folder = profiles->GetProfileContentPath(0, release->title_id,
+                                                      XContentType::kInstaller);
+  const uint32_t installed =
+      InstalledTitleUpdateNumber(folder, release->version);
+  // A title known for other releases only is offered too while none is
+  // installed, since xboxunity.net can have one for this release.
+  std::error_code ec;
+  if (!FindNewerTitleUpdate(known, *release, installed) &&
+      std::filesystem::exists(folder, ec) &&
+      !std::filesystem::is_empty(folder, ec)) {
+    return;
+  }
+
+  std::string name;
+  if (entry) {
+    name = entry->name;
+  } else if (const auto* info = GetGameTitleInfo(release->title_id)) {
+    name = info->name;
+  }
+  if (name.empty()) {
+    name = fmt::format("{:08X}", release->title_id);
+  }
+  auto* wx_window = dynamic_cast<ui::WxWindow*>(window_.get());
+  ShowTitleUpdateDialog(wx_window ? wx_window->frame() : nullptr, *release,
+                        installed, path, wxString::FromUTF8(name), folder,
+                        /*at_launch=*/true);
+}
+
 xe::X_STATUS EmulatorWindow::RunTitle(const std::filesystem::path& path_to_file,
                                       bool boot_animation) {
   std::error_code ec = {};
@@ -4270,6 +4518,7 @@ xe::X_STATUS EmulatorWindow::RunTitle(const std::filesystem::path& path_to_file,
     auto abs_path = std::filesystem::absolute(path_to_file);
     config::ReloadConfig();
     config::LoadGameConfigForFile(abs_path);
+    OfferTitleUpdate(abs_path);
     {
       auto res = xe::gpu::GraphicsSystem::GetInternalDisplayResolution();
       window_->SetDesiredLogicalSize(res.first, res.second);
@@ -4278,9 +4527,7 @@ xe::X_STATUS EmulatorWindow::RunTitle(const std::filesystem::path& path_to_file,
       }
     }
     auto host_path = xe::path_to_utf8(abs_path);
-    // macOS always relaunches out-of-process (see XamLoaderLaunchTitle).
-#if !XE_PLATFORM_MAC
-    if (cvars::in_process_title_relaunch) {
+    if (Emulator::CanRelaunchInProcess()) {
       // Detached non-guest thread: RelaunchTitle terminates all guest threads.
       auto* emulator = emulator_;
       std::thread([emulator, host_path = std::move(host_path)]() mutable {
@@ -4290,7 +4537,6 @@ xe::X_STATUS EmulatorWindow::RunTitle(const std::filesystem::path& path_to_file,
       }).detach();
       return X_STATUS_SUCCESS;
     }
-#endif  // !XE_PLATFORM_MAC
     // Otherwise spawn a fresh process (same path as the kernel relaunch).
     auto cb = emulator_->on_launch_new_title();
     if (cb) {
@@ -4324,12 +4570,7 @@ xe::X_STATUS EmulatorWindow::RunTitle(const std::filesystem::path& path_to_file,
     return X_STATUS_UNSUCCESSFUL;
   }
 
-  // macOS always relaunches out-of-process (see XamLoaderLaunchTitle).
-#if XE_PLATFORM_MAC
-  bool spawn_fresh = true;
-#else
-  bool spawn_fresh = !cvars::in_process_title_relaunch;
-#endif
+  bool spawn_fresh = !Emulator::CanRelaunchInProcess();
 #if XE_PLATFORM_LINUX
   // gamemoderun wraps the process via LD_PRELOAD (which fork inherits) and an
   // in-process launch can't add or drop it. Like the gpu/apu respawn below,
@@ -4359,6 +4600,7 @@ xe::X_STATUS EmulatorWindow::RunTitle(const std::filesystem::path& path_to_file,
     // cvars.
     config::ReloadConfig();
     config::LoadGameConfigForFile(abs_path);
+    OfferTitleUpdate(abs_path);
     LaunchTitleInNewProcess(abs_path, boot_animation);
     return X_STATUS_SUCCESS;
   }
@@ -4370,6 +4612,7 @@ xe::X_STATUS EmulatorWindow::RunTitle(const std::filesystem::path& path_to_file,
   emulator_->ShutdownSubsystems();
   config::ReloadConfig();
   config::LoadGameConfigForFile(abs_path);
+  OfferTitleUpdate(abs_path);
   // Backend switches in-process leave residual driver/loader state behind, so
   // when the gpu/apu cvar (after per-game overrides) doesn't match the live
   // backend, restart the process cleanly via the spawn path.
@@ -4387,8 +4630,9 @@ xe::X_STATUS EmulatorWindow::RunTitle(const std::filesystem::path& path_to_file,
     OnLaunchFailed();
     return status;
   }
-  // Toggle before swap chain creation so it picks up the right size.
-  if (cvars::fullscreen && !window_->IsFullscreen()) {
+  // Toggle before swap chain creation so it picks up the right size. Entering
+  // fullscreen activates the window.
+  if (cvars::fullscreen && !window_->IsFullscreen() && MayTakeFocus()) {
     SetFullscreen(true);
   }
   {
@@ -4480,6 +4724,10 @@ void EmulatorWindow::ClearDialogs() {
   if (audio_dialog_) {
     audio_dialog_->CloseDialog();
     audio_dialog_ = nullptr;
+  }
+  if (music_dialog_) {
+    music_dialog_->CloseDialog();
+    music_dialog_ = nullptr;
   }
   // Destroyed below without running its callback.
   stop_title_dialog_ = nullptr;

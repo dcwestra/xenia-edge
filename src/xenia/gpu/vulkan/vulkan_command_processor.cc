@@ -567,8 +567,9 @@ bool VulkanCommandProcessor::SetupContext() {
   zpd_draw_resolution_scale_x_ = draw_resolution_scale_x;
   zpd_draw_resolution_scale_y_ = draw_resolution_scale_y;
 
-  const VkDeviceSize zpd_counter_sink_range =
-      XenosZPDReport::kCounterSizeBytes * kQueryPoolCapacity;
+  // Holds the counter binding until the counter buffer replaces it. Queries
+  // only open after that so shaders never index it and one slot is enough.
+  const VkDeviceSize zpd_counter_sink_range = XenosZPDReport::kCounterSizeBytes;
   if (zpd_counter_binding_used &&
       !ui::vulkan::util::CreateDedicatedAllocationBuffer(
           vulkan_device, zpd_counter_sink_range,
@@ -3683,7 +3684,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
         CanInterpretVertexShader(
             *vertex_shader, active_vertex_shader_ucode_address_,
             primitive_processing_result.host_vertex_shader_type,
-            primitive_processing_result.host_primitive_type);
+            primitive_processing_result.host_primitive_type,
+            vertex_shader_modification.vertex.z_clip_distances ||
+                vertex_shader_modification.vertex.guard_band_clip_distances ||
+                vertex_shader_modification.vertex.discard_band_cull_distances);
     // The shaders the draw's thread readies are translated now for their
     // sampler bindings. Whether the draw can use a stand-in is known only once
     // the render targets are updated, so this assumes it can unless the
@@ -4030,7 +4034,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
           render_target_cache_->GetSampleLocationsInfo(
               render_pass_key.msaa_samples,
               render_pass_key.depth_and_color_used) != nullptr);
-  gviargs.SetupRegisterValues(regs, window_offset_tiles != 0);
+  gviargs.SetupRegisterValues(regs, window_offset_tiles != 0,
+                              pipeline_cache_->raw_clipping_supported());
+  // The host clips at the Z planes without depthClamp.
+  gviargs.depth_clamped &= uint32_t(device_properties.depthClamp);
 
   if (gviargs == previous_viewport_info_args_) {
     viewport_info = previous_viewport_info_;
@@ -5755,18 +5762,21 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     frame_open_ = true;
 
     // Log guest ZPD report stats every 100 frames.
-    if (GetZPDMode() != ZPDMode::kFake && cvars::occlusion_query_log &&
+    if (zpd_mode_ != ZPDMode::kFake && cvars::occlusion_query_log &&
         host_query_pool_ && host_query_pool_->capacity() &&
         frame_current_ - zpd_stats_.last_log_frame >= 100) {
       XELOGI(
           "Occlusion Query Stats (last 100 frames): "
           "ReportsQueued={}, ReportsRetired={}, SegBegun={}, SegEnded={}, "
           "PoolExhausted={}, Failed={}, SpeculativeCorrections={}, "
-          "RetiresAbandoned={}",
+          "RetiresAbandoned={}, StrictWaitsDelaying={}, "
+          "StrictWaitsDelayingMs={:.1f}",
           zpd_stats_.reports_queued, zpd_stats_.reports_retired,
           zpd_stats_.segments_begun, zpd_stats_.segments_ended,
           zpd_stats_.pool_exhausted, zpd_stats_.failed,
-          zpd_stats_.speculative_corrections, zpd_stats_.retires_abandoned);
+          zpd_stats_.speculative_corrections, zpd_stats_.retires_abandoned,
+          zpd_stats_.strict_waits_delaying,
+          zpd_stats_.strict_waits_delaying_us / 1000.0);
 
       zpd_stats_.Reset(frame_current_);
     }
@@ -6935,6 +6945,9 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
     if (active_query_index_ != UINT32_MAX && active_query_is_fsi_ &&
         host_query_pool_->counter_initialized()) {
       zpd_fsi_counter_index = active_query_index_;
+      if (active_segment_.viz.generation != kInvalidVIZGeneration) {
+        zpd_fsi_counter_index |= XenosZPDReport::kCounterIndexFirstCopyOnly;
+      }
     }
     dirty |= zpd_counter_index_force_update_;
     zpd_counter_index_force_update_ = false;
@@ -7001,6 +7014,20 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
     dirty |= system_constants_.ndc_offset[i] != viewport_info.ndc_offset[i];
     system_constants_.ndc_scale[i] = viewport_info.ndc_scale[i];
     system_constants_.ndc_offset[i] = viewport_info.ndc_offset[i];
+  }
+
+  float guard_band_clip_adj[] = {
+      regs.Get<float>(XE_GPU_REG_PA_CL_GB_HORZ_CLIP_ADJ),
+      regs.Get<float>(XE_GPU_REG_PA_CL_GB_VERT_CLIP_ADJ)};
+  float guard_band_discard_adj[] = {
+      regs.Get<float>(XE_GPU_REG_PA_CL_GB_HORZ_DISC_ADJ),
+      regs.Get<float>(XE_GPU_REG_PA_CL_GB_VERT_DISC_ADJ)};
+  for (uint32_t i = 0; i < 2; ++i) {
+    dirty |= system_constants_.guard_band_clip_adj[i] != guard_band_clip_adj[i];
+    system_constants_.guard_band_clip_adj[i] = guard_band_clip_adj[i];
+    dirty |= system_constants_.guard_band_discard_adj[i] !=
+             guard_band_discard_adj[i];
+    system_constants_.guard_band_discard_adj[i] = guard_band_discard_adj[i];
   }
 
   // User clip planes, for vertex and domain shaders.

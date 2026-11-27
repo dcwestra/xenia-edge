@@ -169,8 +169,9 @@ void ImGuiContextMenu::OnDraw(ImGuiIO& io) {
 
   // Position the popup
   if (center_on_screen_) {
+    // Every frame so the menu follows resizes.
     ImVec2 center = ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f);
-    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
   } else {
     ImGui::SetNextWindowPos(ImVec2(position_x_, position_y_),
                             ImGuiCond_Appearing);
@@ -262,12 +263,11 @@ void ImGuiContextMenu::OnDraw(ImGuiIO& io) {
       ImGui::SetCursorPosX(padding);
       ImGui::TextUnformatted(item.text.c_str());
 
-      // Draw shortcut if present
+      // Draw shortcut if present, right-aligned to the item width. Aligning to
+      // the window width would keep the menu from shrinking.
       if (!item.shortcut.empty()) {
-        float shortcut_width =
-            ImGui::CalcTextSize(item.shortcut.c_str()).x + padding;
-        float window_width = ImGui::GetWindowWidth();
-        ImGui::SameLine(window_width - shortcut_width);
+        float shortcut_width = ImGui::CalcTextSize(item.shortcut.c_str()).x;
+        ImGui::SameLine(padding + min_width - shortcut_width);
         // Lighter text for shortcut, white if focused for contrast on green
         ImGui::PushStyleColor(ImGuiCol_Text,
                               is_focused ? ImVec4(0.85f, 0.85f, 0.85f, 1.0f)

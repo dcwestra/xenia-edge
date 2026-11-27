@@ -26,10 +26,6 @@
 #include "xenia/cpu/mmio_handler.h"
 #include "xenia/guest_pointers.h"
 namespace xe {
-class ByteStream;
-}  // namespace xe
-
-namespace xe {
 
 class Memory;
 
@@ -39,6 +35,10 @@ enum SystemHeapFlag : uint32_t {
 
   kSystemHeapDefault = kSystemHeapVirtual,
 };
+
+// The console's system partition is the first 32 MB of physical memory, the
+// title's is the rest.
+constexpr uint32_t kSystemPhysicalMemoryEnd = 0x02000000;
 
 enum class HeapType : uint8_t {
   kGuestVirtual,
@@ -117,7 +117,10 @@ union PageEntry {
     uint32_t current_protect : 4;
     // Allocation state of the page as a MemoryAllocationFlag bit mask.
     uint32_t state : 2;
-    uint32_t reserved : 14;
+    // Set once a commit has initialized the page. Decommit and release keep it
+    // because the page holds data from then on.
+    uint32_t initialized : 1;
+    uint32_t reserved : 13;
   };
 };
 
@@ -141,6 +144,10 @@ class BaseHeap {
 
   // Sum of unreserved pages in heap
   uint32_t unreserved_page_count() const { return unreserved_page_count_; }
+
+  // Unreserved pages between the pages holding the two addresses, inclusive.
+  uint32_t UnreservedPageCountInRange(uint32_t low_address,
+                                      uint32_t high_address) const;
 
   // Sum of reserved pages in heap
   uint32_t reserved_page_count() const {
@@ -203,6 +210,15 @@ class BaseHeap {
   // Partial overlapping pages will also be released.
   virtual bool Release(uint32_t address, uint32_t* out_region_size = nullptr);
 
+  // Releases whole pages inside one region. The pages before and after them
+  // become regions of their own.
+  bool ReleaseRange(uint32_t address, uint32_t size);
+
+  // The runs of the range whose pages no commit has initialized since the heap
+  // was reset. Marks the whole range initialized.
+  std::vector<std::pair<uint32_t, uint32_t>> TakeUninitializedRuns(
+      uint32_t address, uint32_t size);
+
   // Modifies the protection mode of pages within the given range.
   virtual bool Protect(uint32_t address, uint32_t size, uint32_t protect,
                        uint32_t* old_protect = nullptr);
@@ -263,9 +279,6 @@ class BaseHeap {
   xe::memory::PageAccess QueryRangeAccess(uint32_t low_address,
                                           uint32_t high_address);
 
-  bool Save(ByteStream* stream);
-  bool Restore(ByteStream* stream);
-
   void Reset();
 
  protected:
@@ -291,6 +304,9 @@ class BaseHeap {
   // to ApplyHostProtect where it is not (4 KB guest pages on a 16 KB host).
   bool CommitHostPages(uint32_t start_page_number, uint32_t page_count,
                        uint32_t protect);
+
+  // Frees the page range in page_table_ and the free block tracker.
+  void ReleasePages(uint32_t start_page_number, uint32_t page_count);
 
   // Removes (or splits) the free block covering the given page range.
   void RemoveFreeBlock(uint32_t start_page, uint32_t page_count);
@@ -861,9 +877,6 @@ class Memory {
 
   // Dumps a map of all allocated memory to the log.
   void DumpMap();
-
-  bool Save(ByteStream* stream);
-  bool Restore(ByteStream* stream);
 
   void SetMMIOExceptionRecordingCallback(cpu::MmioAccessRecordCallback callback,
                                          void* context);

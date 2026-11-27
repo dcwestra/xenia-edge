@@ -12,6 +12,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <span>
 #include <string>
 #include <vector>
 #include "xenia/base/mapped_memory.h"
@@ -195,6 +196,11 @@ class XexModule : public xe::cpu::Module {
   const uint32_t base_address() const { return base_address_; }
   const bool is_dev_kit() const { return is_dev_kit_; }
 
+  // The function entries the kernel's unwinder searches: the image's
+  // exception directory, else its .pdata section without the zero padding.
+  uint32_t function_entries() const { return function_entries_; }
+  uint32_t function_entry_count() const { return function_entry_count_; }
+
   // Section type of the image page containing `address`.
   bool GetPageSectionType(uint32_t address, xex2_section_type* out_type) const;
 
@@ -227,6 +233,16 @@ class XexModule : public xe::cpu::Module {
   uint32_t GetProcAddress(const std::string_view name) const;
 
   int ApplyPatch(XexModule* module);
+  // Whether this patch's image key fits |module|, the check ApplyPatch makes
+  // once the headers are patched. A region's own headers change the base's
+  // signature but not its key so this also passes for the same build released
+  // elsewhere.
+  bool PatchImageKeyMatches(const XexModule& module) const;
+  // The same check on headers read from files, |dev_kit| naming the key the
+  // base is encrypted with.
+  static bool PatchKeyFits(std::span<const uint8_t> base_headers,
+                           std::span<const uint8_t> patch_headers,
+                           bool dev_kit);
   bool Load(const std::string_view name, const std::string_view path,
             const void* xex_addr, size_t xex_length);
   bool LoadContinue();
@@ -242,6 +258,8 @@ class XexModule : public xe::cpu::Module {
   bool is_valid_executable() const;
   // A module of resources alone has no code, nor a PE image.
   bool has_code() const;
+  // Whether its code has an mfvscr, the only instruction that reads VSCR[SAT].
+  bool ReadsVscr() const;
 
   bool is_patch() const {
     assert_not_null(xex_header());
@@ -274,6 +292,14 @@ class XexModule : public xe::cpu::Module {
   std::vector<uint32_t> PreanalyzeCode();
   friend struct XexInfoCache;
   void ReadSecurityInfo();
+  // Applies a patch's header delta to |headers|, the base's own or a copy.
+  // Returns 0 or ApplyPatch's error code.
+  static int PatchHeaders(const xex2_opt_delta_patch_descriptor& descriptor,
+                          uint32_t window_size, std::vector<uint8_t>& headers);
+  // Whether the image matches the page digest chain. section_digest hashes
+  // the first page region with its descriptor and each data_digest hashes the
+  // next region with its descriptor.
+  bool PageDigestsMatch() const;
 
   int ReadImage(const void* xex_addr, size_t xex_length, const uint8_t* key);
   bool AllocImage(uint32_t size);
@@ -312,6 +338,8 @@ class XexModule : public xe::cpu::Module {
   uint32_t base_address_ = 0;
   uint32_t low_address_ = 0;
   uint32_t high_address_ = 0;
+  uint32_t function_entries_ = 0;
+  uint32_t function_entry_count_ = 0;
 
   XexFormat xex_format_ = kFormatUnknown;
   SecurityInfoContext security_info_ = {};

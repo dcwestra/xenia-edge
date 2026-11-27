@@ -59,21 +59,6 @@ XE_NTDLL_IMPORT(NtQueryEvent, cls_NtQueryEvent, NtQueryEventPointer);
 namespace xe {
 namespace threading {
 
-void EnableAffinityConfiguration() {
-  // chrispy: i don't think this is necessary,
-  // affinity always seems to be the system mask? research more
-  // also, maybe if ignore_thread_affinities is on we should use
-  // SetProcessAffinityUpdateMode to allow windows to dynamically update
-  // our process' affinity (by default windows cannot change the affinity itself
-  // at runtime, user code must do it)
-  HANDLE process_handle = GetCurrentProcess();
-  DWORD_PTR process_affinity_mask;
-  DWORD_PTR system_affinity_mask;
-  GetProcessAffinityMask(process_handle, &process_affinity_mask,
-                         &system_affinity_mask);
-  SetProcessAffinityMask(process_handle, system_affinity_mask);
-}
-
 uint32_t current_thread_system_id() {
   return static_cast<uint32_t>(GetCurrentThreadId());
 }
@@ -177,14 +162,6 @@ void PreciseSleep(std::chrono::nanoseconds duration) {
 
 void NanoSleepPrecise(int64_t ns) { NanoSleep(ns); }
 
-SleepResult AlertableSleep(std::chrono::microseconds duration) {
-  if (SleepEx(static_cast<DWORD>(duration.count() / 1000), true) ==
-      WAIT_IO_COMPLETION) {
-    return SleepResult::kAlerted;
-  }
-  return SleepResult::kSuccess;
-}
-
 TlsHandle AllocateTlsHandle() { return TlsAlloc(); }
 
 bool FreeTlsHandle(TlsHandle handle) { return TlsFree(handle) ? true : false; }
@@ -214,36 +191,23 @@ class Win32Handle : public T {
   HANDLE handle_ = nullptr;
 };
 
-WaitResult Wait(WaitHandle* wait_handle, bool is_alertable,
-                std::chrono::milliseconds timeout) {
+WaitResult Wait(WaitHandle* wait_handle, std::chrono::milliseconds timeout) {
   HANDLE handle = wait_handle->native_handle();
   DWORD result;
   DWORD timeout_dw = DWORD(timeout.count());
-  BOOL bAlertable = is_alertable ? true : false;
-  // todo: we might actually be able to use NtWaitForSingleObject even if its
-  // alertable, just need to study whether
-  // RtlDeactivateActivationContextUnsafeFast/RtlActivateActivationContext are
-  // actually needed for us
 #if XE_USE_NTDLL_FUNCTIONS == 1
-  if (bAlertable) {
-    result = WaitForSingleObjectEx(handle, timeout_dw, bAlertable);
-  } else {
-    LARGE_INTEGER timeout_big;
-    timeout_big.QuadPart = -10000LL * static_cast<int64_t>(timeout_dw);
-
-    result = NtWaitForSingleObjectPointer.invoke<NTSTATUS>(
-        handle, bAlertable, timeout_dw == INFINITE ? nullptr : &timeout_big);
-  }
+  LARGE_INTEGER timeout_big;
+  timeout_big.QuadPart = -10000LL * static_cast<int64_t>(timeout_dw);
+  result = NtWaitForSingleObjectPointer.invoke<NTSTATUS>(
+      handle, false, timeout_dw == INFINITE ? nullptr : &timeout_big);
 #else
-  result = WaitForSingleObjectEx(handle, timeout_dw, bAlertable);
+  result = WaitForSingleObject(handle, timeout_dw);
 #endif
   switch (result) {
     case WAIT_OBJECT_0:
       return WaitResult::kSuccess;
     case WAIT_ABANDONED:
       return WaitResult::kAbandoned;
-    case WAIT_IO_COMPLETION:
-      return WaitResult::kUserCallback;
     case WAIT_TIMEOUT:
       return WaitResult::kTimeout;
     default:
@@ -253,20 +217,17 @@ WaitResult Wait(WaitHandle* wait_handle, bool is_alertable,
 }
 
 WaitResult SignalAndWait(WaitHandle* wait_handle_to_signal,
-                         WaitHandle* wait_handle_to_wait_on, bool is_alertable,
+                         WaitHandle* wait_handle_to_wait_on,
                          std::chrono::milliseconds timeout) {
   HANDLE handle_to_signal = wait_handle_to_signal->native_handle();
   HANDLE handle_to_wait_on = wait_handle_to_wait_on->native_handle();
-  DWORD result =
-      SignalObjectAndWait(handle_to_signal, handle_to_wait_on,
-                          DWORD(timeout.count()), is_alertable ? true : false);
+  DWORD result = SignalObjectAndWait(handle_to_signal, handle_to_wait_on,
+                                     DWORD(timeout.count()), false);
   switch (result) {
     case WAIT_OBJECT_0:
       return WaitResult::kSuccess;
     case WAIT_ABANDONED:
       return WaitResult::kAbandoned;
-    case WAIT_IO_COMPLETION:
-      return WaitResult::kUserCallback;
     case WAIT_TIMEOUT:
       return WaitResult::kTimeout;
     default:
@@ -277,7 +238,7 @@ WaitResult SignalAndWait(WaitHandle* wait_handle_to_signal,
 
 std::pair<WaitResult, size_t> WaitMultiple(WaitHandle* wait_handles[],
                                            size_t wait_handle_count,
-                                           bool wait_all, bool is_alertable,
+                                           bool wait_all,
                                            std::chrono::milliseconds timeout) {
   xenia_assert(wait_handle_count <= 64);
   HANDLE handles[64];
@@ -285,9 +246,9 @@ std::pair<WaitResult, size_t> WaitMultiple(WaitHandle* wait_handles[],
   for (size_t i = 0; i < wait_handle_count; ++i) {
     handles[i] = wait_handles[i]->native_handle();
   }
-  DWORD result = WaitForMultipleObjectsEx(
-      static_cast<DWORD>(wait_handle_count), handles, wait_all ? true : false,
-      DWORD(timeout.count()), is_alertable ? true : false);
+  DWORD result =
+      WaitForMultipleObjects(static_cast<DWORD>(wait_handle_count), handles,
+                             wait_all ? true : false, DWORD(timeout.count()));
   if (result >= WAIT_OBJECT_0 && result < WAIT_OBJECT_0 + wait_handle_count) {
     return std::pair<WaitResult, size_t>(WaitResult::kSuccess,
                                          result - WAIT_OBJECT_0);
@@ -297,8 +258,6 @@ std::pair<WaitResult, size_t> WaitMultiple(WaitHandle* wait_handles[],
                                          result - WAIT_ABANDONED_0);
   }
   switch (result) {
-    case WAIT_IO_COMPLETION:
-      return std::pair<WaitResult, size_t>(WaitResult::kUserCallback, 0);
     case WAIT_TIMEOUT:
       return std::pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
     default:
@@ -542,68 +501,13 @@ class Win32Thread : public Win32Handle<Thread> {
     Thread::set_name(name);
   }
 
-  int32_t priority() override { return GetThreadPriority(handle_); }
   uint32_t system_id() const override { return GetThreadId(handle_); }
 
   void set_priority(int32_t new_priority) override {
     SetThreadPriority(handle_, new_priority);
   }
 
-  uint64_t affinity_mask() override {
-    uint64_t value = 0;
-    SetThreadAffinityMask(handle_, reinterpret_cast<DWORD_PTR>(&value));
-    return value;
-  }
-
-  void set_affinity_mask(uint64_t new_affinity_mask) override {
-    SetThreadAffinityMask(handle_, new_affinity_mask);
-  }
-
-  struct ApcData {
-    std::function<void()> callback;
-  };
-  static void NTAPI DispatchApc(ULONG_PTR parameter) {
-    auto apc_data = reinterpret_cast<ApcData*>(parameter);
-    apc_data->callback();
-    delete apc_data;
-  }
-
-  void QueueUserCallback(std::function<void()> callback) override {
-    auto apc_data = new ApcData({std::move(callback)});
-    QueueUserAPC(DispatchApc, handle_, reinterpret_cast<ULONG_PTR>(apc_data));
-  }
-
-  bool Resume(uint32_t* out_previous_suspend_count = nullptr) override {
-    if (out_previous_suspend_count) {
-      *out_previous_suspend_count = 0;
-    }
-    DWORD result = ResumeThread(handle_);
-    if (result == UINT_MAX) {
-      return false;
-    }
-    if (out_previous_suspend_count) {
-      *out_previous_suspend_count = result;
-    }
-    return true;
-  }
-
-  bool Suspend(uint32_t* out_previous_suspend_count = nullptr) override {
-    if (out_previous_suspend_count) {
-      *out_previous_suspend_count = 0;
-    }
-    DWORD result = SuspendThread(handle_);
-    if (result == UINT_MAX) {
-      return false;
-    }
-    if (out_previous_suspend_count) {
-      *out_previous_suspend_count = result;
-    }
-    return true;
-  }
-
-  void Terminate(int exit_code) override {
-    TerminateThread(handle_, exit_code);
-  }
+  void Resume() override { ResumeThread(handle_); }
 
  private:
   void AssertCallingThread() {

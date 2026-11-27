@@ -16,7 +16,9 @@
 #include "xenia/base/assert.h"
 #include "xenia/base/byte_order.h"
 #include "xenia/base/math.h"
+#include "xenia/cpu/cpu_flags.h"
 #include "xenia/cpu/hir/hir_builder.h"
+#include "xenia/cpu/ppc/ppc_estimates.h"
 namespace xe {
 namespace cpu {
 namespace hir {
@@ -230,13 +232,26 @@ void Value::Convert(TypeName target_type, RoundMode round_mode) {
           type = target_type;
           constant.f32 = (float)constant.f64;
           return;
+        // As fctiw and fctid: saturated, with a NaN giving the smallest value
         case INT32_TYPE:
           type = target_type;
-          constant.i32 = (int32_t)constant.f64;
+          if (std::isnan(constant.f64) || constant.f64 <= INT32_MIN) {
+            constant.i32 = INT32_MIN;
+          } else if (constant.f64 >= INT32_MAX) {
+            constant.i32 = INT32_MAX;
+          } else {
+            constant.i32 = (int32_t)constant.f64;
+          }
           return;
         case INT64_TYPE:
           type = target_type;
-          constant.i64 = (int64_t)constant.f64;
+          if (std::isnan(constant.f64) || constant.f64 <= -0x1p63) {
+            constant.i64 = INT64_MIN;
+          } else if (constant.f64 >= 0x1p63) {
+            constant.i64 = INT64_MAX;
+          } else {
+            constant.i64 = (int64_t)constant.f64;
+          }
           return;
         default:
           assert_unhandled_case(target_type);
@@ -625,11 +640,13 @@ void Value::Recip() {
       constant.f32 = 1.0f / constant.f32;
       break;
     case FLOAT64_TYPE:
-      constant.f64 = 1.0f / constant.f64;
+      // fres
+      constant.f64 = ppc::EstimateReciprocalSingle(constant.f64);
       break;
     case VEC128_TYPE:
+      // vrefp
       for (int i = 0; i < 4; i++) {
-        constant.v128.f32[i] = 1.0f / constant.v128.f32[i];
+        constant.v128.u32[i] = ppc::EstimateReciprocal(constant.v128.u32[i]);
       }
       break;
     default:
@@ -1796,6 +1813,97 @@ hir::Instr* Value::GetDefSkipAssigns() {
     return def->GetDestDefSkipAssigns();
   } else {
     return nullptr;
+  }
+}
+// Answers no once it has looked at budget values, which bounds the walk where
+// values are shared.
+static bool IsNeverWideNan(const Value* value, int& budget) {
+  if (value->type != FLOAT64_TYPE || --budget < 0) {
+    return false;
+  }
+  if (value->IsConstant()) {
+    const uint64_t bits = value->constant.u64;
+    return (bits & 0x7FFFFFFFFFFFFFFFull) <= 0x7FF0000000000000ull ||
+           !(bits & 0x1FFFFFFFull);
+  }
+  const Instr* def = const_cast<Value*>(value)->GetDefSkipAssigns();
+  if (!def) {
+    return false;
+  }
+  auto never = [&budget](const Value* operand) {
+    return IsNeverWideNan(operand, budget);
+  };
+  switch (def->GetOpcodeNum()) {
+    case OPCODE_UNPACK_SINGLE:
+      return true;
+    case OPCODE_CONVERT:
+      return def->src1.value->type != FLOAT64_TYPE;
+    case OPCODE_TO_SINGLE:
+      // Under --no_round_to_single the x64 TO_SINGLE is an identity.
+      return (!(def->flags & TO_SINGLE_KEEP_NAN) &&
+              !cvars::no_round_to_single) ||
+             never(def->src1.value);
+    case OPCODE_NEG:
+    case OPCODE_ABS:
+    case OPCODE_SQRT:
+    case OPCODE_RECIP:
+      return never(def->src1.value);
+    case OPCODE_ADD:
+    case OPCODE_SUB:
+    case OPCODE_MUL:
+    case OPCODE_DIV:
+      return never(def->src1.value) && never(def->src2.value);
+    case OPCODE_MUL_ADD:
+    case OPCODE_MUL_SUB:
+      return never(def->src1.value) && never(def->src2.value) &&
+             never(def->src3.value);
+    case OPCODE_SELECT:
+      return never(def->src2.value) && never(def->src3.value);
+    default:
+      return false;
+  }
+}
+bool Value::IsNeverWideNan() const {
+  int budget = 64;
+  return xe::cpu::hir::IsNeverWideNan(this, budget);
+}
+bool Value::IsInSingleRange(int depth) const {
+  if (type != FLOAT64_TYPE) {
+    return false;
+  }
+  if (IsConstant()) {
+    const uint64_t magnitude = constant.u64 & 0x7FFFFFFFFFFFFFFFull;
+    return !magnitude ||
+           (magnitude >= 0x36A0000000000000ull &&
+            magnitude < 0x47F0000000000000ull) ||
+           magnitude >= 0x7FF0000000000000ull;
+  }
+  if (flags & VALUE_IN_SINGLE_RANGE) {
+    return true;
+  }
+  const Instr* def_instr = const_cast<Value*>(this)->GetDefSkipAssigns();
+  if (!def_instr || depth <= 0) {
+    return false;
+  }
+  auto in_range = [depth](const Value* value) {
+    return value && value->IsInSingleRange(depth - 1);
+  };
+  switch (def_instr->GetOpcodeNum()) {
+    case OPCODE_TO_SINGLE:
+      // Under --no_round_to_single the x64 TO_SINGLE is an identity.
+      return !cvars::no_round_to_single;
+    case OPCODE_UNPACK_SINGLE:
+      return true;
+    case OPCODE_CONVERT:
+      return def_instr->src1.value &&
+             def_instr->src1.value->type == FLOAT32_TYPE;
+    case OPCODE_SELECT:
+      return in_range(def_instr->src2.value) && in_range(def_instr->src3.value);
+    case OPCODE_NEG:
+    case OPCODE_ABS:
+      return in_range(def_instr->src1.value);
+    default:
+      return false;
   }
 }
 hir::Instr* Value::GetDefTunnelMovs(unsigned int* tunnel_flags) {

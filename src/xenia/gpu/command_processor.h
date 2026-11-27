@@ -39,9 +39,6 @@ DECLARE_bool(log_draws);
 #include "xenia/ui/presenter.h"
 
 namespace xe {
-
-class ByteStream;
-
 namespace gpu {
 
 enum class GPUSetting {
@@ -158,6 +155,8 @@ class CommandProcessor {
   // Safe from any thread, even while the context is being torn down.
   std::string GetTitleStateSuffix() const;
 
+  // Runs fn on the worker thread, right away if already on it with nothing
+  // queued. Callable from any thread.
   void CallInThread(std::function<void()> fn);
 
   // Dumps the EDRAM contents to a raw file.
@@ -176,7 +175,8 @@ class CommandProcessor {
 
   // Get cached ZPD mode (avoids string parsing every frame).
   ZPDMode GetZPDMode() const { return cached_zpd_mode_; }
-  // Set ZPD mode (updates both cvar and cached value).
+  // Set ZPD mode (updates both cvar and cached value). Callable from any
+  // thread, the query state switches over on the command processor thread.
   void SetZPDMode(ZPDMode mode);
 
   // "Desired" is for the external thread managing the post-processing effect.
@@ -259,13 +259,6 @@ class CommandProcessor {
   void LogRegisterSets(uint32_t base_register_index, const uint32_t* values,
                        uint32_t n_values);
 
-  bool is_paused() const { return paused_; }
-  void Pause();
-  void Resume();
-
-  bool Save(ByteStream* stream);
-  bool Restore(ByteStream* stream);
-
  protected:
   struct IndexBufferInfo {
     xenos::IndexFormat format = xenos::IndexFormat::kInt16;
@@ -313,6 +306,8 @@ class CommandProcessor {
   };
 
   void WorkerThreadMain();
+  bool HasPendingFunctions() const;
+  void RunPendingFunctions();
   virtual bool SetupContext() = 0;
   virtual void ShutdownContext() = 0;
   // Built once the context is set up, and kept until it shuts down.
@@ -491,6 +486,10 @@ class CommandProcessor {
     uint64_t speculative_corrections = 0;
     // Reports force-retired on the backstop deadline with segments unresolved.
     uint64_t retires_abandoned = 0;
+    // Strict GPU waits that the guest wrote new commands during, and their
+    // total time.
+    uint64_t strict_waits_delaying = 0;
+    uint64_t strict_waits_delaying_us = 0;
     uint64_t last_log_frame = 0;
 
     void Reset(uint64_t current_frame) {
@@ -802,11 +801,9 @@ class CommandProcessor {
   // Pushed from any thread (UI, title launch), drained by the worker, so every
   // access goes through pending_fns_mutex_. pending_fns_queued_ mirrors
   // !empty() for the worker's lock-free idle spin.
-  std::mutex pending_fns_mutex_;
+  mutable std::mutex pending_fns_mutex_;
   std::queue<std::function<void()>> pending_fns_;
   std::atomic<bool> pending_fns_queued_{false};
-  // Runs queued calls in order on the worker. A call may queue another.
-  void RunPendingFns();
 
   // MicroEngine binary from PM4_ME_INIT
   std::vector<uint32_t> me_bin_;
@@ -833,15 +830,14 @@ class CommandProcessor {
   // 0 if unknown (loaded immediately, embedded in the command buffer).
   uint32_t active_vertex_shader_ucode_address_ = 0;
 
-  bool paused_ = false;
-
   // By default (such as for tools), post-processing is disabled.
   // "Desired" is for the external thread managing the post-processing effect.
   SwapPostEffect swap_post_effect_desired_ = SwapPostEffect::kNone;
   SwapPostEffect swap_post_effect_actual_ = SwapPostEffect::kNone;
 
-  // Cached ZPD occlusion query mode (defaults to fake)
-  ZPDMode cached_zpd_mode_ = ZPDMode::kFake;
+  // Cached ZPD occlusion query mode (defaults to fake). Set from the UI
+  // thread, zpd_mode_ follows it on the command processor thread.
+  std::atomic<ZPDMode> cached_zpd_mode_{ZPDMode::kFake};
 
   // For host frame rate limiting at IssueSwap
   uint64_t last_swap_time_ = 0;

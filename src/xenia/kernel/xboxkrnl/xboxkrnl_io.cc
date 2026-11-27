@@ -109,12 +109,15 @@ static bool CompletesAsync(XFile* file, uint32_t length, uint64_t byte_offset,
 }
 
 // Runs |transfer|, which returns a status and fills in the bytes moved, then
-// reports the completion. A request that pends runs on an I/O worker.
+// reports the completion. A request that pends runs on an I/O worker once host
+// uptime reaches |deadline_ms|, see XFile::PostIo. Neither |transfer| nor the
+// completion retains the file, as the file's own queue holds them.
 static X_STATUS SubmitRequest(const object_ref<XFile>& file,
                               const object_ref<XEvent>& ev,
                               uint32_t apc_routine, uint32_t apc_context,
                               X_IO_STATUS_BLOCK* status_block,
                               uint32_t status_block_address, bool pends,
+                              uint64_t deadline_ms,
                               std::function<X_STATUS(uint32_t*)> transfer) {
   auto thread = retain_object(XThread::GetCurrentThread());
   // Cleared at issue, so a wait cannot return on an earlier completion.
@@ -122,9 +125,10 @@ static X_STATUS SubmitRequest(const object_ref<XFile>& file,
     ev->Reset();
   }
   file->ResetWaitState();
-  auto complete = [file, ev, thread, apc_routine, apc_context, status_block,
-                   status_block_address, transfer = std::move(transfer)](
-                      bool posted, bool cancelled) {
+  auto complete = [file = file.get(), ev, thread, apc_routine, apc_context,
+                   status_block, status_block_address,
+                   transfer = std::move(transfer)](bool posted,
+                                                   bool cancelled) {
     uint32_t bytes = 0;
     X_STATUS status = cancelled ? X_STATUS_CANCELLED : transfer(&bytes);
     // A failure the caller was not told PENDING for completes nothing.
@@ -145,7 +149,7 @@ static X_STATUS SubmitRequest(const object_ref<XFile>& file,
   };
   if (pends) {
     // The status block is left alone until the request completes.
-    file->PostIo(thread.get(),
+    file->PostIo(thread.get(), deadline_ms,
                  [complete = std::move(complete)](bool cancelled) {
                    complete(true, cancelled);
                  });
@@ -475,11 +479,13 @@ dword_result_t NtReadFile_entry(dword_t file_handle, dword_t event_handle,
     uint32_t buffer_address = buffer.guest_address();
     uint32_t length = buffer_length;
     uint32_t apc_context_address = apc_context.guest_address();
+    // A read that pends is booked on the medium as it is issued.
+    const bool pends = CompletesAsync(file.get(), length, byte_offset, false);
     result = SubmitRequest(
         file, ev, static_cast<uint32_t>(apc_routine_ptr), apc_context_address,
-        io_status_block, io_status_block.guest_address(),
-        CompletesAsync(file.get(), length, byte_offset, false),
-        [file, buffer_address, length, byte_offset,
+        io_status_block, io_status_block.guest_address(), pends,
+        pends ? file->ReserveDriveTime(byte_offset, length) : 0,
+        [file = file.get(), buffer_address, length, byte_offset,
          apc_context_address](uint32_t* bytes_read) {
           return file->Read(buffer_address, length, byte_offset, bytes_read,
                             apc_context_address, false);
@@ -518,11 +524,13 @@ dword_result_t NtReadFileScatter_entry(
     uint32_t segments_address = segment_array.guest_address();
     uint32_t read_length = length;
     uint32_t apc_context_address = apc_context.guest_address();
+    const bool pends =
+        CompletesAsync(file.get(), read_length, byte_offset, false);
     result = SubmitRequest(
         file, ev, static_cast<uint32_t>(apc_routine_ptr), apc_context_address,
-        io_status_block, io_status_block.guest_address(),
-        CompletesAsync(file.get(), read_length, byte_offset, false),
-        [file, segments_address, read_length, byte_offset,
+        io_status_block, io_status_block.guest_address(), pends,
+        pends ? file->ReserveDriveTime(byte_offset, read_length) : 0,
+        [file = file.get(), segments_address, read_length, byte_offset,
          apc_context_address](uint32_t* bytes_read) {
           return file->ReadScatter(segments_address, read_length, byte_offset,
                                    bytes_read, apc_context_address, false);
@@ -561,8 +569,8 @@ dword_result_t NtWriteFile_entry(dword_t file_handle, dword_t event_handle,
     result = SubmitRequest(
         file, ev, apc_routine, apc_context_address, io_status_block,
         io_status_block.guest_address(),
-        CompletesAsync(file.get(), length, byte_offset, true),
-        [file, buffer_address, length, byte_offset,
+        CompletesAsync(file.get(), length, byte_offset, true), 0,
+        [file = file.get(), buffer_address, length, byte_offset,
          apc_context_address](uint32_t* bytes_written) {
           return file->Write(buffer_address, length, byte_offset, bytes_written,
                              apc_context_address, false);
@@ -622,11 +630,11 @@ dword_result_t NtRemoveIoCompletion_entry(
     return X_STATUS_INVALID_HANDLE;
   }
 
-  uint64_t timeout_ticks =
-      timeout ? static_cast<uint64_t>(*timeout)
-              : static_cast<uint64_t>(std::numeric_limits<int64_t>::min());
+  // Without a timeout the wait is for as long as it takes.
+  uint64_t timeout_ticks = timeout ? static_cast<uint64_t>(*timeout) : 0;
   XIOCompletion::IONotification notification;
-  if (port->WaitForNotification(timeout_ticks, &notification)) {
+  if (port->WaitForNotification(timeout ? &timeout_ticks : nullptr,
+                                &notification)) {
     if (key_context) {
       *key_context = notification.key_context;
     }
@@ -707,12 +715,7 @@ dword_result_t NtQueryFullAttributesFile_entry(
           entry->update();
           return;
         }
-        // A missing directory or link before the last component is a missing
-        // path.
-        auto base_path = xe::utf8::find_base_guest_path(target_path);
-        if (!base_path.empty() && !file_system->ResolvePath(base_path)) {
-          missing_status = X_STATUS_OBJECT_PATH_NOT_FOUND;
-        }
+        missing_status = file_system->MissingPathStatus(target_path);
       },
       GuestScheduler::BlockingCallClass::kConcurrent);
   if (entry) {
@@ -786,7 +789,7 @@ dword_result_t NtFlushBuffersFile_entry(
   // behind the handle's pending requests, so it completes after them.
   return SubmitRequest(file, nullptr, 0, 0, io_status_block_ptr,
                        io_status_block_ptr.guest_address(),
-                       !file->is_synchronous(),
+                       !file->is_synchronous(), 0,
                        [](uint32_t*) { return X_STATUS_SUCCESS; });
 }
 DECLARE_XBOXKRNL_EXPORT1(NtFlushBuffersFile, kFileSystem, kImplemented);
@@ -819,7 +822,7 @@ dword_result_t NtOpenSymbolicLinkObject_entry(
   std::string link_path;
   if (!kernel_state()->file_system()->FindSymbolicLink(target_path,
                                                        link_path)) {
-    return X_STATUS_NO_SUCH_FILE;
+    return X_STATUS_OBJECT_NAME_NOT_FOUND;
   }
 
   object_ref<XSymbolicLink> symlink(new XSymbolicLink(kernel_state()));
@@ -832,21 +835,29 @@ dword_result_t NtOpenSymbolicLinkObject_entry(
 DECLARE_XBOXKRNL_EXPORT1(NtOpenSymbolicLinkObject, kFileSystem, kImplemented);
 
 // https://docs.microsoft.com/en-us/windows/win32/devnotes/ntquerysymboliclinkobject
-dword_result_t NtQuerySymbolicLinkObject_entry(
-    dword_t handle, pointer_t<X_ANSI_STRING> target) {
+dword_result_t NtQuerySymbolicLinkObject_entry(dword_t handle,
+                                               pointer_t<X_ANSI_STRING> target,
+                                               lpdword_t returned_length_ptr) {
   auto symlink =
       kernel_state()->object_table()->LookupObject<XSymbolicLink>(handle);
   if (!symlink) {
     return X_STATUS_NO_SUCH_FILE;
   }
-  auto length = std::min(static_cast<size_t>(target->maximum_length),
-                         symlink->target().size());
+  // What fits is copied even when the target is longer than the buffer, and
+  // the returned length is the whole target's.
+  const auto target_length = static_cast<uint32_t>(symlink->target().size());
+  const uint32_t length =
+      std::min<uint32_t>(target_length, target->maximum_length);
   if (length > 0) {
     auto target_buf = kernel_memory()->TranslateVirtual(target->pointer);
     std::memcpy(target_buf, symlink->target().c_str(), length);
   }
   target->length = static_cast<uint16_t>(length);
-  return X_STATUS_SUCCESS;
+  if (returned_length_ptr) {
+    *returned_length_ptr = target_length;
+  }
+  return target_length > target->maximum_length ? X_STATUS_BUFFER_TOO_SMALL
+                                                : X_STATUS_SUCCESS;
 }
 DECLARE_XBOXKRNL_EXPORT1(NtQuerySymbolicLinkObject, kFileSystem, kImplemented);
 

@@ -10,6 +10,7 @@
 #ifndef XENIA_CPU_BACKEND_A64_A64_EMITTER_H_
 #define XENIA_CPU_BACKEND_A64_A64_EMITTER_H_
 
+#include <deque>
 #include <functional>
 #include <unordered_map>
 #include <unordered_set>
@@ -136,6 +137,11 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   // calling it. Returns false when the callee is not a GPR saverest helper.
   bool TryInlinePPCGprLrSaveRestore(const hir::Instr* instr,
                                     const GuestFunction* function);
+  bool InlinesPPCGprLrSaveRestore(const hir::Instr* instr,
+                                  const GuestFunction* function) const;
+  // Whether |instr| calls or branches to guest code, a saverest helper inlined
+  // in place aside, or calls host code, traps included.
+  bool MakesCall(const hir::Instr* instr) const;
   void CallNative(void* fn);
   void CallNativeSafe(void* fn);
   // Loads the host address for the guest address in w16 into x9. A direct bl,
@@ -206,6 +212,8 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
     return (feature_flags_ & feature_flag) == feature_flag;
   }
 
+  // The label stays valid for the whole function, even as more tails are
+  // added, and a tail's callback may add tails of its own.
   Xbyak_aarch64::Label& AddToTail(TailEmitCallback callback,
                                   uint32_t alignment = 0);
   Xbyak_aarch64::Label& NewCachedLabel();
@@ -350,6 +358,28 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
     return true;
   }
 
+  // A TO_SINGLE_KEEP_NAN reading the result of the F64 operation right before
+  // it leaves the NaN to that operation, when it tests its result anyway: the
+  // operation's NaN exits hand the NaN to the TO_SINGLE's dest and jump to
+  // exit, past the conversion, where the TO_SINGLE binds it. Keyed on the
+  // TO_SINGLE; cleared on read. It must take it, or Emit fails the function.
+  void MarkFusedToSingle(const hir::Instr* to_single,
+                         Xbyak_aarch64::Label* exit) {
+    fused_to_single_ = to_single;
+    fused_to_single_exit_ = exit;
+  }
+  const hir::Instr* fused_to_single() const { return fused_to_single_; }
+  Xbyak_aarch64::Label* fused_to_single_exit() const {
+    return fused_to_single_exit_;
+  }
+  Xbyak_aarch64::Label* ConsumeFusedToSingle(const hir::Instr* to_single) {
+    if (!fused_to_single_ || fused_to_single_ != to_single) {
+      return nullptr;
+    }
+    fused_to_single_ = nullptr;
+    return fused_to_single_exit_;
+  }
+
   // SOURCE_OFFSET, CONTEXT_BARRIER and NOP emit no code that touches NZCV
   // or a register a required handoff names (SOURCE_OFFSET's coverage
   // counter uses add, not adds, and only x0/x1). COMMENT does not pass: it
@@ -441,11 +471,19 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   // tbz/tbnz reach (+/-32 KiB).
   bool near_tail_branches_safe_ = false;
   bool near_tbz_branches_safe_ = false;
+  // Whether the near-branch flags come from a typical code size rather than
+  // the largest one, so a branch out of range calls for another try.
+  bool estimate_typical_code_size_ = false;
+  bool IsRetryableBranchRangeError(const Xbyak_aarch64::Error& e) const {
+    return estimate_typical_code_size_ &&
+           static_cast<int>(e) == Xbyak_aarch64::ERR_LABEL_IS_TOO_FAR;
+  }
 
   static const uint32_t gpr_reg_map_[GPR_COUNT];
   static const uint32_t vec_reg_map_[VEC_COUNT];
 
-  std::vector<TailEmitter> tail_code_;
+  // A deque, so adding a tail doesn't move the labels already handed out
+  std::deque<TailEmitter> tail_code_;
   std::vector<Xbyak_aarch64::Label*> label_cache_;
 
   // v128 constants needing a literal, with labels owned by label_cache_.
@@ -492,6 +530,12 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
 
   FPCRMode fpcr_mode_ = FPCRMode::Unknown;
   bool function_has_vmx_ = false;
+  // Whether this function records a stackpoint. One that makes no call has no
+  // return sites, so no unwind ever restores its frame, and it is never below
+  // another frame, so a pseudo stack trace, taken from the frames that called
+  // out, has nothing to show for it either. Every tail branch, and so every
+  // dynamic one, leaves from a frame that has its record.
+  bool function_has_stackpoint_ = true;
   // FPCR tracking across blocks: lattice {Unknown, Fpu, Vmx, VmxDaz}, where
   // meet(a, b) = a if a == b else Unknown. A block starts in the meet of its
   // incoming edges once all of them have been emitted, else Unknown. The
@@ -523,21 +567,25 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
     RecordIncomingState(target, fpcr_mode_, physical_remap_bound_valid_);
   }
   bool physical_remap_bound_valid_ = false;
-  // Handoffs between adjacent sequences; see MarkFusedAddressMask and
-  // MarkFusedCompareBranch.
+  // Handoffs between adjacent sequences; see MarkFusedAddressMask,
+  // MarkFusedCompareBranch and MarkFusedToSingle.
   void ResetSequenceHandoffs() {
     fused_addr_mask_dest_reg_ = -1;
     fused_cmp_branch_reg_ = -1;
+    fused_to_single_ = nullptr;
     x0_constant_reader_ = nullptr;
   }
   bool sequence_handoff_pending() const {
-    return fused_addr_mask_dest_reg_ >= 0 || fused_cmp_branch_reg_ >= 0;
+    return fused_addr_mask_dest_reg_ >= 0 || fused_cmp_branch_reg_ >= 0 ||
+           fused_to_single_;
   }
   int fused_addr_mask_dest_reg_ = -1;
   int fused_addr_mask_src_reg_ = -1;
   uint32_t fused_addr_mask_imm_ = 0;
   int fused_cmp_branch_reg_ = -1;
   Xbyak_aarch64::Cond fused_cmp_branch_cond_ = Xbyak_aarch64::EQ;
+  const hir::Instr* fused_to_single_ = nullptr;
+  Xbyak_aarch64::Label* fused_to_single_exit_ = nullptr;
   const hir::Instr* x0_constant_reader_ = nullptr;
   uint64_t x0_constant_ = 0;
   bool synchronize_stack_on_next_instruction_ = false;

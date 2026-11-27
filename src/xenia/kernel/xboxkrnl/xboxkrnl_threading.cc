@@ -10,6 +10,7 @@
 #include "xenia/kernel/xboxkrnl/xboxkrnl_threading.h"
 
 #include <algorithm>
+#include <atomic>
 #include <utility>
 #include <vector>
 
@@ -261,17 +262,16 @@ dword_result_t NtResumeThread_entry(dword_t handle,
 }
 DECLARE_XBOXKRNL_EXPORT1(NtResumeThread, kThreading, kImplemented);
 
+// Returns the suspend count from before the resume.
 dword_result_t KeResumeThread_entry(pointer_t<X_KTHREAD> thread_ptr) {
-  X_STATUS result = X_STATUS_SUCCESS;
+  uint32_t previous_suspend_count = 0;
   auto thread = XObject::GetNativeObject<XThread>(kernel_state(), thread_ptr,
                                                   ThreadObject);
   if (thread) {
-    result = thread->Resume();
-  } else {
-    result = X_STATUS_INVALID_HANDLE;
+    thread->Resume(&previous_suspend_count);
   }
 
-  return result;
+  return previous_suspend_count;
 }
 DECLARE_XBOXKRNL_EXPORT1(KeResumeThread, kThreading, kImplemented);
 
@@ -287,31 +287,12 @@ dword_result_t NtSuspendThread_entry(dword_t handle,
     if (thread->type() == XObject::Type::Thread) {
       auto current_pcr = context->TranslateVirtualGPR<X_KPCR*>(context->r[13]);
 
-#if XE_PLATFORM_WIN32
       if (current_pcr->prcb_data.current_thread == thread->guest_object() ||
           !thread->guest_object<X_KTHREAD>()->terminated) {
         result = thread->Suspend(&suspend_count);
       } else {
         return X_STATUS_THREAD_IS_TERMINATING;
       }
-#else
-      // Handle self-suspension specially to avoid deadlock.
-      if (!thread->guest_object<X_KTHREAD>()->terminated) {
-        bool is_self_suspend =
-            (current_pcr->prcb_data.current_thread == thread->guest_object());
-
-        if (is_self_suspend) {
-          XELOGD("Thread {:X} self-suspending", thread->handle());
-          suspend_count = thread->SelfSuspend();
-          result = X_STATUS_SUCCESS;
-          XELOGD("Thread {:X} resumed", thread->handle());
-        } else {
-          result = thread->Suspend(&suspend_count);
-        }
-      } else {
-        return X_STATUS_THREAD_IS_TERMINATING;
-      }
-#endif
     } else {
       return X_STATUS_OBJECT_TYPE_MISMATCH;
     }
@@ -319,7 +300,8 @@ dword_result_t NtSuspendThread_entry(dword_t handle,
     return X_STATUS_INVALID_HANDLE;
   }
 
-  if (suspend_count_ptr) {
+  // A failed suspend leaves the count unwritten.
+  if (suspend_count_ptr && XSUCCEEDED(result)) {
     *suspend_count_ptr = suspend_count;
   }
 
@@ -522,7 +504,7 @@ DECLARE_XBOXKRNL_EXPORT3(KeDelayExecutionThread, kThreading, kImplemented,
 dword_result_t NtYieldExecution_entry() {
   SCOPE_profile_cpu_i("guestsync", "NtYieldExecution");
   xeProcessKernelApcs(nullptr);
-  if (GuestScheduler::enabled() && XThread::GetCurrentFiberThread()) {
+  if (XThread::GetCurrentFiberThread()) {
     // NT reports whether anything else ran. Guests fall back to an alertable
     // sleep on no-yield, which is where their pending APCs get pumped.
     if (!kernel_state()->guest_scheduler()->YieldExecution(true)) {
@@ -771,6 +753,7 @@ DECLARE_XBOXKRNL_EXPORT2(NtClearEvent, kThreading, kImplemented,
 // https://msdn.microsoft.com/en-us/library/windows/hardware/ff552150(v=vs.85).aspx
 void KeInitializeSemaphore_entry(pointer_t<X_KSEMAPHORE> semaphore_ptr,
                                  dword_t count, dword_t limit) {
+  semaphore_ptr.Zero();
   semaphore_ptr->header.type = SemaphoreObject;
   semaphore_ptr->header.signal_state = (uint32_t)count;
   semaphore_ptr->limit = (uint32_t)limit;
@@ -862,7 +845,7 @@ dword_result_t NtReleaseSemaphore_entry(dword_t sem_handle,
   } else {
     result = X_STATUS_INVALID_HANDLE;
   }
-  if (previous_count_ptr) {
+  if (previous_count_ptr && XSUCCEEDED(result)) {
     *previous_count_ptr = (uint32_t)previous_count;
   }
 
@@ -927,6 +910,9 @@ dword_result_t NtCreateTimer_entry(
     lpdword_t handle_ptr, pointer_t<X_OBJECT_ATTRIBUTES> obj_attributes_ptr,
     dword_t timer_type) {
   // timer_type = NotificationTimer (0) or SynchronizationTimer (1)
+  if (timer_type > 1) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
 
   // Check for an existing timer with the same name.
   if (X_STATUS result = OpenNamedObject<XTimer>(kernel_state(),
@@ -1142,6 +1128,17 @@ uint32_t xeNtWaitForMultipleObjectsEx(uint32_t count, xe::be<uint32_t>* handles,
     }
   }
 
+  // A wait for all can't name an object twice, by any handle.
+  if (wait_type == X_KWAIT_REASON::WaitAll) {
+    for (uint32_t i = 0; i < count; i++) {
+      for (uint32_t j = i + 1; j < count; j++) {
+        if (objects[i].get() == objects[j].get()) {
+          return X_STATUS_INVALID_PARAMETER_MIX;
+        }
+      }
+    }
+  }
+
   auto result =
       XObject::WaitMultiple(count, reinterpret_cast<XObject**>(&objects[0]),
                             wait_type, 6, wait_mode, alertable, timeout_ptr);
@@ -1224,11 +1221,10 @@ uint32_t xeKeKfAcquireSpinLock(PPCContext* ctx, X_KSPINLOCK* lock,
   // Lock.
   while (
       !xe::atomic_cas(0, xe::byte_swap(our_pcr), &lock->prcb_of_owner.value)) {
-    // Under the cooperative scheduler the holder may be a fiber queued behind
-    // us on this dispatch thread, so it can only run if we yield the fiber. A
-    // holder on another dispatch thread runs there. Like the console at
-    // DISPATCH_LEVEL, this spins until it releases and yields only the host
-    // thread.
+    // The holder may be a fiber queued behind us on this dispatch thread, so
+    // it can only run if we yield the fiber. A holder on another dispatch
+    // thread runs there. Like the console at DISPATCH_LEVEL, this spins until
+    // it releases and yields only the host thread.
     if (XThread::GetCurrentFiberThread()) {
       uint32_t owner_pcr_be = lock->prcb_of_owner.value;
       if (!owner_pcr_be) {
@@ -1254,26 +1250,7 @@ uint32_t xeKeKfAcquireSpinLock(PPCContext* ctx, X_KSPINLOCK* lock,
       GuestScheduler::SpinYield();
       continue;
     }
-    // On real hardware, threads sharing a Xenon HW thread are serialized by
-    // the kernel scheduler — the spinner would be preempted within one
-    // timeslice (~1ms) so the holder can make progress.  In the naive
-    // host-thread model both threads run truly in parallel, so the spinner
-    // can burn its entire host quantum without giving the holder a chance.
-    //
-    // Check whether the lock holder is assigned to the same guest CPU as us.
-    // If so, yield the host thread aggressively (Sleep(0)) to force a host
-    // context switch and give the holder a chance to run and release.
-    // The relationship is stable — affinity doesn't change while a thread
-    // holds a spinlock — so one check per contention episode is sufficient.
-    uint32_t owner_pcr_be = lock->prcb_of_owner.value;
-    if (owner_pcr_be) {
-      uint32_t owner_pcr = xe::byte_swap(owner_pcr_be);
-      auto* owner_kpcr = ctx->TranslateVirtual<X_KPCR*>(owner_pcr);
-      if (owner_kpcr->prcb_data.current_cpu == our_cpu) {
-        xe::threading::Sleep(std::chrono::milliseconds(0));
-        continue;
-      }
-    }
+    // A host-routine thread never shares its host thread with the holder.
     xe::threading::MaybeYield();
   }
 
@@ -1304,9 +1281,19 @@ void xeKeKfReleaseSpinLock(PPCContext* ctx, X_KSPINLOCK* lock,
   }
 }
 
+// Lowering IRQL below APC_LEVEL delivers a suspend the raise held off.
+static void DeliverSuspendOnLowerIrql(uint32_t new_irql) {
+  if (new_irql < 1) {
+    if (XThread* self = XThread::GetCurrentFiberThread()) {
+      self->DeliverPendingSuspend();
+    }
+  }
+}
+
 void KfReleaseSpinLock_entry(pointer_t<X_KSPINLOCK> lock_ptr, dword_t old_irql,
                              const ppc_context_t& ppc_ctx) {
   xeKeKfReleaseSpinLock(ppc_ctx, lock_ptr, old_irql, true);
+  DeliverSuspendOnLowerIrql(old_irql);
 }
 
 DECLARE_XBOXKRNL_EXPORT2(KfReleaseSpinLock, kThreading, kImplemented,
@@ -1321,9 +1308,8 @@ DECLARE_XBOXKRNL_EXPORT3(KeAcquireSpinLockAtRaisedIrql, kThreading,
 
 dword_result_t KeTryToAcquireSpinLockAtRaisedIrql_entry(
     pointer_t<X_KSPINLOCK> lock_ptr, const ppc_context_t& ppc_ctx) {
-  // Lock.
+  // A lock that's held, even by this processor, is refused with 0.
   auto lock = reinterpret_cast<uint32_t*>(lock_ptr.host_address());
-  assert_true(lock_ptr->prcb_of_owner != static_cast<uint32_t>(ppc_ctx->r[13]));
   PrefetchForCAS(lock);
   if (!ppc_ctx->processor->GuestAtomicCAS32(
           ppc_ctx, 0, static_cast<uint32_t>(ppc_ctx->r[13]),
@@ -1379,13 +1365,13 @@ void xeKfLowerIrql(PPCContext* ctx, unsigned char new_irql) {
   }
   kpcr->current_irql = new_irql;
   if (new_irql < 2) {
-    // the called function does a ton of other stuff including changing the
-    // irql and interrupt_related
+    xeRunPendingDpcs(ctx);
   }
 }
 // irql is supposed to be per thread afaik...
 void KfLowerIrql_entry(dword_t new_irql, const ppc_context_t& ctx) {
   xeKfLowerIrql(ctx, static_cast<unsigned char>(new_irql));
+  DeliverSuspendOnLowerIrql(new_irql);
 }
 DECLARE_XBOXKRNL_EXPORT2(KfLowerIrql, kThreading, kImplemented, kHighFrequency);
 
@@ -1444,14 +1430,9 @@ uint32_t xeInsertQueueApcAndWake(XThread* thread, XAPC* apc, uint32_t arg1,
   if (!xeKeInsertQueueApc(apc, arg1, arg2, 0, context)) {
     return 0;
   }
-  // Awaken a sleeping alertable thread to process real apcs. A host thread gets
-  // a no-op user callback to break its wait, a fiber gets a scheduler poke so
-  // its alertable poll re-runs.
-  if (thread->thread()) {
-    thread->thread()->QueueUserCallback([]() {});
-  } else {
-    context->kernel_state->guest_scheduler()->WakeAll();
-  }
+  // Pokes the scheduler so an alertable fiber's poll re-runs. A host-routine
+  // thread takes the APC at its next wait.
+  context->kernel_state->guest_scheduler()->WakeAll();
   return 1;
 }
 dword_result_t NtQueueApcThread_entry(dword_t thread_handle,
@@ -1552,20 +1533,22 @@ bool xeProcessKernelApcs(PPCContext* ctx) {
   }
   auto kpcr = ctx->TranslateVirtualGPR<X_KPCR*>(ctx->r[13]);
   auto current_thread = ctx->TranslateVirtual(kpcr->prcb_data.current_thread);
+  bool delivered = false;
   // Masked at APC_LEVEL and above or in a critical region, and never nested.
-  if (kpcr->current_irql >= 1 || current_thread->apc_disable_count ||
-      current_thread->executing_kernel_apc) {
-    return false;
+  if (kpcr->current_irql < 1 && !current_thread->apc_disable_count &&
+      !current_thread->executing_kernel_apc &&
+      !current_thread->apc_lists[0].empty(ctx)) {
+    current_thread->executing_kernel_apc = 1;
+    delivered = ProcessApcList(ctx, current_thread, 0);
+    if (delivered) {
+      XELOGD("xeProcessKernelApcs: delivered");
+    }
+    current_thread->executing_kernel_apc = 0;
   }
-  if (current_thread->apc_lists[0].empty(ctx)) {
-    return false;
+  // A suspend is a kernel APC under the same mask.
+  if (XThread* self = XThread::GetCurrentFiberThread()) {
+    delivered |= self->DeliverPendingSuspend();
   }
-  current_thread->executing_kernel_apc = 1;
-  bool delivered = ProcessApcList(ctx, current_thread, 0);
-  if (delivered) {
-    XELOGD("xeProcessKernelApcs: delivered");
-  }
-  current_thread->executing_kernel_apc = 0;
   return delivered;
 }
 
@@ -1768,10 +1751,14 @@ void KeInitializeDpc_entry(pointer_t<XDPC> dpc, lpvoid_t routine,
 }
 DECLARE_XBOXKRNL_EXPORT2(KeInitializeDpc, kThreading, kImplemented, kSketchy);
 
-// DPCs queued while a DPC routine runs, with the guest thread running it, as
-// {thread id, DPC}. They run after it returns, as the console drains its DPC
-// queue, instead of nesting. Guarded with the global lock.
+// DPCs queued while a DPC routine runs or at DISPATCH_LEVEL and above, with
+// the guest thread that queued them, as {thread id, DPC}. They run once the
+// routine returns or the thread's IRQL drops below DISPATCH_LEVEL, as the
+// console drains its DPC queue, instead of nesting. Guarded with the global
+// lock.
 static std::vector<std::pair<uint32_t, uint32_t>> deferred_dpcs;
+// Lets an IRQL drop skip the lock when nothing waits.
+static std::atomic<uint32_t> deferred_dpc_count{0};
 
 static bool IsDeferredDpc(uint32_t dpc_ptr) {
   return std::find_if(deferred_dpcs.begin(), deferred_dpcs.end(),
@@ -1812,19 +1799,40 @@ void xeRunDeferredDpcs(PPCContext* ctx) {
       }
       dpc_ptr = it->second;
       deferred_dpcs.erase(it);
+      --deferred_dpc_count;
     }
     auto dpc = kernel_memory()->TranslateVirtual<XDPC*>(dpc_ptr);
     xeRunDpc(ctx, dpc_ptr, dpc->arg1, dpc->arg2);
   }
 }
 
+void xeRunPendingDpcs(PPCContext* ctx) {
+  if (!deferred_dpc_count.load(std::memory_order_relaxed)) {
+    return;
+  }
+  auto kpcr = ctx->TranslateVirtualGPR<X_KPCR*>(ctx->r[13]);
+  if (kpcr->prcb_data.dpc_active || kpcr->current_irql >= 2) {
+    return;
+  }
+  {
+    auto global_lock = xe::global_critical_region::AcquireDirect();
+    if (std::none_of(deferred_dpcs.begin(), deferred_dpcs.end(),
+                     [ctx](const auto& deferred) {
+                       return deferred.first == ctx->thread_id;
+                     })) {
+      return;
+    }
+  }
+  DPCImpersonationScope dpc_scope{};
+  kernel_state()->BeginDPCImpersonation(ctx, dpc_scope);
+  xeRunDeferredDpcs(ctx);
+  kernel_state()->EndDPCImpersonation(ctx, dpc_scope);
+}
+
 dword_result_t KeInsertQueueDpc_entry(pointer_t<XDPC> dpc, dword_t arg1,
                                       dword_t arg2) {
-  uint32_t list_entry_ptr = dpc.guest_address() + 4;
-
   // Lock dispatcher.
   auto global_lock = xe::global_critical_region::AcquireDirect();
-  auto dpc_list = kernel_state()->dpc_list();
 
   // A DPC still waiting to run is not queued again.
   if (IsDeferredDpc(dpc.guest_address())) {
@@ -1836,8 +1844,7 @@ dword_result_t KeInsertQueueDpc_entry(pointer_t<XDPC> dpc, dword_t arg1,
   // stand in for it.
   auto thread = XThread::GetCurrentThread();
   const uint8_t desired_cpu = dpc->desired_cpu_number;
-  if (dpc->routine && thread && desired_cpu && desired_cpu <= 6 &&
-      GuestScheduler::enabled()) {
+  if (dpc->routine && thread && desired_cpu && desired_cpu <= 6) {
     auto ppc_context = thread->thread_state()->context();
     auto kpcr = ppc_context->TranslateVirtualGPR<X_KPCR*>(ppc_context->r[13]);
     if (desired_cpu - 1 != kpcr->prcb_data.current_cpu ||
@@ -1858,8 +1865,6 @@ dword_result_t KeInsertQueueDpc_entry(pointer_t<XDPC> dpc, dword_t arg1,
   dpc->arg1 = (uint32_t)arg1;
   dpc->arg2 = (uint32_t)arg2;
 
-  dpc_list->Insert(list_entry_ptr);
-
   // Otherwise it runs inline on the calling thread: it targets the calling
   // processor, or no scheduler can run it elsewhere.
   uint32_t routine = dpc->routine;
@@ -1871,9 +1876,12 @@ dword_result_t KeInsertQueueDpc_entry(pointer_t<XDPC> dpc, dword_t arg1,
 
       // Inside a DPC routine (reentrant KeInsertQueueDpc), the DPC waits
       // for the running one to return. A routine that queues itself again
-      // would otherwise recurse until the host stack overflows.
-      if (kpcr->prcb_data.dpc_active) {
+      // would otherwise recurse until the host stack overflows. At
+      // DISPATCH_LEVEL or above it waits for the IRQL to drop, as the caller
+      // may hold a spinlock the routine takes.
+      if (kpcr->prcb_data.dpc_active || kpcr->current_irql >= 2) {
         deferred_dpcs.emplace_back(ppc_context->thread_id, dpc.guest_address());
+        ++deferred_dpc_count;
         return 1;
       }
 
@@ -1888,17 +1896,11 @@ dword_result_t KeInsertQueueDpc_entry(pointer_t<XDPC> dpc, dword_t arg1,
 }
 DECLARE_XBOXKRNL_EXPORT2(KeInsertQueueDpc, kThreading, kImplemented, kSketchy);
 
+// Whether the DPC was still waiting to run.
 dword_result_t KeRemoveQueueDpc_entry(pointer_t<XDPC> dpc) {
   bool result = false;
 
-  uint32_t list_entry_ptr = dpc.guest_address() + 4;
-
   auto global_lock = xe::global_critical_region::AcquireDirect();
-  auto dpc_list = kernel_state()->dpc_list();
-  if (dpc_list->IsQueued(list_entry_ptr)) {
-    dpc_list->Remove(list_entry_ptr);
-    result = true;
-  }
   if (kernel_state()->RemoveDpc(dpc.guest_address())) {
     result = true;
   }
@@ -1908,6 +1910,7 @@ dword_result_t KeRemoveQueueDpc_entry(pointer_t<XDPC> dpc) {
   for (auto it = deferred_dpcs.begin(); it != deferred_dpcs.end(); ++it) {
     if (it->second == dpc.guest_address()) {
       deferred_dpcs.erase(it);
+      --deferred_dpc_count;
       result = true;
       break;
     }
@@ -2029,6 +2032,8 @@ void ExReleaseReadWriteLock_entry(pointer_t<X_ERWLOCK> lock_ptr,
   }
 
   if (!lock_ptr->readers_entry_count) {
+    // The exclusive owner is releasing, so hand the lock to the waiting
+    // readers, or else to a waiting writer.
     auto readers_waiting_count = lock_ptr->readers_waiting_count;
     if (readers_waiting_count) {
       lock_ptr->readers_waiting_count = 0;
@@ -2038,10 +2043,8 @@ void ExReleaseReadWriteLock_entry(pointer_t<X_ERWLOCK> lock_ptr,
                            readers_waiting_count, 0);
       return;
     }
-  }
-
-  auto readers_entry_count = --lock_ptr->readers_entry_count;
-  if (readers_entry_count) {
+  } else if (--lock_ptr->readers_entry_count) {
+    // Other readers still hold the lock.
     xeKeKfReleaseSpinLock(ppc_context, &lock_ptr->spin_lock, old_irql);
     return;
   }

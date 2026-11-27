@@ -34,7 +34,6 @@
 #include "xenia/vfs/virtual_file_system.h"
 
 namespace xe {
-class ByteStream;
 class Emulator;
 namespace cpu {
 class Processor;
@@ -62,8 +61,6 @@ class NuiIdentity;
 class NuiMicrophones;
 class PsCamDevice;
 }  // namespace nui
-
-constexpr fourcc_t kKernelSaveSignature = make_fourcc("KRNL");
 
 static constexpr const uint16_t kBaseKernelBuildVersion = 1888;
 
@@ -158,6 +155,9 @@ struct KernelGuestGlobals {
   // KeQueryBackgroundProcessors and written by KeSetBackgroundProcessors.
   // 0x3C (CPUs 2-5) is the console's boot value.
   xe::be<uint32_t> background_processors;
+
+  // Every loaded module's loader entry, by InLoadOrderLinks, in load order.
+  X_LIST_ENTRY loaded_modules;
 };
 struct DPCImpersonationScope {
   uint8_t previous_irql_;
@@ -277,8 +277,10 @@ class KernelState {
   object_ref<XThread> LaunchModule(object_ref<UserModule> module);
   object_ref<UserModule> GetExecutableModule();
   void SetExecutableModule(object_ref<UserModule> module);
+  // Stores why a module that can't be loaded failed in |out_status|.
   object_ref<UserModule> LoadUserModule(const std::string_view name,
-                                        bool call_entry = true);
+                                        bool call_entry = true,
+                                        X_STATUS* out_status = nullptr);
   object_ref<UserModule> LoadUserModuleFromMemory(const std::string_view name,
                                                   const void* addr,
                                                   const size_t length);
@@ -320,6 +322,22 @@ class KernelState {
 
   void RegisterThread(XThread* thread);
   void UnregisterThread(XThread* thread);
+  // Holds the title loader lock for the current guest thread, as the console's
+  // loader does around a load, an unload and the DllMain calls. A thread that
+  // finds it held waits like for any critical section, so other guest threads
+  // run meanwhile. Threads that aren't guest threads don't take it.
+  class LoaderLockScope {
+   public:
+    explicit LoaderLockScope(KernelState* kernel_state);
+    ~LoaderLockScope();
+    LoaderLockScope(const LoaderLockScope&) = delete;
+    LoaderLockScope& operator=(const LoaderLockScope&) = delete;
+
+   private:
+    KernelState* kernel_state_;
+    bool held_ = false;
+  };
+
   void OnThreadExecute(XThread* thread);
   void OnThreadExit(XThread* thread);
   object_ref<XThread> GetThreadByID(uint32_t thread_id);
@@ -328,8 +346,6 @@ class KernelState {
   void RegisterNotifyListener(XNotifyListener* listener);
   void UnregisterNotifyListener(XNotifyListener* listener);
   void BroadcastNotification(XNotificationID id, uint32_t data);
-
-  util::NativeList* dpc_list() { return &dpc_list_; }
 
   void CompleteOverlapped(uint32_t overlapped_ptr, X_RESULT result);
   // The completion routine runs on thread_handle, the requester's thread.
@@ -359,9 +375,6 @@ class KernelState {
       std::function<X_RESULT(uint32_t&, uint32_t&)> completion_callback,
       uint32_t overlapped_ptr, std::function<void()> pre_callback = nullptr,
       std::function<void()> post_callback = nullptr);
-
-  bool Save(ByteStream* stream);
-  bool Restore(ByteStream* stream);
 
   uint32_t notification_position_ = 2;
   XDeploymentType deployment_type_ = XDeploymentType::kOther;
@@ -427,6 +440,7 @@ class KernelState {
   void SetProcessTLSVars(X_KPROCESS* process, int num_slots, int tls_data_size,
                          int tls_static_data_address);
   void InitializeKernelGuestGlobals();
+  std::vector<object_ref<UserModule>> NotifiedModules();
 
   std::vector<xam::XCONTENT_AGGREGATE_DATA> FindTitleUpdate(
       const uint32_t title_id) const;
@@ -486,11 +500,13 @@ class KernelState {
   std::vector<PendingProcessAttach> pending_process_attaches_;
   std::vector<TerminateNotification> terminate_notifications_;
   uint32_t kernel_guest_globals_ = 0;
+  // The title process's loader lock, a guest RTL_CRITICAL_SECTION, held around
+  // the DllMain calls as xboxkrnl 17559's XexpAcquireLoaderLock (0x80078F40)
+  // does with its own at 0x801A5DE0.
+  uint32_t title_loader_lock_ = 0;
 
   std::atomic<bool> dispatch_thread_running_;
   object_ref<XHostThread> dispatch_thread_;
-  // Must be guarded by the global critical region.
-  util::NativeList dpc_list_;
   // Guards the dispatch queue, which a timer expiry pushes to while a timer
   // cancel holding the global lock can be waiting for it.
   std::mutex dispatch_mutex_;
@@ -499,10 +515,19 @@ class KernelState {
   // KDPCs queued on the dispatch thread that haven't started.
   std::vector<uint32_t> dispatch_dpcs_;
 
+  struct QueuedDpc {
+    uint32_t dpc_ptr;
+    uint32_t arg1;
+    uint32_t arg2;
+  };
   // DPCs queued to each guest processor and the thread that runs them there.
   struct ProcessorDpcs {
+    // Never held across a guest memory access, which can fault into the watch
+    // handler while KeInsertQueueDpc holds the global region and waits here.
     std::mutex lock;
-    std::deque<uint32_t> queue;
+    std::deque<QueuedDpc> queue;
+    // Under lock.
+    std::deque<QueuedDpc>::iterator Find(uint32_t dpc_ptr);
     object_ref<XEvent> event;
     object_ref<XHostThread> thread;
     std::atomic<bool> started{false};

@@ -1824,3 +1824,138 @@ msgstr "الألعاب التي تعذّر تنزيل غلافها: %d"
 #: src/xenia/app/emulator_window.cc:2427
 msgid "Covers that couldn't be saved: %d"
 msgstr "الأغلفة التي تعذّر حفظها: %d"
+
+#: src/xenia/app/emulator_window.cc:524
+msgid "M PLUS 1p by Coji Morishita"
+msgstr "M PLUS 1p بواسطة Coji Morishita"
+
+#: src/xenia/app/emulator_window.cc:530
+msgid "Noto Sans TC by Adobe"
+msgstr "Noto Sans TC بواسطة Adobe"
+
+#: src/xenia/app/emulator_window.cc:527
+msgid "Pretendard by Kil Hyung-jin"
+msgstr "Pretendard بواسطة Kil Hyung-jin"
+
+#: src/xenia/app/emulator_window.cc:526
+#: src/xenia/app/emulator_window.cc:529
+msgid "System font: %s (SIL Open Font License 1.1)"
+msgstr "خط النظام: %s (SIL Open Font License 1.1)"
+
+#: src/xenia/ui/title_update_dialog_wx.cc:110
+msgid "%s doesn't fit this release of the game."
+msgstr "%s لا يناسب هذا الإصدار من اللعبة."
+
+#: src/xenia/ui/title_update_dialog_wx.cc:65
+msgid "%s has no newer title update for this release of %s."
+msgstr "لا يتوفر لدى %s تحديث أحدث لهذا الإصدار من %s."
+
+#: src/xenia/ui/title_update_dialog_wx.cc:108
+msgid "%s is damaged."
+msgstr "%s تالف."
+
+#: src/xenia/ui/title_update_dialog_wx.cc:350
+msgid "%s is not a title update package."
+msgstr "%s ليس حزمة تحديث لعبة."
+
+#: src/xenia/ui/title_update_dialog_wx.cc:206
+msgid "&Close"
+msgstr "إغلاق(&C)"
+
+#: src/xenia/ui/title_update_dialog_wx.cc:206
+msgid "&Not Now"
+msgstr "ليس الآن(&N)"
+
+#: src/xenia/ui/title_update_dialog_wx.cc:308
+#: src/xenia/ui/title_update_dialog_wx.cc:435
+msgid "Checking the title update..."
+msgstr "جارٍ التحقق من تحديث اللعبة…"
+
+#: src/xenia/ui/title_update_dialog_wx.cc:218
+msgid "Checking xboxunity.net..."
+msgstr "جارٍ البحث في xboxunity.net…"
+
+#: src/xenia/ui/title_update_dialog_wx.cc:364
+msgid "Copying the title update..."
+msgstr "جارٍ نسخ تحديث اللعبة…"
+
+#: src/xenia/ui/title_update_dialog_wx.cc:201
+msgid "Don't ask again for this game"
+msgstr "عدم السؤال مرة أخرى بشأن هذه اللعبة"
+
+#: src/xenia/ui/title_update_dialog_wx.cc:276
+msgid "Downloading the title update..."
+msgstr "جارٍ تنزيل تحديث اللعبة…"
+
+#: src/xenia/ui/title_update_dialog_wx.cc:193
+msgid "Install from File..."
+msgstr "تثبيت من ملف…"
+
+#: src/xenia/ui/quick_settings_dialog_wx.cc:338
+msgid "Offer Title Updates:"
+msgstr "اقتراح تحديثات اللعبة:"
+
+#: src/xenia/ui/title_update_dialog_wx.cc:338
+msgid "Select a title update package"
+msgstr "تحديد حزمة تحديث اللعبة"
+
+#: src/xenia/ui/title_update_dialog_wx.cc:311
+msgid "The downloaded title update is damaged."
+msgstr "تحديث اللعبة الذي تم تنزيله تالف."
+
+#: src/xenia/ui/title_update_dialog_wx.cc:304
+msgid "The downloaded title update isn't the one this game needs."
+msgstr "تحديث اللعبة الذي تم تنزيله ليس التحديث الذي تحتاجه هذه اللعبة."
+
+#: src/xenia/ui/title_update_dialog_wx.cc:320
+msgid "The title update couldn't be downloaded."
+msgstr "تعذّر تنزيل تحديث اللعبة."
+
+#: src/xenia/ui/title_update_dialog_wx.cc:323
+#: src/xenia/ui/title_update_dialog_wx.cc:403
+msgid "The title update couldn't be saved."
+msgstr "تعذّر حفظ تحديث اللعبة."
+
+#: src/xenia/ui/title_update_dialog_wx.cc:94
+#: src/xenia/ui/title_update_dialog_wx.cc:156
+#: src/xenia/ui/title_update_dialog_wx.cc:218
+#: src/xenia/ui/title_update_dialog_wx.cc:275
+#: src/xenia/ui/title_update_dialog_wx.cc:410
+msgid "Title Update"
+msgstr "تحديث اللعبة"
+
+#: src/xenia/ui/title_update_dialog_wx.cc:246
+msgid "xboxunity.net couldn't be reached."
+msgstr "تعذّر الوصول إلى xboxunity.net."
+
+#: src/xenia/ui/title_update_dialog_wx.cc:240
+msgid "xboxunity.net's answer couldn't be read."
+msgstr "تعذّرت قراءة رد xboxunity.net."
+
+#: src/xenia/ui/title_update_dialog_wx.cc:243
+msgid "xboxunity.net's answer couldn't be saved."
+msgstr "تعذّر حفظ رد xboxunity.net."
+
+#: src/xenia/ui/title_update_dialog_wx.cc:54
+msgid "Title update %u for %s is available (%s)."
+msgstr "يتوفر التحديث %u للعبة %s (%s)."
+
+#: src/xenia/ui/title_update_dialog_wx.cc:56
+msgid "A title update for %s is available (%s)."
+msgstr "يتوفر تحديث للعبة %s (%s)."
+
+#: src/xenia/ui/title_update_dialog_wx.cc:170
+msgid "A title update may be available for %s."
+msgstr "قد يتوفر تحديث للعبة %s."
+
+#: src/xenia/ui/title_update_dialog_wx.cc:173
+msgid "No newer title update is known for this release of %s."
+msgstr "لا يُعرف تحديث أحدث لهذا الإصدار من %s."
+
+#: src/xenia/ui/title_update_dialog_wx.cc:182
+msgid "Check for Updates"
+msgstr "البحث عن تحديثات"
+
+#: src/xenia/ui/title_update_dialog_wx.cc:253
+msgid "Download"
+msgstr "تنزيل"

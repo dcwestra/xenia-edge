@@ -13,7 +13,6 @@
 
 #include "xenia/kernel/kernel_state.h"
 
-#include "xenia/base/byte_stream.h"
 #include "xenia/base/logging.h"
 #include "xenia/emulator.h"
 #include "xenia/hid/input_system.h"
@@ -28,11 +27,13 @@
 #include "xenia/kernel/title_id_utils.h"
 #include "xenia/kernel/user_module.h"
 #include "xenia/kernel/util/shim_utils.h"
+#include "xenia/kernel/xam/xam_module.h"
 #include "xenia/kernel/xam/xam_state.h"
 #include "xenia/kernel/xam/xam_system_link.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_memory.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_module.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_ob.h"
+#include "xenia/kernel/xboxkrnl/xboxkrnl_rtl.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_threading.h"
 #include "xenia/kernel/xevent.h"
 #include "xenia/kernel/xmodule.h"
@@ -46,9 +47,6 @@
 #include "third_party/mbedtls/include/mbedtls/sha1.h"
 
 DEFINE_bool(apply_title_update, true, "Apply title updates.", "Kernel");
-DEFINE_bool(allow_incompatible_title_update, false,
-            "Allow title updates with mismatched signatures to be applied.",
-            "Kernel");
 
 DEFINE_uint32(kernel_build_version, 17559, "Define current kernel version",
               "Kernel");
@@ -72,7 +70,6 @@ KernelState::KernelState(Emulator* emulator)
     : emulator_(emulator),
       memory_(emulator->memory()),
       dispatch_thread_running_(false),
-      dpc_list_(emulator->memory()),
       kernel_trampoline_group_(emulator->processor()->backend()) {
   assert_null(shared_kernel_state_);
   shared_kernel_state_ = this;
@@ -163,6 +160,12 @@ KernelState::~KernelState() {
   for (auto& dpcs : processor_dpcs_) {
     dpcs.thread.reset();
     dpcs.event.reset();
+  }
+
+  // The object table reset below would otherwise join the System Link worker
+  // under the global critical region, which the worker's callbacks need.
+  if (auto xam = GetKernelModule<xam::XamModule>("xam.xex")) {
+    xam->ShutdownSystemLink();
   }
 
   executable_module_.reset();
@@ -469,9 +472,38 @@ void KernelState::RemoveTitleTerminateNotification(uint32_t routine) {
   }
 }
 
-void KernelState::RegisterModule(XModule* module) {}
+// Links the module's loader entry onto the end of the loaded module list once,
+// so a title walking InLoadOrderLinks finds every module.
+void KernelState::RegisterModule(XModule* module) {
+  if (!kernel_guest_globals_ || !module->hmodule_ptr()) {
+    return;
+  }
+  auto global_lock = global_critical_region_.Acquire();
+  auto ldr_data =
+      memory_->TranslateVirtual<X_LDR_DATA_TABLE_ENTRY*>(module->hmodule_ptr());
+  if (ldr_data->in_load_order_links.flink_ptr) {
+    return;
+  }
+  auto block =
+      memory_->TranslateVirtual<KernelGuestGlobals*>(kernel_guest_globals_);
+  util::XeInsertTailList(&block->loaded_modules, &ldr_data->in_load_order_links,
+                         memory_);
+}
 
-void KernelState::UnregisterModule(XModule* module) {}
+void KernelState::UnregisterModule(XModule* module) {
+  if (!module->hmodule_ptr()) {
+    return;
+  }
+  auto global_lock = global_critical_region_.Acquire();
+  auto ldr_data =
+      memory_->TranslateVirtual<X_LDR_DATA_TABLE_ENTRY*>(module->hmodule_ptr());
+  if (!ldr_data->in_load_order_links.flink_ptr) {
+    return;
+  }
+  util::XeRemoveEntryList(&ldr_data->in_load_order_links, memory_);
+  ldr_data->in_load_order_links.flink_ptr = 0;
+  ldr_data->in_load_order_links.blink_ptr = 0;
+}
 
 bool KernelState::RegisterUserModule(object_ref<UserModule> module) {
   auto lock = global_critical_region_.Acquire();
@@ -610,16 +642,11 @@ object_ref<XThread> KernelState::LaunchModule(object_ref<UserModule> module) {
 
   // The boot animation is a DLL with no entry point.
   if (module->is_dll_module() && !module->entry_point()) {
-    auto thread = GetKernelModule<xboxkrnl::XboxkrnlModule>("xboxkrnl.exe")
-                      ->StartBootAnimation(module, /*main_thread=*/true);
-    if (thread) {
-      emulator()->processor()->PreLaunch();
-    }
-    return thread;
+    return GetKernelModule<xboxkrnl::XboxkrnlModule>("xboxkrnl.exe")
+        ->StartBootAnimation(module, /*main_thread=*/true);
   }
 
-  // Create a thread to run in.
-  // We start suspended so we can run the debugger prep.
+  // Create a thread to run in, suspended until the launch finishes.
   // The console's XexStartExecutable always starts it on CPU 0.
   auto thread = object_ref<XThread>(new XThread(
       kernel_state(), module->stack_size(), 0, module->entry_point(), 0,
@@ -633,9 +660,6 @@ object_ref<XThread> KernelState::LaunchModule(object_ref<UserModule> module) {
     XELOGE("Could not create launch thread: {:08X}", result);
     return nullptr;
   }
-
-  // Waits for a debugger client, if desired.
-  emulator()->processor()->PreLaunch();
 
   return thread;
 }
@@ -732,9 +756,6 @@ void KernelState::SetExecutableModule(object_ref<UserModule> module) {
     dispatch_thread_ = object_ref<XHostThread>(new XHostThread(
         this, 128 * 1024, 0,
         [this]() {
-          // As we run guest callbacks the debugger must be able to suspend us.
-          dispatch_thread_->set_can_debugger_suspend(true);
-
           while (true) {
             std::function<void()> fn;
             {
@@ -764,7 +785,7 @@ void KernelState::LoadKernelModule(object_ref<KernelModule> kernel_module) {
 }
 
 object_ref<UserModule> KernelState::LoadUserModule(
-    const std::string_view raw_name, bool call_entry) {
+    const std::string_view raw_name, bool call_entry, X_STATUS* out_status) {
   // Some games try to load relative to launch module, others specify full path.
   auto name = xe::utf8::find_name_from_guest_path(raw_name);
   std::string path(raw_name);
@@ -800,6 +821,9 @@ object_ref<UserModule> KernelState::LoadUserModule(
     X_STATUS status = module->LoadFromFile(path);
     if (XFAILED(status)) {
       object_table()->ReleaseHandle(module->handle());
+      if (out_status) {
+        *out_status = status;
+      }
       return nullptr;
     }
 
@@ -830,7 +854,7 @@ object_ref<UserModule> KernelState::LoadUserModuleFromMemory(
 
     // Module wasn't loaded, so load it.
     module = object_ref<UserModule>(new UserModule(this));
-    X_STATUS status = module->LoadFromMemoryNamed(name, addr, length);
+    X_STATUS status = module->LoadFromMemoryNamed(raw_name, addr, length);
     if (XFAILED(status)) {
       object_table()->ReleaseHandle(module->handle());
       return nullptr;
@@ -876,8 +900,41 @@ X_RESULT KernelState::FinishLoadingUserModule(
   return result;
 }
 
+KernelState::LoaderLockScope::LoaderLockScope(KernelState* kernel_state)
+    : kernel_state_(kernel_state) {
+  if (kernel_state_->title_loader_lock_ && !XThread::IsInThread(nullptr)) {
+    xboxkrnl::xeRtlEnterCriticalSection(
+        kernel_state_->memory()
+            ->TranslateVirtual<xboxkrnl::X_RTL_CRITICAL_SECTION*>(
+                kernel_state_->title_loader_lock_));
+    held_ = true;
+  }
+}
+
+KernelState::LoaderLockScope::~LoaderLockScope() {
+  if (held_) {
+    xboxkrnl::xeRtlLeaveCriticalSection(
+        kernel_state_->memory()
+            ->TranslateVirtual<xboxkrnl::X_RTL_CRITICAL_SECTION*>(
+                kernel_state_->title_loader_lock_),
+        kernel_state_->title_loader_lock_);
+  }
+}
+
 void KernelState::AttachPendingModules(XThread* thread,
                                        uint32_t loader_thread_id) {
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    if (std::ranges::find(pending_process_attaches_, loader_thread_id,
+                          &PendingProcessAttach::loader_thread_id) ==
+        pending_process_attaches_.end()) {
+      return;
+    }
+  }
+  // DllMain runs under the loader lock, never the global critical region: a
+  // DllMain that waits would leave its host thread holding that, and stall
+  // every other thread that takes it.
+  LoaderLockScope loader_lock(this);
   auto global_lock = global_critical_region_.Acquire();
   while (true) {
     auto it = std::ranges::find(pending_process_attaches_, loader_thread_id,
@@ -900,7 +957,8 @@ void KernelState::AttachPendingModules(XThread* thread,
                          xe::countof(args));
 
     global_lock.lock();
-    // Threads that start while DllMain runs skip the module.
+    // A thread that starts while DllMain runs waits for the loader lock and
+    // then gets DLL_THREAD_ATTACH for the module, as on the console.
     module->is_attached_ = true;
   }
 }
@@ -912,49 +970,94 @@ X_RESULT KernelState::ApplyTitleUpdate(
     return X_STATUS_SUCCESS;
   }
 
-  auto patch_module = LoadTitleUpdate(&title_updates.front(), title_module);
+  // How an update fits the module: made for it, made for the same code under
+  // another release's headers, which the encryption key tells and ApplyPatch's
+  // page digest check then confirms, or not at all.
+  enum class Fit { kNone, kKey, kSignature };
+  auto fit_of = [&](const object_ref<UserModule>& patch_module) {
+    if (!patch_module || !patch_module->xex_module()->is_patch()) {
+      return Fit::kNone;
+    }
+    if (IsPatchSignatureProper(title_module, patch_module)) {
+      return Fit::kSignature;
+    }
+    return patch_module->xex_module()->PatchImageKeyMatches(
+               *title_module->xex_module())
+               ? Fit::kKey
+               : Fit::kNone;
+  };
+
+  object_ref<UserModule> patch_module;
+  Fit fit = Fit::kNone;
+  if (GetExecutableModule()) {
+    // A module loaded after the executable takes the update it took, if any.
+    if (!content_manager()->IsRootTaken("UPDATE")) {
+      return X_STATUS_SUCCESS;
+    }
+    patch_module = LoadTitleUpdate(&title_updates.front(), title_module);
+    if (!patch_module) {
+      return X_STATUS_SUCCESS;
+    }
+    fit = fit_of(patch_module);
+  } else {
+    // The best fit, then the newest by the version it patches to, since every
+    // update of a release has the release's version in its header.
+    const xam::XCONTENT_AGGREGATE_DATA* best = nullptr;
+    uint32_t best_version = 0;
+    bool any_patch = false;
+    for (const auto& title_update : title_updates) {
+      {
+        auto candidate = LoadTitleUpdate(&title_update, title_module);
+        any_patch = any_patch || candidate;
+        const Fit candidate_fit = fit_of(candidate);
+        xex2_opt_delta_patch_descriptor* descriptor = nullptr;
+        if (candidate_fit != Fit::kNone) {
+          candidate->GetOptHeader(XEX_HEADER_DELTA_PATCH_DESCRIPTOR,
+                                  reinterpret_cast<void**>(&descriptor));
+        }
+        const uint32_t version =
+            descriptor ? uint32_t(descriptor->target_version_value) : 0;
+        if (candidate_fit > fit ||
+            (candidate_fit != Fit::kNone && candidate_fit == fit &&
+             version > best_version)) {
+          best = &title_update;
+          fit = candidate_fit;
+          best_version = version;
+        }
+      }
+      content_manager()->CloseContent("UPDATE");
+    }
+    // None of the installed updates patches this module.
+    if (!any_patch) {
+      return X_STATUS_SUCCESS;
+    }
+    if (best) {
+      patch_module = LoadTitleUpdate(best, title_module);
+    }
+  }
+
+  if (fit == Fit::kNone) {
+    XELOGW("No installed title update fits {}", title_module->name());
+    // The executable took the update, which this module would run without.
+    if (GetExecutableModule()) {
+      return X_STATUS_UNSUCCESSFUL;
+    }
+    emulator_->display_window()->app_context().CallInUIThread([&]() {
+      new xe::ui::HostNotificationWindow(
+          emulator_->imgui_drawer(), "Warning!",
+          "Title Update signature doesn't match. Skipping its application!", 0);
+    });
+    return X_STATUS_SUCCESS;
+  }
   if (!patch_module) {
     return X_STATUS_SUCCESS;
   }
-
-  if (!patch_module->xex_module()->is_patch()) {
-    return X_STATUS_UNSUCCESSFUL;
-  }
-
-  if (!IsPatchSignatureProper(title_module, patch_module)) {
-    if (!cvars::allow_incompatible_title_update) {
-      XELOGW(
-          "Skipping incompatible title update for {} due to signature mismatch",
-          title_module->name());
-      if (!GetExecutableModule()) {
-        emulator_->display_window()->app_context().CallInUIThread([&]() {
-          new xe::ui::HostNotificationWindow(
-              emulator_->imgui_drawer(), "Warning!",
-              "Title Update signature doesn't match. Skipping its application!",
-              0);
-        });
-      }
-      return X_STATUS_SUCCESS;
-    }
-
-    XELOGW(
-        "Applying incompatible title update for {} due to enabled "
-        "allow_incompatible_title_update config option!",
+  if (fit == Fit::kKey) {
+    XELOGI(
+        "Title update for {} was made for another release of it, applying it "
+        "since its encryption key fits",
         title_module->name());
-
-    // First module that is loaded is always main executable. That way we can
-    // prevent random message spam in case of loading/unloading.
-    if (!GetExecutableModule()) {
-      emulator_->display_window()->app_context().CallInUIThread([&]() {
-        new xe::ui::HostNotificationWindow(
-            emulator_->imgui_drawer(), "Warning!",
-            "Title Update signature doesn't match. This can cause unexpected "
-            "issues or crashes!",
-            0);
-      });
-    }
   }
-
   return ApplyTitleUpdate(title_module, patch_module);
 }
 
@@ -1044,14 +1147,7 @@ bool KernelState::IsPatchSignatureProper(
       title_module->xex_module()->xex_security_info()->rsa_signature);
   mbedtls_sha1(signature, 0x100, digest);
 
-  if (memcmp(digest, patch_header->digest_source, 0x14) != 0) {
-    XELOGW(
-        "XEX patch signature hash doesn't match base XEX signature hash, patch "
-        "will likely fail!");
-
-    return false;
-  }
-  return true;
+  return memcmp(digest, patch_header->digest_source, 0x14) == 0;
 }
 
 X_RESULT KernelState::ApplyTitleUpdate(
@@ -1067,17 +1163,19 @@ X_RESULT KernelState::ApplyTitleUpdate(
     return X_STATUS_UNSUCCESSFUL;
   }
 
-  X_STATUS result =
+  // ApplyPatch fails with positive codes, which XFAILED reads as success.
+  const int result =
       patch_module->xex_module()->ApplyPatch(title_module->xex_module());
-  if (result != X_STATUS_SUCCESS) {
+  if (result) {
     XELOGE("Failed to apply XEX patch, code: {}", result);
+    return X_STATUS_UNSUCCESSFUL;
   }
-  return result;
+  return X_STATUS_SUCCESS;
 }
 
 void KernelState::UnloadUserModule(const object_ref<UserModule>& module,
                                    bool call_entry) {
-  auto global_lock = global_critical_region_.Acquire();
+  LoaderLockScope loader_lock(this);
 
   if (module->is_dll_module() && module->entry_point() && call_entry) {
     // Call DllMain(DLL_PROCESS_DETACH):
@@ -1092,6 +1190,7 @@ void KernelState::UnloadUserModule(const object_ref<UserModule>& module,
                          xe::countof(args));
   }
 
+  auto global_lock = global_critical_region_.Acquire();
   auto iter = std::ranges::find_if(user_modules_, [&module](const auto& e) {
     return e->path() == module->path();
   });
@@ -1113,19 +1212,25 @@ void KernelState::UnloadUserModule(const object_ref<UserModule>& module,
 
 void KernelState::TerminateTitle() {
   XELOGI("KernelState::TerminateTitle");
+  if (xe::IsUnattended()) {
+    xe::ExitUnattended(EXIT_SUCCESS, "title exited");
+  }
   xe::FlushLog();
   std::quick_exit(EXIT_SUCCESS);
 }
 
 // Doesn't return when the host UI's handler took the title down.
 static void HandOffToHostUI(const Emulator::ExitToDashboardCallback& handler) {
-  if (handler && handler()) {
-    // Park off guest code until the host's reset or exit ends us; Suspend can
-    // return on POSIX, so loop rather than fall through to TerminateTitle.
+  // Unattended, there's no game list to go back to.
+  if (handler && !xe::IsUnattended() && handler()) {
+    // Park off guest code until the host's reset or exit ends us. Suspend
+    // returns if the thread is resumed, so loop rather than fall through to
+    // TerminateTitle.
     auto* current_thread = XThread::GetCurrentThread();
     current_thread->Suspend(nullptr);
+    // SpinYield parks a fiber, a host sleep would stall its dispatch thread.
     while (true) {
-      xe::threading::NanoSleep(int64_t(1'000'000'000));
+      GuestScheduler::SpinYield(std::chrono::seconds(1));
     }
   }
 }
@@ -1164,9 +1269,22 @@ static bool NotifiesDlls(XThread* thread) {
          thread->guest_object<X_KTHREAD>()->process_type == X_PROCTYPE_TITLE;
 }
 
-void KernelState::OnThreadExecute(XThread* thread) {
+// The DLLs a thread start or exit notifies, in load order: attached ones with
+// an entry point. The console copies them out of the module list the same way
+// before it calls any (xboxkrnl 17559, 0x8007B598-0x8007B610).
+std::vector<object_ref<UserModule>> KernelState::NotifiedModules() {
   auto global_lock = global_critical_region_.Acquire();
+  std::vector<object_ref<UserModule>> modules;
+  for (const auto& user_module : user_modules_) {
+    if (user_module->is_dll_module() && user_module->entry_point() &&
+        user_module->is_attached()) {
+      modules.push_back(user_module);
+    }
+  }
+  return modules;
+}
 
+void KernelState::OnThreadExecute(XThread* thread) {
   // Must be called on executing thread.
   assert_true(XThread::GetCurrentThread() == thread);
 
@@ -1174,38 +1292,35 @@ void KernelState::OnThreadExecute(XThread* thread) {
     return;
   }
 
-  // Call DllMain(DLL_THREAD_ATTACH) for each user module:
+  // Call DllMain(DLL_THREAD_ATTACH) for each user module, holding the loader
+  // lock as the console's thread notification (0x8007B520) does:
   // https://msdn.microsoft.com/en-us/library/windows/desktop/ms682583%28v=vs.85%29.aspx
+  LoaderLockScope loader_lock(this);
   auto thread_state = thread->thread_state();
-  for (auto user_module : user_modules_) {
-    if (user_module->is_dll_module() && user_module->entry_point() &&
-        user_module->is_attached()) {
-      uint64_t args[] = {
-          user_module->hmodule_ptr(),
-          2,  // DLL_THREAD_ATTACH
-          0,  // 0 because always dynamic
-      };
-      processor()->Execute(thread_state, user_module->entry_point(), args,
-                           xe::countof(args));
-    }
+  for (const auto& user_module : NotifiedModules()) {
+    uint64_t args[] = {
+        user_module->hmodule_ptr(),
+        2,  // DLL_THREAD_ATTACH
+        0,  // 0 because always dynamic
+    };
+    processor()->Execute(thread_state, user_module->entry_point(), args,
+                         xe::countof(args));
   }
   // Imports loaded with the title.
   AttachPendingModules(thread, 0);
 }
 
 void KernelState::OnThreadExit(XThread* thread) {
-  auto global_lock = global_critical_region_.Acquire();
-
   // Must be called on executing thread.
   assert_true(XThread::GetCurrentThread() == thread);
 
-  // Call DllMain(DLL_THREAD_DETACH) for each user module:
+  // Call DllMain(DLL_THREAD_DETACH) for each user module, under the loader
+  // lock:
   // https://msdn.microsoft.com/en-us/library/windows/desktop/ms682583%28v=vs.85%29.aspx
-  auto thread_state = thread->thread_state();
-  const bool notifies_dlls = NotifiesDlls(thread);
-  for (auto user_module : user_modules_) {
-    if (notifies_dlls && user_module->is_dll_module() &&
-        user_module->entry_point() && user_module->is_attached()) {
+  if (NotifiesDlls(thread)) {
+    LoaderLockScope loader_lock(this);
+    auto thread_state = thread->thread_state();
+    for (const auto& user_module : NotifiedModules()) {
       uint64_t args[] = {
           user_module->hmodule_ptr(),
           3,  // DLL_THREAD_DETACH
@@ -1215,8 +1330,6 @@ void KernelState::OnThreadExit(XThread* thread) {
                            xe::countof(args));
     }
   }
-
-  emulator()->processor()->OnThreadExit(thread->thread_id());
 }
 
 object_ref<XThread> KernelState::GetThreadByID(uint32_t thread_id) {
@@ -1271,13 +1384,17 @@ void KernelState::RegisterNotifyListener(XNotifyListener* listener) {
                                   xam::SystemLinkEnabled());
   }
 
+  // The first music player listener starts with its state and controller,
+  // without being signaled.
   if (!has_notified_xmp_startup_ && listener->mask() & kXNotifyXmp) {
     has_notified_xmp_startup_ = true;
-    // Playback state is idle until the media player broadcasts a transition
-    // of its own, so only the controller is worth priming.
+    auto media_player = emulator()->audio_media_player();
     listener->EnqueueNotification(
-        kXNotificationXmpPlaybackControllerChanged,
-        emulator()->audio_media_player()->IsTitleInPlaybackControl());
+        kXNotificationXmpStateChanged,
+        media_player->GetState() != xam::apps::XmpApp::State::kIdle, false);
+    listener->EnqueueNotification(kXNotificationXmpPlaybackControllerChanged,
+                                  media_player->IsTitleInPlaybackControl(),
+                                  false);
   }
 }
 
@@ -1423,77 +1540,6 @@ void KernelState::CompleteOverlappedDeferredEx(
   dispatch_cond_.notify_all();
 }
 
-bool KernelState::Save(ByteStream* stream) {
-  XELOGD("Serializing the kernel...");
-  stream->Write(kKernelSaveSignature);
-
-  // Save the object table
-  object_table_.Save(stream);
-
-  // Write the TLS allocation bitmap
-  // We save XThreads absolutely first, as they will execute code upon save
-  // (which could modify the kernel state)
-  auto threads = object_table_.GetObjectsByType<XThread>();
-  uint32_t* num_threads_ptr =
-      reinterpret_cast<uint32_t*>(stream->data() + stream->offset());
-  stream->Write(static_cast<uint32_t>(threads.size()));
-
-  size_t num_threads = threads.size();
-  XELOGD("Serializing {} threads...", threads.size());
-  for (auto thread : threads) {
-    if (!thread->is_guest_thread()) {
-      // Don't save host threads. They can be reconstructed on startup.
-      num_threads--;
-      continue;
-    }
-
-    if (!thread->Save(stream)) {
-      XELOGD("Failed to save thread \"{}\"", thread->name());
-      num_threads--;
-    }
-  }
-
-  *num_threads_ptr = static_cast<uint32_t>(num_threads);
-
-  // Save all other objects
-  auto objects = object_table_.GetAllObjects();
-  uint32_t* num_objects_ptr =
-      reinterpret_cast<uint32_t*>(stream->data() + stream->offset());
-  stream->Write(static_cast<uint32_t>(objects.size()));
-
-  size_t num_objects = objects.size();
-  XELOGD("Serializing {} objects...", num_objects);
-  for (auto object : objects) {
-    auto prev_offset = stream->offset();
-
-    // A user module is a host object only to stay out of the title's handle
-    // numbering, so it still saves.
-    bool user_module = object->type() == XObject::Type::Module &&
-                       static_cast<XModule*>(object.get())->module_type() ==
-                           XModule::ModuleType::kUserModule;
-    if ((object->is_host_object() && !user_module) ||
-        object->type() == XObject::Type::Thread) {
-      // Don't save host objects or save XThreads again
-      num_objects--;
-      continue;
-    }
-
-    stream->Write<uint32_t>(static_cast<uint32_t>(object->type()));
-    if (!object->Save(stream)) {
-      XELOGD("Did not save object of type {}",
-             static_cast<uint32_t>(object->type()));
-      assert_always();
-
-      // Revert backwards and overwrite if a save failed.
-      stream->set_offset(prev_offset);
-      num_objects--;
-    }
-  }
-
-  *num_objects_ptr = static_cast<uint32_t>(num_objects);
-  return true;
-}
-
 // this only gets triggered once per ms at most, so fields other than tick count
 // will probably not be updated in a timely manner for guest code that uses them
 void KernelState::UpdateKeTimestampBundle() {
@@ -1533,49 +1579,6 @@ uint32_t KernelState::CreateKeTimestampBundle() {
   assert_always(
       "CreateKeTimestampBundle called but bundle not initialized during boot");
   return 0;
-}
-
-bool KernelState::Restore(ByteStream* stream) {
-  // Check the magic value.
-  if (stream->Read<uint32_t>() != kKernelSaveSignature) {
-    return false;
-  }
-
-  // Restore the object table
-  object_table_.Restore(stream);
-
-  // TLS bitmap is now stored per-process in X_KPROCESS structures (in guest
-  // memory) Skip reading old global TLS bitmap if present in old save files
-  auto num_bitmap_entries = stream->Read<uint32_t>();
-  for (uint32_t i = 0; i < num_bitmap_entries; i++) {
-    stream->Read<uint64_t>();  // Discard old data
-  }
-
-  uint32_t num_threads = stream->Read<uint32_t>();
-  XELOGD("Loading {} threads...", num_threads);
-  for (uint32_t i = 0; i < num_threads; i++) {
-    auto thread = XObject::Restore(this, XObject::Type::Thread, stream);
-    if (!thread) {
-      // Can't continue the restore or we risk misalignment.
-      assert_always();
-      return false;
-    }
-  }
-
-  uint32_t num_objects = stream->Read<uint32_t>();
-  XELOGD("Loading {} objects...", num_objects);
-  for (uint32_t i = 0; i < num_objects; i++) {
-    uint32_t type = stream->Read<uint32_t>();
-
-    auto obj = XObject::Restore(this, XObject::Type(type), stream);
-    if (!obj) {
-      // Can't continue the restore or we risk misalignment.
-      assert_always();
-      return false;
-    }
-  }
-
-  return true;
 }
 
 std::bitset<4> KernelState::GetConnectedUsers() const {
@@ -1643,8 +1646,7 @@ void KernelState::QueueDpc(uint32_t dpc_ptr, uint32_t arg1, uint32_t arg2) {
 
 void KernelState::StartProcessorDpcThread(uint8_t cpu) {
   auto& dpcs = processor_dpcs_[cpu];
-  if (dpcs.started.load(std::memory_order_acquire) ||
-      !GuestScheduler::enabled()) {
+  if (dpcs.started.load(std::memory_order_acquire)) {
     return;
   }
   auto global_lock = global_critical_region_.Acquire();
@@ -1660,7 +1662,6 @@ void KernelState::StartProcessorDpcThread(uint8_t cpu) {
         return 0;
       },
       GetSystemProcess(), true));
-  dpcs.thread->set_can_debugger_suspend(true);
   dpcs.thread->set_name(fmt::format("DPC Processor {}", cpu));
   if (XFAILED(dpcs.thread->Create())) {
     dpcs.thread.reset();
@@ -1672,20 +1673,27 @@ void KernelState::StartProcessorDpcThread(uint8_t cpu) {
   dpcs.started.store(true, std::memory_order_release);
 }
 
+std::deque<KernelState::QueuedDpc>::iterator KernelState::ProcessorDpcs::Find(
+    uint32_t dpc_ptr) {
+  return std::find_if(
+      queue.begin(), queue.end(),
+      [dpc_ptr](const QueuedDpc& entry) { return entry.dpc_ptr == dpc_ptr; });
+}
+
 bool KernelState::QueueProcessorDpc(uint8_t cpu, uint32_t dpc_ptr,
                                     uint32_t arg1, uint32_t arg2) {
   auto& dpcs = processor_dpcs_[cpu];
   {
     std::lock_guard lock(dpcs.lock);
-    if (std::find(dpcs.queue.begin(), dpcs.queue.end(), dpc_ptr) !=
-        dpcs.queue.end()) {
+    if (dpcs.Find(dpc_ptr) != dpcs.queue.end()) {
       return false;
     }
-    auto dpc = memory()->TranslateVirtual<XDPC*>(dpc_ptr);
-    dpc->arg1 = arg1;
-    dpc->arg2 = arg2;
-    dpcs.queue.push_back(dpc_ptr);
+    dpcs.queue.push_back({dpc_ptr, arg1, arg2});
   }
+  // Only the guest's copy, the runner takes the arguments from the queue.
+  auto dpc = memory()->TranslateVirtual<XDPC*>(dpc_ptr);
+  dpc->arg1 = arg1;
+  dpc->arg2 = arg2;
   dpcs.event->Set(0, false);
   return true;
 }
@@ -1696,14 +1704,13 @@ bool KernelState::IsProcessorDpcQueued(uint8_t cpu, uint32_t dpc_ptr) {
     return false;
   }
   std::lock_guard lock(dpcs.lock);
-  return std::find(dpcs.queue.begin(), dpcs.queue.end(), dpc_ptr) !=
-         dpcs.queue.end();
+  return dpcs.Find(dpc_ptr) != dpcs.queue.end();
 }
 
 bool KernelState::RemoveProcessorDpc(uint32_t dpc_ptr) {
   for (auto& dpcs : processor_dpcs_) {
     std::lock_guard lock(dpcs.lock);
-    auto it = std::find(dpcs.queue.begin(), dpcs.queue.end(), dpc_ptr);
+    auto it = dpcs.Find(dpc_ptr);
     if (it != dpcs.queue.end()) {
       dpcs.queue.erase(it);
       return true;
@@ -1722,19 +1729,16 @@ void KernelState::RunProcessorDpcs(uint8_t cpu) {
     while (true) {
       // Its arguments are taken as it leaves the queue, so KeInsertQueueDpc
       // may queue it again before it runs.
-      uint32_t dpc_ptr, arg1, arg2;
+      QueuedDpc entry;
       {
         std::lock_guard lock(dpcs.lock);
         if (dpcs.queue.empty()) {
           break;
         }
-        dpc_ptr = dpcs.queue.front();
+        entry = dpcs.queue.front();
         dpcs.queue.pop_front();
-        auto dpc = memory()->TranslateVirtual<XDPC*>(dpc_ptr);
-        arg1 = dpc->arg1;
-        arg2 = dpc->arg2;
       }
-      xboxkrnl::xeRunDpc(context, dpc_ptr, arg1, arg2);
+      xboxkrnl::xeRunDpc(context, entry.dpc_ptr, entry.arg1, entry.arg2);
     }
     EndDPCImpersonation(context, dpc_scope);
   }
@@ -1755,7 +1759,7 @@ void KernelState::EmulateCPInterruptDPC(uint32_t interrupt_callback,
                                         uint32_t source, uint32_t cpu) {
   // Source 0 is vblank, where the console's graphics DPC enters background
   // mode. Before the callback check, which the console also does without one.
-  if (source == 0 && GuestScheduler::enabled()) {
+  if (source == 0) {
     guest_scheduler()->EnterBackgroundMode();
   }
   if (!interrupt_callback) {
@@ -1922,6 +1926,14 @@ void KernelState::InitializeKernelGuestGlobals() {
   KernelGuestGlobals* block =
       memory_->TranslateVirtual<KernelGuestGlobals*>(kernel_guest_globals_);
   memset(block, 0, sizeof(KernelGuestGlobals));
+  util::XeInitializeListHead(&block->loaded_modules, memory_);
+
+  title_loader_lock_ =
+      memory_->SystemHeapAlloc(xboxkrnl::xeRtlCriticalSectionSize());
+  xboxkrnl::xeRtlInitializeCriticalSection(
+      memory_->TranslateVirtual<xboxkrnl::X_RTL_CRITICAL_SECTION*>(
+          title_loader_lock_),
+      title_loader_lock_);
 
   auto idle_process = memory()->TranslateVirtual<X_KPROCESS*>(GetIdleProcess());
   InitializeProcess(idle_process, X_PROCTYPE_IDLE, 0, 0, 0);
@@ -2042,6 +2054,9 @@ void KernelState::InitializeKernelGuestGlobals() {
       {XObject::Type::Mutant,
        kernel_guest_globals_ +
            offsetof32(KernelGuestGlobals, ExMutantObjectType)},
+      {XObject::Type::Timer,
+       kernel_guest_globals_ +
+           offsetof32(KernelGuestGlobals, ExTimerObjectType)},
       {XObject::Type::Device,
        kernel_guest_globals_ +
            offsetof32(KernelGuestGlobals, IoDeviceObjectType)}};

@@ -168,6 +168,16 @@ bool VulkanPipelineCache::precise_interpolation_supported() const {
   return cvars::precise_interpolation;
 }
 
+bool VulkanPipelineCache::raw_clipping_supported() const {
+  const ui::vulkan::VulkanDevice::Properties& device_properties =
+      command_processor_.GetVulkanDevice()->properties();
+  return device_properties.depthClamp && device_properties.shaderClipDistance;
+}
+
+bool VulkanPipelineCache::cull_distances_supported() const {
+  return command_processor_.GetVulkanDevice()->properties().shaderCullDistance;
+}
+
 bool VulkanPipelineCache::Initialize() {
   const ui::vulkan::VulkanDevice* const vulkan_device =
       command_processor_.GetVulkanDevice();
@@ -356,13 +366,6 @@ bool VulkanPipelineCache::Initialize() {
           "VulkanPipelineCache: Failed to create one or more tessellation "
           "shaders - tessellation will not be available");
     }
-  }
-
-  if (cvars::force_depth_clamp && !vulkan_device->properties().depthClamp) {
-    XELOGW(
-        "force_depth_clamp is enabled, but the device doesn't support depth "
-        "clamping - guest draws with clipping enabled will still be clipped "
-        "to the host planes");
   }
 
   // Create placeholder pixel shader for pipeline hot-swap (stutter reduction).
@@ -1193,7 +1196,7 @@ void VulkanPipelineCache::TranslateShadersForStorage(
   translate_function();
 
   for (auto& thread : translation_threads) {
-    xe::threading::Wait(thread.get(), false);
+    xe::threading::Wait(thread.get());
   }
 
   XELOGI("Translated {} shaders in {} ms", translations_completed.load(),
@@ -1422,16 +1425,9 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
   description_out.primitive_restart =
       primitive_processing_result.host_primitive_reset_enabled;
 
-  // With force_depth_clamp, use the host viewport clamp instead of near and far
-  // Z plane clipping. X/Y/W clipping is unchanged. Both 494707EE and 41560881
-  // have passes that rely on alpha inputs that currently gets dropped by
-  // near-plane clipping.
-  // TODO(boma): Investigate whether the difference is in shader arithmetic or
-  // the clipper itself.
   description_out.depth_clamp_enable =
       device_properties.depthClamp &&
-      (regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable ||
-       cvars::force_depth_clamp);
+      draw_util::IsDepthClampedAtZPlanes(regs, raw_clipping_supported());
 
   // TODO(Triang3l): Tessellation.
   bool primitive_polygonal = draw_util::IsPrimitivePolygonal(regs);
@@ -1558,14 +1554,24 @@ bool VulkanPipelineCache::ArePipelineRequirementsMet(
     return false;
   }
 
+  SpirvShaderTranslator::Modification vertex_shader_modification(
+      description.vertex_shader_modification);
   VkShaderStageFlags vertex_shader_stage =
       Shader::IsHostVertexShaderTypeDomain(
-          SpirvShaderTranslator::Modification(
-              description.vertex_shader_modification)
-              .vertex.host_vertex_shader_type)
+          vertex_shader_modification.vertex.host_vertex_shader_type)
           ? VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT
           : VK_SHADER_STAGE_VERTEX_BIT;
   if (!(guest_shader_vertex_stages_ & vertex_shader_stage)) {
+    return false;
+  }
+
+  // Clip and cull distances from the raw position, possibly in pipeline
+  // storage from another device.
+  if (((vertex_shader_modification.vertex.z_clip_distances ||
+        vertex_shader_modification.vertex.guard_band_clip_distances) &&
+       !raw_clipping_supported()) ||
+      (vertex_shader_modification.vertex.discard_band_cull_distances &&
+       !cull_distances_supported())) {
     return false;
   }
 
@@ -1629,13 +1635,12 @@ VkShaderModule VulkanPipelineCache::GetGeometryShader(GeometryShaderKey key) {
     return it->second;
   }
 
-  // When user clip planes are present, the max count is used to reduce
-  // variants.
   std::vector<unsigned int> shader_code =
       BuildGuestPrimitiveGeometryShaderSpirv(
           BuiltinGeometryShaderType(uint32_t(key.type)), key.interpolator_count,
-          key.user_clip_plane_count > 0 ? 6u : 0u,
-          bool(key.user_clip_plane_cull), bool(key.has_vertex_kill_and),
+          key.user_clip_plane_count, bool(key.user_clip_plane_cull),
+          bool(key.z_clip_distances), bool(key.guard_band_clip_distances),
+          bool(key.discard_band_cull_distances), bool(key.has_vertex_kill_and),
           bool(key.has_point_size), bool(key.has_point_coordinates),
           spirv_version_, denorm_flush_to_zero_float32_,
           signed_zero_inf_nan_preserve_float32_, rounding_mode_rte_float32_);

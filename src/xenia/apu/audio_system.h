@@ -26,8 +26,6 @@
 namespace xe {
 namespace apu {
 
-constexpr fourcc_t kAudioSaveSignature = make_fourcc("XAUD");
-
 class AudioDriver;
 class XmaDecoder;
 
@@ -73,6 +71,15 @@ class AudioSystem {
     virtual void Pump(cpu::ThreadState* thread_state) = 0;
   };
 
+  // Voice category volumes titles scale their voices by. Setting one marks
+  // its category changed for every client. False for a category out of range.
+  static constexpr uint32_t kVoiceCategoryCount = 32;
+  bool SetVoiceCategoryVolume(uint32_t category, float volume);
+  bool GetVoiceCategoryVolume(uint32_t category, float* out_volume);
+  // The categories set since client |index| last asked, which this clears.
+  // False for an index out of range.
+  bool TakeVoiceCategoryChangeMask(size_t index, uint32_t* out_mask);
+
   X_STATUS RegisterClient(uint32_t callback, uint32_t callback_arg,
                           size_t* out_index);
   X_STATUS RegisterHostClient(HostClient* client, size_t* out_index);
@@ -103,13 +110,6 @@ class AudioSystem {
   virtual AudioDriver* CreateDriver(xe::threading::Semaphore* semaphore,
                                     uint32_t frequency, uint32_t channels,
                                     bool need_format_conversion) = 0;
-
-  bool Save(ByteStream* stream);
-  bool Restore(ByteStream* stream);
-
-  bool is_paused() const { return paused_; }
-  void Pause();
-  void Resume();
 
  protected:
   explicit AudioSystem(cpu::Processor* processor);
@@ -146,6 +146,8 @@ class AudioSystem {
     bool in_use = false;
     // Wall-clock deadline for this client's next pump.
     uint64_t next_pump_us = 0;
+    // Every category counts as changed for a new client.
+    uint32_t voice_category_change_mask = 0;
     std::atomic<uint32_t> frames_submitted{0};
     std::atomic<uint32_t> frames_processed{0};
     std::atomic<uint32_t> frames_dropped{0};
@@ -156,6 +158,8 @@ class AudioSystem {
     bool has_last_frame = false;
   };
   ClientSlot clients_[kMaximumClientCount];
+  // Guarded by clients_mutex_.
+  float voice_category_volumes_[kVoiceCategoryCount];
 
   int FindFreeClient();
   X_STATUS AddClient(uint32_t callback, uint32_t callback_arg,
@@ -164,12 +168,8 @@ class AudioSystem {
 
   std::unique_ptr<xe::threading::Semaphore>
       client_semaphores_[kMaximumClientCount];
-  // Wakes the worker to re-scan clients on register, shutdown, and pause.
+  // Wakes the worker to re-scan clients on register and shutdown.
   std::unique_ptr<xe::threading::Event> pending_work_event_;
-
-  bool paused_ = false;
-  threading::Fence pause_fence_;
-  std::unique_ptr<threading::Event> resume_event_;
 };
 
 }  // namespace apu

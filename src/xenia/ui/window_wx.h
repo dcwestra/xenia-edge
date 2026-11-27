@@ -10,6 +10,7 @@
 #ifndef XENIA_UI_WINDOW_WX_H_
 #define XENIA_UI_WINDOW_WX_H_
 
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -156,14 +157,7 @@ class WxWindow : public Window {
 #endif
 
 #if XE_PLATFORM_LINUX
-  // The glib idle source of a pending RequestPaintImpl, 0 if none. The
-  // presenter requests paints from the guest output thread too, so it's only
-  // accessed under the mutex: unguarded, the UI thread could run and clear the
-  // source between g_idle_add_full returning and its id being stored, leaving
-  // a stale id that made every later request return without painting - the
-  // picture froze while the game kept running.
-  std::mutex pending_paint_mutex_;
-  unsigned int pending_paint_source_ = 0;
+  std::atomic<bool> paint_idle_pending_{false};
   GtkSurfaceFactory gtk_surface_factory_;
 #endif
 };

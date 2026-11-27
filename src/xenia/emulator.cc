@@ -24,7 +24,6 @@
 #include "third_party/fmt/include/fmt/format.h"
 #include "xenia/apu/audio_system.h"
 #include "xenia/base/assert.h"
-#include "xenia/base/byte_stream.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/debugging.h"
@@ -164,14 +163,7 @@ DEFINE_string(gpu, "vulkan", "Graphics system. Use: " GPU_OPTIONS, "GPU");
 #endif
 
 DECLARE_bool(allow_plugins);
-
-DEFINE_bool(mount_scratch, false, "Enable scratch mount", "Storage");
-
-DEFINE_bool(mount_cache, true, "Enable cache mount", "Storage");
-UPDATE_from_bool(mount_cache, 2024, 8, 31, 20, false);
-
-DEFINE_bool(mount_memory_unit, false, "Enable memory unit (MU) mount",
-            "Storage");
+DECLARE_bool(in_process_title_relaunch);
 
 DEFINE_path(xefu_path, "",
             "Folder with XeFu, the Xbox 360's original Xbox emulator: xbox.xex "
@@ -189,7 +181,7 @@ DEFINE_string(xefu_launcher, "xbox.xex",
               "game.",
               "General");
 
-DECLARE_bool(force_mount_devkit);
+DEFINE_bool(force_mount_devkit, false, "Force devkit mount", "Storage");
 
 DEFINE_int32(priority_class, 0,
              "Forces Xenia to use different process priority than default one. "
@@ -226,10 +218,7 @@ Emulator::Emulator(const std::filesystem::path& command_line,
       kernel_state_(),
       main_thread_(),
       title_id_(std::nullopt),
-      game_info_database_(),
-      paused_(false),
-      restoring_(false),
-      restore_fence_() {
+      game_info_database_() {
   if (cvars::priority_class != 0) {
     if (SetProcessPriorityClass(cvars::priority_class)) {
       XELOGI("Higher priority class request: Successful. New priority: {}",
@@ -241,7 +230,9 @@ Emulator::Emulator(const std::filesystem::path& command_line,
   // Show a disclaimer that links to the quickstart
   // guide the first time they ever open the emulator
   uint64_t persistent_flags = GetPersistentEmulatorFlags();
-  if (!(persistent_flags & EmulatorFlagDisclaimerAcknowledged)) {
+  // Unattended, it waits for a later run with someone there to read it.
+  if (!(persistent_flags & EmulatorFlagDisclaimerAcknowledged) &&
+      !xe::IsUnattended()) {
     if ((MessageBoxW(
              nullptr,
              L"DISCLAIMER: Xenia is not for enabling illegal activity, and "
@@ -309,7 +300,6 @@ void Emulator::Shutdown() {
   title_name_.clear();
   title_version_.clear();
   game_info_database_.reset();
-  paused_ = false;
   boot_animation_requested_ = false;
 
   XELOGI("Emulator::Shutdown: teardown complete");
@@ -354,10 +344,6 @@ X_STATUS Emulator::Setup(
   Clock::SetGuestSystemTime(Clock::QueryHostSystemTime());
   // This can be adjusted dynamically, as well.
   Clock::set_guest_time_scalar(cvars::time_scalar);
-
-  // Before we can set thread affinity we must enable the process to use all
-  // logical processors.
-  xe::threading::EnableAffinityConfiguration();
 
   XELOGI("{}: Initializing Memory...", __func__);
   // Create memory system first, as it is required for other systems.
@@ -421,6 +407,10 @@ X_STATUS Emulator::Setup(
     if (const X_STATUS result = input_system_->Setup(); result) {
       return result;
     }
+  }
+
+  if (!host_media_session_) {
+    host_media_session_ = apu::HostMediaSession::Create();
   }
 
   // Add inputSystem to UI (if imgui is enabled)
@@ -503,7 +493,7 @@ X_STATUS Emulator::SetupSubsystems() {
       return result;
     }
     audio_media_player_ = std::make_unique<apu::AudioMediaPlayer>(
-        audio_system_.get(), kernel_state_.get());
+        audio_system_.get(), kernel_state_.get(), host_media_session_.get());
     audio_media_player_->Setup();
   }
 
@@ -1539,8 +1529,8 @@ X_STATUS Emulator::InstallContentPackage(
 
   vfs::VirtualFileSystem::ExtractContentHeader(device.get(), header_path);
 
-  // Lambda to handle cleanup - defined once, used in both cancellation paths
-  auto cleanup_and_fail = [&]() {
+  // Removes the partial install and reports the failure.
+  auto cleanup_and_fail = [&](X_STATUS result, std::string_view message) {
     std::error_code ec;
     bool cleanup_failed = false;
 
@@ -1560,16 +1550,16 @@ X_STATUS Emulator::InstallContentPackage(
 
     // Set state AFTER cleanup is done, so dialog doesn't pop up prematurely
     std::lock_guard<std::mutex> lock(*installation_info.mutex_);
-    installation_info.installation_result_ = X_ERROR_CANCELLED;
+    installation_info.installation_result_ = result;
     installation_info.installation_error_message_ =
-        cleanup_failed ? "Installation cancelled (cleanup failed)"
-                       : "Installation cancelled";
+        cleanup_failed ? fmt::format("{} (cleanup failed)", message)
+                       : std::string(message);
     installation_info.installation_state_ = InstallState::failed;
   };
 
   // Check for cancellation before extracting files
   if (installation_info.cancelled_.load()) {
-    cleanup_and_fail();
+    cleanup_and_fail(X_ERROR_CANCELLED, "Installation cancelled");
     return X_ERROR_CANCELLED;
   }
 
@@ -1580,13 +1570,15 @@ X_STATUS Emulator::InstallContentPackage(
 
   // Check for cancellation after extraction
   if (installation_info.cancelled_.load() || error_code == X_ERROR_CANCELLED) {
-    cleanup_and_fail();
+    cleanup_and_fail(X_ERROR_CANCELLED, "Installation cancelled");
     return X_ERROR_CANCELLED;
   }
 
+  // A partial install can't be used.
   if (error_code != X_ERROR_SUCCESS) {
-    std::lock_guard<std::mutex> lock(*installation_info.mutex_);
-    installation_info.installation_state_ = InstallState::failed;
+    cleanup_and_fail(error_code, error_code == X_STATUS_END_OF_FILE
+                                     ? "Package is damaged!"
+                                     : "Failed to extract package!");
     return error_code;
   }
 
@@ -1603,164 +1595,6 @@ X_STATUS Emulator::InstallContentPackage(
   }
 
   return error_code;
-}
-
-void Emulator::Pause() {
-  if (paused_) {
-    return;
-  }
-  paused_ = true;
-
-  // Don't hold the lock on this (so any waits follow through)
-  graphics_system_->Pause();
-  audio_system_->Pause();
-
-  auto lock = global_critical_region::AcquireDirect();
-  auto threads =
-      kernel_state()->object_table()->GetObjectsByType<kernel::XThread>(
-          kernel::XObject::Type::Thread);
-  auto current_thread = kernel::XThread::IsInThread()
-                            ? kernel::XThread::GetCurrentThread()
-                            : nullptr;
-  for (auto thread : threads) {
-    // Don't pause ourself or host threads.
-    if (thread == current_thread || !thread->can_debugger_suspend()) {
-      continue;
-    }
-
-    if (thread->is_running()) {
-      thread->thread()->Suspend(nullptr);
-    }
-  }
-
-  XELOGD("! EMULATOR PAUSED !");
-}
-
-void Emulator::Resume() {
-  if (!paused_) {
-    return;
-  }
-  paused_ = false;
-  XELOGD("! EMULATOR RESUMED !");
-
-  graphics_system_->Resume();
-  audio_system_->Resume();
-
-  auto threads =
-      kernel_state()->object_table()->GetObjectsByType<kernel::XThread>(
-          kernel::XObject::Type::Thread);
-  for (auto thread : threads) {
-    if (!thread->can_debugger_suspend()) {
-      // Don't pause host threads.
-      continue;
-    }
-
-    if (!thread->is_running()) {
-      thread->thread()->Resume(nullptr);
-    }
-  }
-}
-
-bool Emulator::SaveToFile(const std::filesystem::path& path) {
-  Pause();
-
-  filesystem::CreateEmptyFile(path);
-  auto map = MappedMemory::Open(path, MappedMemory::Mode::kReadWrite, 0, 2_GiB);
-  if (!map) {
-    return false;
-  }
-
-  // Save the emulator state to a file
-  ByteStream stream(map->data(), map->size());
-  stream.Write(kEmulatorSaveSignature);
-  stream.Write(title_id_.has_value());
-  if (title_id_.has_value()) {
-    stream.Write(title_id_.value());
-  }
-
-  // It's important we don't hold the global lock here! XThreads need to step
-  // forward (possibly through guarded regions) without worry!
-  processor_->Save(&stream);
-  graphics_system_->Save(&stream);
-  audio_system_->Save(&stream);
-  kernel_state_->Save(&stream);
-  memory_->Save(&stream);
-  map->Close(stream.offset());
-
-  Resume();
-  return true;
-}
-
-bool Emulator::RestoreFromFile(const std::filesystem::path& path) {
-  // Restore the emulator state from a file
-  auto map = MappedMemory::Open(path, MappedMemory::Mode::kReadWrite);
-  if (!map) {
-    return false;
-  }
-
-  restoring_ = true;
-
-  // Terminate any loaded titles.
-  Pause();
-  kernel_state_->TerminateTitle();
-
-  auto lock = global_critical_region::AcquireDirect();
-  ByteStream stream(map->data(), map->size());
-  if (stream.Read<uint32_t>() != kEmulatorSaveSignature) {
-    return false;
-  }
-
-  auto has_title_id = stream.Read<bool>();
-  std::optional<uint32_t> title_id;
-  if (!has_title_id) {
-    title_id = {};
-  } else {
-    title_id = stream.Read<uint32_t>();
-  }
-  if (title_id_.has_value() != title_id.has_value() ||
-      title_id_.value() != title_id.value()) {
-    // Swapping between titles is unsupported at the moment.
-    assert_always();
-    return false;
-  }
-
-  if (!processor_->Restore(&stream)) {
-    XELOGE("Could not restore processor!");
-    return false;
-  }
-  if (!graphics_system_->Restore(&stream)) {
-    XELOGE("Could not restore graphics system!");
-    return false;
-  }
-  if (!audio_system_->Restore(&stream)) {
-    XELOGE("Could not restore audio system!");
-    return false;
-  }
-  if (!kernel_state_->Restore(&stream)) {
-    XELOGE("Could not restore kernel state!");
-    return false;
-  }
-  if (!memory_->Restore(&stream)) {
-    XELOGE("Could not restore memory!");
-    return false;
-  }
-
-  // Update the main thread.
-  auto threads =
-      kernel_state_->object_table()->GetObjectsByType<kernel::XThread>();
-  for (auto thread : threads) {
-    if (thread->main_thread()) {
-      main_thread_ = thread;
-      break;
-    }
-  }
-
-  Resume();
-
-  restore_fence_.Signal();
-  restoring_ = false;
-
-  return true;
 }
 
 void Emulator::RelaunchTitle(const std::string& host_path,
@@ -1883,6 +1717,10 @@ void Emulator::RelaunchTitle(const std::string& host_path,
   XELOGI("RelaunchTitle: relaunch complete");
 }
 
+bool Emulator::CanRelaunchInProcess() {
+  return cvars::in_process_title_relaunch;
+}
+
 void Emulator::ResetTitle() {
   // Drops relaunches requested before the reset.
   ++relaunch_requests_;
@@ -1938,89 +1776,42 @@ void Emulator::ResetTitle() {
 }
 
 void Emulator::MountStandardDrives() {
-  auto fs = file_system_.get();
-
-  if (cvars::mount_scratch) {
-    auto scratch_device = std::make_unique<xe::vfs::HostPathDevice>(
-        "\\SCRATCH", storage_root_ / "scratch", false);
-    if (!scratch_device->Initialize()) {
-      XELOGE("Unable to scan scratch path");
-    } else {
-      if (!fs->RegisterDevice(std::move(scratch_device))) {
-        XELOGE("Unable to register scratch path");
-      } else {
-        fs->RegisterSymbolicLink("scratch:", "\\SCRATCH");
-      }
-    }
-  }
-
-  if (cvars::mount_cache) {
-    auto cache0_device = std::make_unique<xe::vfs::HostPathDevice>(
-        "\\CACHE0", storage_root_ / "cache0", false);
-    if (!cache0_device->Initialize()) {
-      XELOGE("Unable to scan cache0 path");
-    } else {
-      if (!fs->RegisterDevice(std::move(cache0_device))) {
-        XELOGE("Unable to register cache0 path");
-      } else {
-        fs->RegisterSymbolicLink("cache0:", "\\CACHE0");
-      }
-    }
-
-    auto cache1_device = std::make_unique<xe::vfs::HostPathDevice>(
-        "\\CACHE1", storage_root_ / "cache1", false);
-    if (!cache1_device->Initialize()) {
-      XELOGE("Unable to scan cache1 path");
-    } else {
-      if (!fs->RegisterDevice(std::move(cache1_device))) {
-        XELOGE("Unable to register cache1 path");
-      } else {
-        fs->RegisterSymbolicLink("cache1:", "\\CACHE1");
-      }
-    }
-
-    // Some (older?) games try accessing cache:\ too
-    auto cache_device = std::make_unique<xe::vfs::HostPathDevice>(
-        "\\CACHE", storage_root_ / "cache", false);
-    if (!cache_device->Initialize()) {
-      XELOGE("Unable to scan cache path");
-    } else {
-      if (!fs->RegisterDevice(std::move(cache_device))) {
-        XELOGE("Unable to register cache path");
-      } else {
-        fs->RegisterSymbolicLink("cache:", "\\CACHE");
-      }
-    }
-  }
-
-  if (cvars::mount_memory_unit) {
-    auto mu_device = std::make_unique<xe::vfs::HostPathDevice>(
-        "\\MU", storage_root_ / "mu", false);
-    if (!mu_device->Initialize()) {
-      XELOGE("Unable to scan MU path");
-    } else {
-      if (!fs->RegisterDevice(std::move(mu_device))) {
-        XELOGE("Unable to register MU path");
-      } else {
-        fs->RegisterSymbolicLink("MU:", "\\MU");
-      }
-    }
-  }
-
   if (cvars::force_mount_devkit) {
-    auto devkit_device =
-        std::make_unique<xe::vfs::HostPathDevice>("\\DEVKIT", "devkit", false);
+    MountDevkitDrive();
+  }
+}
 
-    if (!devkit_device->Initialize()) {
-      XELOGE("Unable to scan devkit path");
+bool Emulator::MountDevkitDrive() {
+  if (file_system_->GetDevice("\\DEVKIT")) {
+    return true;
+  }
+  auto devkit_device = std::make_unique<vfs::HostPathDevice>(
+      "\\DEVKIT", storage_root_ / "devkit", false);
+  if (!devkit_device->Initialize()) {
+    XELOGE("Unable to scan devkit path");
+    return false;
+  }
+  file_system_->RegisterDevice(std::move(devkit_device));
+  file_system_->RegisterSymbolicLink("DEVKIT:", "\\DEVKIT");
+  file_system_->RegisterSymbolicLink("e:", "\\DEVKIT");
+  return true;
+}
+
+void Emulator::EmptyTitleCache() {
+  auto global_lock = global_critical_region::AcquireDirect();
+  vfs::Entry* root = file_system_->ResolvePath("\\CACHE");
+  if (!root) {
+    return;
+  }
+  std::vector<vfs::Entry*> children;
+  for (const auto& child : root->children()) {
+    children.push_back(child.get());
+  }
+  // Entries the title still has open stay.
+  for (vfs::Entry* child : children) {
+    if (!root->Delete(child)) {
+      XELOGW("Unable to delete cache:\\{} on format", child->name());
     }
-
-    if (!fs->RegisterDevice(std::move(devkit_device))) {
-      XELOGE("Unable to register devkit path");
-    }
-
-    fs->RegisterSymbolicLink("DEVKIT:", "\\DEVKIT");
-    fs->RegisterSymbolicLink("e:", "\\DEVKIT");
   }
 }
 
@@ -2238,7 +2029,6 @@ void Emulator::HaltCrashedGuestThread(uint32_t pc, std::string_view fault) {
   if (thread->fiber()) {
     HaltCrashedFiberThunk();
   }
-  thread->Suspend(nullptr);
   while (true) {
     xe::threading::NanoSleep(int64_t(1'000'000'000));
   }
@@ -2289,7 +2079,10 @@ bool Emulator::ExceptionCallback(Exception* ex) {
   // their faults are expected, so park them instead of crashing. The teardown
   // thread isn't a guest thread, so its own faults still surface.
   if (relaunching_ && kernel::XThread::IsInThread()) {
-    DivertToThunk(ex, &HaltDuringRelaunchThunk);
+    // A sleeping fiber would hold the dispatch thread the shutdown joins.
+    DivertToThunk(ex, kernel::XThread::GetCurrentFiberThread()
+                          ? &HaltCrashedFiberThunk
+                          : &HaltDuringRelaunchThunk);
     return true;
   }
 
@@ -2298,21 +2091,16 @@ bool Emulator::ExceptionCallback(Exception* ex) {
   auto code_base = code_cache->execute_base_address();
   auto code_end = code_base + code_cache->total_size();
 
-  if (!processor()->is_debugger_attached() && debugging::IsDebuggerAttached()) {
-    // If Xenia's debugger isn't attached but another one is, pass it to that
-    // debugger.
+  if (debugging::IsDebuggerAttached()) {
+    // Pass it to the attached host debugger.
     return false;
-  } else if (processor()->is_debugger_attached()) {
-    // Let the debugger handle this exception. It may decide to continue past
-    // it (if it was a stepping breakpoint, etc).
-    return processor()->OnUnhandledException(ex);
   }
 
   if (!(ex->pc() >= code_base && ex->pc() < code_end)) {
-    // Not in JIT'd guest code. In host-thread mode let the OS default handler
-    // deal with it. In fiber mode the faulting thread is the shared dispatch
-    // loop, so if a fiber is current halt just that fiber to keep the
-    // dispatcher and the other fibers alive.
+    // Not in JIT'd guest code. On a host-routine thread let the OS default
+    // handler deal with it. On a fiber the faulting thread is the shared
+    // dispatch loop, so halt just that fiber to keep the dispatcher and the
+    // other fibers alive.
     if (auto* fiber_self = kernel::XThread::GetCurrentFiberThread()) {
       // ASLR moves the absolute PC each run, so log a stable module offset that
       // resolves against the pdb with "ln xenia_edge+<offset>".
@@ -2378,6 +2166,9 @@ bool Emulator::ExceptionCallback(Exception* ex) {
           fiber_self->handle(), fiber_self->thread_id(), code_name,
           fault_detail, ex->pc(), module_offset, guest_lr, host_sp,
           host_sp % 16);
+      if (xe::IsUnattended()) {
+        ExitUnattended(EXIT_FAILURE, "host crash on a guest thread");
+      }
       DivertToThunk(ex, &HaltCrashedFiberThunk);
       return true;
     }
@@ -2435,9 +2226,10 @@ bool Emulator::ExceptionCallback(Exception* ex) {
   }
   ReportGuestCrash(FormatGuestCrashDump(current_thread, pc, fault));
 
-  // Halt the crashed thread without unwinding the rest of the emulator. Host
-  // mode suspends self. Fiber mode diverts the resume PC to a halt thunk, since
-  // calling Suspend here would yield from inside the exception handler.
+  // Halt the crashed thread without unwinding the rest of the emulator. A
+  // host-routine thread suspends itself. A fiber diverts the resume PC to a
+  // halt thunk, since calling Suspend here would yield from inside the
+  // exception handler.
   if (current_thread->fiber()) {
     DivertToThunk(ex, &HaltCrashedFiberThunk);
     return true;
@@ -2451,19 +2243,13 @@ bool Emulator::ExceptionCallback(Exception* ex) {
 
 void Emulator::ReportGuestCrash(const std::string& crash_msg) {
   XELOGE("{}", crash_msg);
+  if (xe::IsUnattended()) {
+    ExitUnattended(EXIT_FAILURE, "title crashed");
+  }
   FlushLog();
 
-  // Only pause the entire emulator if debugging is enabled. After the dump,
-  // since Pause() can block (e.g. waiting on the GPU/audio systems).
-  if (cvars::debug) {
-    Pause();
-  }
-
-  std::string crash_dlg = fmt::format(
-      "The guest has crashed.\n\n"
-      "Xenia has now paused itself.\n\n"
-      "{}",
-      crash_msg);
+  std::string crash_dlg =
+      fmt::format("The guest has crashed.\n\n{}", crash_msg);
   // Display a dialog telling the user the guest has crashed.
   if (display_window_ && imgui_drawer_) {
     display_window_->app_context().CallInUIThreadSynchronous([this,
@@ -2478,19 +2264,17 @@ void Emulator::WaitUntilExit() {
     if (main_thread_) {
       // Use wait_handle() rather than thread(): a fiber-backed main thread has
       // no host thread, only an exit event.
-      xe::threading::Wait(main_thread_->wait_handle(), false);
+      xe::threading::Wait(main_thread_->wait_handle());
     }
 
-    if (restoring_) {
-      restore_fence_.Wait();
-    } else if (relaunching_) {
+    if (relaunching_) {
       // RelaunchTitle is running on another thread - wait for it to finish
       // and set the new main_thread_, then loop back to wait on it.
       while (relaunching_) {
         xe::threading::Sleep(std::chrono::milliseconds(10));
       }
     } else {
-      // Not restoring/relaunching and the thread exited. We're finished.
+      // Not relaunching and the thread exited. We're finished.
       break;
     }
   }
@@ -2578,6 +2362,8 @@ static std::string format_version(xex2_version version) {
 X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
                                   const std::string_view module_path) {
   const bool boot_animation = std::exchange(boot_animation_requested_, false);
+  // Before any of the launch's modules load.
+  processor_->BeginVscrSatCensus();
   // The window icon and on_launch listeners need the UI thread.
   X_STATUS result = X_STATUS_UNSUCCESSFUL;
   display_window_->app_context().CallInUIThreadSynchronous(
@@ -2590,6 +2376,9 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
 
   // Off the UI thread and after plugins, which patch code in place.
   auto module = kernel_state_->GetExecutableModule();
+  kernel_state_->xam_state()->dash_mouse()->Attach(module->xex_module());
+  processor_->FinishVscrSatCensus(!module->xex_module() ||
+                                  module->xex_module()->ReadsVscr());
   if (module->xex_module()) {
     module->xex_module()->PrecompileDiscoveredFunctions();
     module->xex_module()->PrecompileStaticInitializers();
@@ -2600,7 +2389,7 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
     PrepareSystemTitle();
   }
 
-  // Drops only the launch suspend, so a debugger break still holds.
+  // Drops the launch suspend.
   if (!boot_animation || !PlayBootAnimation()) {
     main_thread_->Resume();
   }
@@ -2783,7 +2572,9 @@ X_STATUS Emulator::PrepareLaunch(const std::filesystem::path& path,
                      std::string("\\Cache1")};
   auto null_device =
       std::make_unique<vfs::NullDevice>("\\Device\\Harddisk0", null_paths);
+  vfs::NullDevice* raw_partitions = nullptr;
   if (null_device->Initialize()) {
+    raw_partitions = null_device.get();
     file_system_->RegisterDevice(std::move(null_device));
   }
 
@@ -2807,14 +2598,25 @@ X_STATUS Emulator::PrepareLaunch(const std::filesystem::path& path,
     return X_STATUS_NOT_SUPPORTED;
   }
 
-  X_RESULT result = kernel_state_->ApplyTitleUpdate(module);
-  if (XFAILED(result)) {
-    XELOGE("Failed to apply title update! Cannot run module {}",
+  // A patch that fails part way leaves the module unusable so it's loaded
+  // again and runs without the update.
+  if (XFAILED(kernel_state_->ApplyTitleUpdate(module))) {
+    XELOGE("Failed to apply title update, starting {} without it",
            xe::strip_pii(xe::path_to_utf8(path)));
-    return result;
+    kernel_state_->UnloadUserModule(module, false);
+    kernel_state_->content_manager()->CloseContent("UPDATE");
+    // Its image is freed with its last reference, which has to go before the
+    // reload maps the image at the same address.
+    module = nullptr;
+    module = kernel_state_->LoadUserModule(module_path);
+    if (!module) {
+      XELOGE("Failed to load user module {}",
+             xe::strip_pii(xe::path_to_utf8(path)));
+      return X_STATUS_NOT_FOUND;
+    }
   }
 
-  result = kernel_state_->FinishLoadingUserModule(module);
+  X_RESULT result = kernel_state_->FinishLoadingUserModule(module);
   if (XFAILED(result)) {
     XELOGE("Failed to initialize user module {}",
            xe::strip_pii(xe::path_to_utf8(path)));
@@ -2857,6 +2659,29 @@ X_STATUS Emulator::PrepareLaunch(const std::filesystem::path& path,
     if (title_version.value != 0) {
       title_version_ = format_version(title_version);
     }
+  }
+
+  // XMountUtilityDrive creates \Device\cacheN on Harddisk0\CacheN and links
+  // cache: to it. Each game XeFu runs gets its own folder.
+  const uint32_t cache_title_id = game_config_title_id();
+  const auto cache_name =
+      fmt::format("{:08X}", cache_title_id ? cache_title_id : *title_id_);
+  const auto cache_root = storage_root_ / "cache";
+  auto cache_device = std::make_unique<vfs::HostPathDevice>(
+      "\\CACHE", cache_root / cache_name, false);
+  if (cache_device->Initialize()) {
+    file_system_->RegisterDevice(std::move(cache_device));
+    file_system_->RegisterSymbolicLink("\\Device\\cache0", "\\CACHE");
+    file_system_->RegisterSymbolicLink("\\Device\\cache1", "\\CACHE");
+  } else {
+    XELOGE("Unable to scan the title's cache path");
+  }
+  // The cache table and cluster sizes sit beside the folder, as content
+  // package headers do.
+  if (raw_partitions) {
+    raw_partitions->LoadCacheHeader(cache_root / "Headers" /
+                                    (cache_name + ".header"));
+    raw_partitions->set_cache_format_handler([this]() { EmptyTitleCache(); });
   }
 
   if (title_id_ == kXeFuTitleId) {

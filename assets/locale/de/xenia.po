@@ -1830,3 +1830,138 @@ msgstr "Spiele, deren Cover nicht heruntergeladen werden konnte: %d"
 #: src/xenia/app/emulator_window.cc:2427
 msgid "Covers that couldn't be saved: %d"
 msgstr "Cover, die nicht gespeichert werden konnten: %d"
+
+#: src/xenia/app/emulator_window.cc:524
+msgid "M PLUS 1p by Coji Morishita"
+msgstr "M PLUS 1p von Coji Morishita"
+
+#: src/xenia/app/emulator_window.cc:530
+msgid "Noto Sans TC by Adobe"
+msgstr "Noto Sans TC von Adobe"
+
+#: src/xenia/app/emulator_window.cc:527
+msgid "Pretendard by Kil Hyung-jin"
+msgstr "Pretendard von Kil Hyung-jin"
+
+#: src/xenia/app/emulator_window.cc:526
+#: src/xenia/app/emulator_window.cc:529
+msgid "System font: %s (SIL Open Font License 1.1)"
+msgstr "Systemschriftart: %s (SIL Open Font License 1.1)"
+
+#: src/xenia/ui/title_update_dialog_wx.cc:110
+msgid "%s doesn't fit this release of the game."
+msgstr "%s passt nicht zu dieser Fassung des Spiels."
+
+#: src/xenia/ui/title_update_dialog_wx.cc:65
+msgid "%s has no newer title update for this release of %s."
+msgstr "%s hat kein neueres Titel-Update für diese Fassung von %s."
+
+#: src/xenia/ui/title_update_dialog_wx.cc:108
+msgid "%s is damaged."
+msgstr "%s ist beschädigt."
+
+#: src/xenia/ui/title_update_dialog_wx.cc:350
+msgid "%s is not a title update package."
+msgstr "%s ist kein Titel-Update-Paket."
+
+#: src/xenia/ui/title_update_dialog_wx.cc:206
+msgid "&Close"
+msgstr "&Schließen"
+
+#: src/xenia/ui/title_update_dialog_wx.cc:206
+msgid "&Not Now"
+msgstr "&Nicht jetzt"
+
+#: src/xenia/ui/title_update_dialog_wx.cc:308
+#: src/xenia/ui/title_update_dialog_wx.cc:435
+msgid "Checking the title update..."
+msgstr "Titel-Update wird geprüft…"
+
+#: src/xenia/ui/title_update_dialog_wx.cc:218
+msgid "Checking xboxunity.net..."
+msgstr "xboxunity.net wird abgefragt…"
+
+#: src/xenia/ui/title_update_dialog_wx.cc:364
+msgid "Copying the title update..."
+msgstr "Titel-Update wird kopiert…"
+
+#: src/xenia/ui/title_update_dialog_wx.cc:201
+msgid "Don't ask again for this game"
+msgstr "Für dieses Spiel nicht mehr fragen"
+
+#: src/xenia/ui/title_update_dialog_wx.cc:276
+msgid "Downloading the title update..."
+msgstr "Titel-Update wird heruntergeladen…"
+
+#: src/xenia/ui/title_update_dialog_wx.cc:193
+msgid "Install from File..."
+msgstr "Aus Datei installieren…"
+
+#: src/xenia/ui/quick_settings_dialog_wx.cc:338
+msgid "Offer Title Updates:"
+msgstr "Titel-Updates anbieten:"
+
+#: src/xenia/ui/title_update_dialog_wx.cc:338
+msgid "Select a title update package"
+msgstr "Titel-Update-Paket auswählen"
+
+#: src/xenia/ui/title_update_dialog_wx.cc:311
+msgid "The downloaded title update is damaged."
+msgstr "Das heruntergeladene Titel-Update ist beschädigt."
+
+#: src/xenia/ui/title_update_dialog_wx.cc:304
+msgid "The downloaded title update isn't the one this game needs."
+msgstr "Das heruntergeladene Titel-Update ist nicht das für dieses Spiel benötigte."
+
+#: src/xenia/ui/title_update_dialog_wx.cc:320
+msgid "The title update couldn't be downloaded."
+msgstr "Das Titel-Update konnte nicht heruntergeladen werden."
+
+#: src/xenia/ui/title_update_dialog_wx.cc:323
+#: src/xenia/ui/title_update_dialog_wx.cc:403
+msgid "The title update couldn't be saved."
+msgstr "Das Titel-Update konnte nicht gespeichert werden."
+
+#: src/xenia/ui/title_update_dialog_wx.cc:94
+#: src/xenia/ui/title_update_dialog_wx.cc:156
+#: src/xenia/ui/title_update_dialog_wx.cc:218
+#: src/xenia/ui/title_update_dialog_wx.cc:275
+#: src/xenia/ui/title_update_dialog_wx.cc:410
+msgid "Title Update"
+msgstr "Titel-Update"
+
+#: src/xenia/ui/title_update_dialog_wx.cc:246
+msgid "xboxunity.net couldn't be reached."
+msgstr "xboxunity.net konnte nicht erreicht werden."
+
+#: src/xenia/ui/title_update_dialog_wx.cc:240
+msgid "xboxunity.net's answer couldn't be read."
+msgstr "Die Antwort von xboxunity.net konnte nicht gelesen werden."
+
+#: src/xenia/ui/title_update_dialog_wx.cc:243
+msgid "xboxunity.net's answer couldn't be saved."
+msgstr "Die Antwort von xboxunity.net konnte nicht gespeichert werden."
+
+#: src/xenia/ui/title_update_dialog_wx.cc:54
+msgid "Title update %u for %s is available (%s)."
+msgstr "Titel-Update %u für %s ist verfügbar (%s)."
+
+#: src/xenia/ui/title_update_dialog_wx.cc:56
+msgid "A title update for %s is available (%s)."
+msgstr "Ein Titel-Update für %s ist verfügbar (%s)."
+
+#: src/xenia/ui/title_update_dialog_wx.cc:170
+msgid "A title update may be available for %s."
+msgstr "Für %s ist möglicherweise ein Titel-Update verfügbar."
+
+#: src/xenia/ui/title_update_dialog_wx.cc:173
+msgid "No newer title update is known for this release of %s."
+msgstr "Für diese Fassung von %s ist kein neueres Titel-Update bekannt."
+
+#: src/xenia/ui/title_update_dialog_wx.cc:182
+msgid "Check for Updates"
+msgstr "Nach Updates suchen"
+
+#: src/xenia/ui/title_update_dialog_wx.cc:253
+msgid "Download"
+msgstr "Herunterladen"

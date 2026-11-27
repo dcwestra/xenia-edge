@@ -17,6 +17,7 @@
 #include "xenia/cpu/backend/a64/a64_seq_util.h"
 #include "xenia/cpu/backend/a64/a64_stack_layout.h"
 #include "xenia/cpu/hir/instr.h"
+#include "xenia/cpu/ppc/ppc_context.h"
 
 namespace xe {
 namespace cpu {
@@ -749,6 +750,110 @@ struct VECTOR_SHR_V128
 EMITTER_OPCODE_TABLE(OPCODE_VECTOR_SHR, VECTOR_SHR_V128);
 
 // ============================================================================
+// OPCODE_VECTOR_SHL_BITS, OPCODE_VECTOR_SHR_BITS
+// ============================================================================
+// The whole vector shifted by count bits, for counts that agree: each word's
+// own shift ORed with the bits of the word next to it, as the guest bytes of a
+// word run from most to least significant.
+static void EmitShiftBitsUniform(A64Emitter& e, int d, int s, bool left,
+                                 uint8_t count) {
+  if (!count) {
+    if (d != s) {
+      e.mov(VReg(d).b16, VReg(s).b16);
+    }
+    return;
+  }
+  if (s < 4) {
+    // A constant landed in the scratch bank the shifts below clobber.
+    e.mov(VReg(3).b16, VReg(s).b16);
+    s = 3;
+  }
+  // The neighbour's bits first, as d may be s
+  if (left) {
+    e.ushr(VReg(0).s4, VReg(s).s4, 32 - count);
+    e.shl(VReg(d).s4, VReg(s).s4, count);
+    e.movi(VReg(1).s4, 0);
+    e.ext(VReg(0).b16, VReg(0).b16, VReg(1).b16, 4);
+  } else {
+    e.shl(VReg(0).s4, VReg(s).s4, 32 - count);
+    e.ushr(VReg(d).s4, VReg(s).s4, count);
+    e.movi(VReg(1).s4, 0);
+    e.ext(VReg(0).b16, VReg(1).b16, VReg(0).b16, 12);
+  }
+  e.orr(VReg(d).b16, VReg(d).b16, VReg(0).b16);
+}
+
+// Each byte by its own count: the byte shifted by it, ORed with its neighbour
+// shifted the other way by 8 - count. ushl shifts right for a negative count
+// and gives 0 for a count of 8. tbl fetches the neighbours, and an index past
+// the end gives the 0 beyond the first or last byte.
+template <typename ARGS>
+static void EmitShiftBitsPerByte(A64Emitter& e, const ARGS& i, bool left) {
+  const int s = SrcVReg(e, i.src1, 0);
+  const int c = SrcVReg(e, i.src2, 1);
+  const int d = i.dest.reg().getIdx();
+  vec128_t neighbours;
+  for (int h = 0; h < 16; ++h) {
+    const int g = (h ^ 3) + (left ? 1 : -1);
+    neighbours.u8[h] = g >= 0 && g < 16 ? uint8_t(g ^ 3) : 0xFF;
+  }
+  e.movi(VReg(2).b16, 7);
+  e.and_(VReg(2).b16, VReg(c).b16, VReg(2).b16);
+  LoadV128Const(e, 3, neighbours);
+  e.tbl(VReg(3).b16, VReg(s).b16, 1, VReg(3).b16);
+  if (left) {
+    e.ushl(VReg(1).b16, VReg(s).b16, VReg(2).b16);
+    e.movi(VReg(0).b16, 8);
+    e.sub(VReg(2).b16, VReg(2).b16, VReg(0).b16);
+  } else {
+    e.neg(VReg(1).b16, VReg(2).b16);
+    e.ushl(VReg(1).b16, VReg(s).b16, VReg(1).b16);
+    e.movi(VReg(0).b16, 8);
+    e.sub(VReg(2).b16, VReg(0).b16, VReg(2).b16);
+  }
+  e.ushl(VReg(3).b16, VReg(3).b16, VReg(2).b16);
+  e.orr(VReg(d).b16, VReg(1).b16, VReg(3).b16);
+}
+
+// Counts known to agree take the whole-vector shift; the rest the per-byte
+// one, which is as fast for counts known only at run time.
+template <typename ARGS>
+static void EmitShiftBits(A64Emitter& e, const ARGS& i, bool left) {
+  if (i.src2.is_constant) {
+    const vec128_t counts = i.src2.constant();
+    const uint8_t count = counts.u8[0] & 7;
+    bool uniform = true;
+    for (int k = 1; k < 16; ++k) {
+      uniform &= (counts.u8[k] & 7) == count;
+    }
+    if (uniform) {
+      EmitShiftBitsUniform(e, i.dest.reg().getIdx(), SrcVReg(e, i.src1, 0),
+                           left, count);
+      return;
+    }
+  }
+  EmitShiftBitsPerByte(e, i, left);
+}
+
+struct VECTOR_SHL_BITS_V128
+    : Sequence<VECTOR_SHL_BITS_V128,
+               I<OPCODE_VECTOR_SHL_BITS, V128Op, V128Op, V128Op>> {
+  static void Emit(A64Emitter& e, const EmitArgType& i) {
+    EmitShiftBits(e, i, true);
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_VECTOR_SHL_BITS, VECTOR_SHL_BITS_V128);
+
+struct VECTOR_SHR_BITS_V128
+    : Sequence<VECTOR_SHR_BITS_V128,
+               I<OPCODE_VECTOR_SHR_BITS, V128Op, V128Op, V128Op>> {
+  static void Emit(A64Emitter& e, const EmitArgType& i) {
+    EmitShiftBits(e, i, false);
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_VECTOR_SHR_BITS, VECTOR_SHR_BITS_V128);
+
+// ============================================================================
 // OPCODE_VECTOR_SHA (arithmetic right shift)
 // ============================================================================
 struct VECTOR_SHA_V128
@@ -1257,10 +1362,50 @@ struct PACK : Sequence<PACK, I<OPCODE_PACK, V128Op, V128Op, V128Op>> {
         break;
     }
   }
+  // With PACK_TYPE_SET_SAT, the register the clamp is compared with: src, or
+  // a copy in v3 when the clamp writes over it. -1 without the flag.
+  static int SatSource(A64Emitter& e, const EmitArgType& i, int s, int d) {
+    if (!(i.instr->flags & hir::PACK_TYPE_SET_SAT)) {
+      return -1;
+    }
+    if (s != d) {
+      return s;
+    }
+    e.mov(VReg(3).b16, VReg(s).b16);
+    return 3;
+  }
+  // Sets VSCR[SAT] when the clamp in d moved a lane of source that isn't a
+  // NaN: lanes 0 and 1 with low_two_lanes, else all four. A pack tends to
+  // saturate always or never, so the store sits inline behind a branch the
+  // predictor learns. Clobbers v0, v1 and x0.
+  static void EmitSetSatIfClamped(A64Emitter& e, int source, int d,
+                                  bool low_two_lanes) {
+    if (source < 0) {
+      return;
+    }
+    e.fcmeq(VReg(1).s4, VReg(d).s4, VReg(source).s4);
+    e.fcmeq(VReg(0).s4, VReg(source).s4, VReg(source).s4);
+    e.bic(VReg(0).b16, VReg(0).b16, VReg(1).b16);
+    if (low_two_lanes) {
+      e.fmov(e.x0, DReg(0));
+    } else {
+      e.umaxv(SReg(0), VReg(0).s4);
+      e.fmov(e.w0, SReg(0));
+    }
+    // VSCR[SAT] is sticky, so saturating only ever stores 1.
+    constexpr int32_t sat_offset =
+        static_cast<int32_t>(offsetof(ppc::PPCContext, vscr_sat));
+    auto& not_saturated = e.NewCachedLabel();
+    e.cbz(e.x0, not_saturated);
+    e.mov(e.w0, 1);
+    e.strb(e.w0, ptr(e.GetContextReg(), sat_offset));
+    e.LKeepingRemapBound(not_saturated);
+  }
   static void EmitD3DCOLOR(A64Emitter& e, const EmitArgType& i) {
     assert_true(i.src2.value->IsConstantZero());
     int s = SrcVReg(e, i.src1, 2);
     int d = i.dest.reg().getIdx();
+    int sat_source = SatSource(e, i, s, d);
     // Clamp to [3.0f, 3.0f + 255*2^-22].
     e.fmov(VReg(0).s4, 3.0f);
     // fmaxnm/fminnm: NaN operand returns the non-NaN value (pack NaN as zero).
@@ -1268,6 +1413,7 @@ struct PACK : Sequence<PACK, I<OPCODE_PACK, V128Op, V128Op, V128Op>> {
     e.fmaxnm(VReg(d).s4, VReg(d).s4, VReg(0).s4);
     LoadV128Const(e, 0, vec128i(0x404000FFu));  // 3.0f + 255*2^-22
     e.fminnm(VReg(d).s4, VReg(d).s4, VReg(0).s4);
+    EmitSetSatIfClamped(e, sat_source, d, false);
     // TBL: extract low byte from each lane, reorder RGBA->ARGB in lane 3.
     // Control: bytes 0-11=0xFF (->0), bytes 12-15={0x08,0x04,0x00,0x0C}
     vec128_t ctrl;
@@ -1280,12 +1426,16 @@ struct PACK : Sequence<PACK, I<OPCODE_PACK, V128Op, V128Op, V128Op>> {
     assert_true(i.src2.value->IsConstantZero());
     int s = SrcVReg(e, i.src1, 2);
     int d = i.dest.reg().getIdx();
-    // Clamp to [PackSHORT_Min, PackSHORT_Max].
+    int sat_source = SatSource(e, i, s, d);
+    // Clamp to [PackSHORT_Min, PackSHORT_Max]. FMAX and FMIN keep a NaN, which
+    // FMAXNM then replaces with 0x403F8000 so it packs as 0x8000.
     LoadV128Const(e, 0, vec128i(0x403F8001u));
-    EmitQuietSnan(e, d, s);
-    e.fmaxnm(VReg(d).s4, VReg(d).s4, VReg(0).s4);
+    e.fmax(VReg(d).s4, VReg(s).s4, VReg(0).s4);
     LoadV128Const(e, 0, vec128i(0x40407FFFu));
-    e.fminnm(VReg(d).s4, VReg(d).s4, VReg(0).s4);
+    e.fmin(VReg(d).s4, VReg(d).s4, VReg(0).s4);
+    EmitSetSatIfClamped(e, sat_source, d, true);
+    LoadV128Const(e, 0, vec128i(0x403F8000u));
+    e.fmaxnm(VReg(d).s4, VReg(d).s4, VReg(0).s4);
     // TBL: extract low 2 bytes from lanes 0,1 -> pack into lane 3.
     // TBL ctrl for PACK_SHORT_2: bytes 12-15={0x04,0x05,0x00,0x01}, rest=0xFF
     vec128_t ctrl;
@@ -1298,11 +1448,15 @@ struct PACK : Sequence<PACK, I<OPCODE_PACK, V128Op, V128Op, V128Op>> {
     assert_true(i.src2.value->IsConstantZero());
     int s = SrcVReg(e, i.src1, 2);
     int d = i.dest.reg().getIdx();
+    int sat_source = SatSource(e, i, s, d);
+    // A NaN packs as 0x8000, as in EmitSHORT_2.
     LoadV128Const(e, 0, vec128i(0x403F8001u));
-    EmitQuietSnan(e, d, s);
-    e.fmaxnm(VReg(d).s4, VReg(d).s4, VReg(0).s4);
+    e.fmax(VReg(d).s4, VReg(s).s4, VReg(0).s4);
     LoadV128Const(e, 0, vec128i(0x40407FFFu));
-    e.fminnm(VReg(d).s4, VReg(d).s4, VReg(0).s4);
+    e.fmin(VReg(d).s4, VReg(d).s4, VReg(0).s4);
+    EmitSetSatIfClamped(e, sat_source, d, false);
+    LoadV128Const(e, 0, vec128i(0x403F8000u));
+    e.fmaxnm(VReg(d).s4, VReg(d).s4, VReg(0).s4);
     // TBL ctrl for PACK_SHORT_4: bytes 8-11={0x04,0x05,0x00,0x01},
     // 12-15={0x0C,0x0D,0x08,0x09}
     vec128_t ctrl;
@@ -1313,14 +1467,13 @@ struct PACK : Sequence<PACK, I<OPCODE_PACK, V128Op, V128Op, V128Op>> {
   }
   // Inline Xenos float→half conversion for 4 float32 lanes in v0.
   // Xenos half saturates to 0x7FFF instead of producing IEEE inf/NaN.
-  // Denormals flush to zero (preserve_denormal=false).
-  // If round_to_even is true, applies round-to-nearest-even before truncation.
+  // Denormals flush to zero (preserve_denormal=false) and the mantissa is
+  // truncated.
   // Result: 4 halfwords in the low 16 bits of each 32-bit lane in v1.
   // Clobbers v0-v3, w0 and `tmp`, which holds the sign across the conversion
   // because v0-v3 are all in use. The caller's dest serves: it is written only
   // once the conversion is done.
-  static void EmitFloatToXenosHalf4(A64Emitter& e, bool round_to_even,
-                                    int tmp) {
+  static void EmitFloatToXenosHalf4(A64Emitter& e, int tmp) {
     // v0 = input float32 bits.  Extract sign, compute abs.
     e.ushr(VReg(tmp).s4, VReg(0).s4, 31);
     e.shl(VReg(tmp).s4, VReg(tmp).s4, 15);  // tmp = sign at bit 15
@@ -1333,16 +1486,6 @@ struct PACK : Sequence<PACK, I<OPCODE_PACK, V128Op, V128Op, V128Op>> {
     // result = abs + 0xC8000000 (subtract 112 from float exponent, unsigned)
     LoadV128Const(e, 2, vec128i(0xC8000000u));
     e.add(VReg(2).s4, VReg(0).s4, VReg(2).s4);  // v2 = rebiased
-
-    if (round_to_even) {
-      // Round to nearest even: result += 0xFFF + ((result >> 13) & 1)
-      e.ushr(VReg(3).s4, VReg(2).s4, 13);
-      e.movi(VReg(1).s4, 1);
-      e.and_(VReg(3).b16, VReg(3).b16, VReg(1).b16);  // (result>>13)&1
-      LoadV128Const(e, 1, vec128i(0xFFFu));
-      e.add(VReg(3).s4, VReg(3).s4, VReg(1).s4);  // 0xFFF + bit
-      e.add(VReg(2).s4, VReg(2).s4, VReg(3).s4);  // rounded
-    }
 
     // Shift and mask to 15 bits.
     e.ushr(VReg(2).s4, VReg(2).s4, 13);
@@ -1377,7 +1520,7 @@ struct PACK : Sequence<PACK, I<OPCODE_PACK, V128Op, V128Op, V128Op>> {
     int s = i.src1.reg().getIdx();
     int d = i.dest.reg().getIdx();
     e.mov(VReg(0).b16, VReg(s).b16);
-    EmitFloatToXenosHalf4(e, false, d);
+    EmitFloatToXenosHalf4(e, d);
     // v1 has halfs in s[0..3].  FLOAT16_2 uses only lanes 0,1.
     // Output: h[7]=half(f32[0]), h[6]=half(f32[1]), rest=0.
     // Narrow to halfwords, swap within word pairs, place at top of vector.
@@ -1392,7 +1535,7 @@ struct PACK : Sequence<PACK, I<OPCODE_PACK, V128Op, V128Op, V128Op>> {
       vec128_t result = {};
       for (int idx = 0; idx < 4; ++idx) {
         result.u16[7 - (idx ^ 2)] =
-            float_to_xenos_half(i.src1.constant().f32[idx], false, true);
+            float_to_xenos_half(i.src1.constant().f32[idx]);
       }
       LoadV128Const(e, i.dest.reg().getIdx(), result);
       return;
@@ -1400,7 +1543,7 @@ struct PACK : Sequence<PACK, I<OPCODE_PACK, V128Op, V128Op, V128Op>> {
     int s = i.src1.reg().getIdx();
     int d = i.dest.reg().getIdx();
     e.mov(VReg(0).b16, VReg(s).b16);
-    EmitFloatToXenosHalf4(e, true, d);
+    EmitFloatToXenosHalf4(e, d);
     // v1 has halfs in s[0..3].  Output mapping:
     //   idx0→h[5], idx1→h[4], idx2→h[7], idx3→h[6]
     // = upper 64 bits with within-word swap, lower 64 bits zero.
@@ -1415,23 +1558,30 @@ struct PACK : Sequence<PACK, I<OPCODE_PACK, V128Op, V128Op, V128Op>> {
     // Inline PACK: clamp magic floats, extract bit fields, shift, OR-fold.
     int s = SrcVReg(e, i.src1, 2);
     int d = i.dest.reg().getIdx();
+    int sat_source = SatSource(e, i, s, d);
 
-    // Clamp to valid range: fmaxnm(src, min) then fminnm(result, max).
+    // Clamp to valid range: fmax(src, min) then fmin(result, max).
     // XYZ min=0x403FFE01 (-511), max=0x404001FF (+511)
     // W   min=0x40400000 (0),    max=0x40400003 (+3)
     e.mov(e.x0, 0x403FFE01403FFE01ull);
     e.fmov(DReg(0), e.x0);
     e.mov(e.x0, 0x40400000403FFE01ull);
     e.ins(VReg(0).d2[1], e.x0);
-    // fmaxnm clamps NaN to min (NaN packs as the minimum value).
-    EmitQuietSnan(e, d, s);
-    e.fmaxnm(VReg(d).s4, VReg(d).s4, VReg(0).s4);
+    e.fmax(VReg(d).s4, VReg(s).s4, VReg(0).s4);
 
     e.mov(e.x0, 0x404001FF404001FFull);
     e.fmov(DReg(0), e.x0);
     e.mov(e.x0, 0x40400003404001FFull);
     e.ins(VReg(0).d2[1], e.x0);
-    e.fminnm(VReg(d).s4, VReg(d).s4, VReg(0).s4);
+    e.fmin(VReg(d).s4, VReg(d).s4, VReg(0).s4);
+    EmitSetSatIfClamped(e, sat_source, d, false);
+
+    // A NaN kept by the clamp packs as the minimum, 0x200, and 0 in W.
+    e.mov(e.x0, 0x403FFE00403FFE00ull);
+    e.fmov(DReg(0), e.x0);
+    e.mov(e.x0, 0x40400000403FFE00ull);
+    e.ins(VReg(0).d2[1], e.x0);
+    e.fmaxnm(VReg(d).s4, VReg(d).s4, VReg(0).s4);
 
     // Mask to extract encoded integer bits: {0x3FF, 0x3FF, 0x3FF, 0x3}
     e.mov(e.x0, 0x000003FF000003FFull);
@@ -1459,22 +1609,30 @@ struct PACK : Sequence<PACK, I<OPCODE_PACK, V128Op, V128Op, V128Op>> {
     // 20-bit fields cross 32-bit boundaries, so use scalar GPR packing.
     int s = SrcVReg(e, i.src1, 2);
     int d = i.dest.reg().getIdx();
+    int sat_source = SatSource(e, i, s, d);
 
-    // Clamp: fmaxnm(src, min) then fminnm(result, max).
+    // Clamp: fmax(src, min) then fmin(result, max).
     // XYZ min=0x40400000+(-524287)=0x40380001, max=0x40400000+524287=0x4047FFFF
     // W   min=0x40400000+0=0x40400000, max=0x40400000+15=0x4040000F
     e.mov(e.x0, 0x4038000140380001ull);
     e.fmov(DReg(0), e.x0);
     e.mov(e.x0, 0x4040000040380001ull);
     e.ins(VReg(0).d2[1], e.x0);
-    EmitQuietSnan(e, d, s);
-    e.fmaxnm(VReg(d).s4, VReg(d).s4, VReg(0).s4);
+    e.fmax(VReg(d).s4, VReg(s).s4, VReg(0).s4);
 
     e.mov(e.x0, 0x4047FFFF4047FFFFull);
     e.fmov(DReg(0), e.x0);
     e.mov(e.x0, 0x4040000F4047FFFFull);
     e.ins(VReg(0).d2[1], e.x0);
-    e.fminnm(VReg(d).s4, VReg(d).s4, VReg(0).s4);
+    e.fmin(VReg(d).s4, VReg(d).s4, VReg(0).s4);
+    EmitSetSatIfClamped(e, sat_source, d, false);
+
+    // A NaN kept by the clamp packs as the minimum, 0x80000, and 0 in W.
+    e.mov(e.x0, 0x4038000040380000ull);
+    e.fmov(DReg(0), e.x0);
+    e.mov(e.x0, 0x4040000040380000ull);
+    e.ins(VReg(0).d2[1], e.x0);
+    e.fmaxnm(VReg(d).s4, VReg(d).s4, VReg(0).s4);
 
     // Extract clamped values to GPRs: mask low bits from magic float encoding.
     // XYZ: & 0xFFFFF (20 bits), W: & 0xF (4 bits)
@@ -2003,14 +2161,18 @@ EMITTER_OPCODE_TABLE(OPCODE_LVR, LVR_V128);
 // accesses, so nothing outside the range is touched. Baseline NEON has no
 // byte-masked store, and merging a whole 16-byte block back with a blend would
 // lose a concurrent write to the bytes this store is not supposed to reach.
+// Exits to done, which the caller binds, or falls through.
 static void EmitPartialVectorStore(A64Emitter& e,
                                    const Xbyak_aarch64::XReg& dst,
                                    const Xbyak_aarch64::XReg& src,
-                                   const Xbyak_aarch64::WReg& count) {
+                                   const Xbyak_aarch64::WReg& count,
+                                   Xbyak_aarch64::Label& done) {
   // Unqualified Label here is hir::Label.
-  Xbyak_aarch64::Label from8, from4, from2, from1, done;
+  Xbyak_aarch64::Label from8, from4, from2, from1;
 
-  // Every label below is bound within this helper, so the near forms are safe.
+  // Every label below is bound within the calling sequence, so the near forms
+  // are safe. The copy works in scratch registers, so they keep the remap
+  // bound.
   e.cmp(count, 8);
   e.b_near(Xbyak_aarch64::HS, from8);
   e.cmp(count, 4);
@@ -2020,7 +2182,7 @@ static void EmitPartialVectorStore(A64Emitter& e,
   e.cbnz_near(count, from1);
   e.b(done);
 
-  e.L(from8);
+  e.LKeepingRemapBound(from8);
   e.sub(e.w6, count, 8);
   e.ldr(e.x3, ptr(src));
   e.str(e.x3, ptr(dst));
@@ -2028,7 +2190,7 @@ static void EmitPartialVectorStore(A64Emitter& e,
   e.str(e.x3, ptr(dst, e.x6));
   e.b(done);
 
-  e.L(from4);
+  e.LKeepingRemapBound(from4);
   e.sub(e.w6, count, 4);
   e.ldr(e.w3, ptr(src));
   e.str(e.w3, ptr(dst));
@@ -2036,7 +2198,7 @@ static void EmitPartialVectorStore(A64Emitter& e,
   e.str(e.w3, ptr(dst, e.x6));
   e.b(done);
 
-  e.L(from2);
+  e.LKeepingRemapBound(from2);
   e.sub(e.w6, count, 2);
   e.ldrh(e.w3, ptr(src));
   e.strh(e.w3, ptr(dst));
@@ -2044,11 +2206,9 @@ static void EmitPartialVectorStore(A64Emitter& e,
   e.strh(e.w3, ptr(dst, e.x6));
   e.b(done);
 
-  e.L(from1);
+  e.LKeepingRemapBound(from1);
   e.ldrb(e.w3, ptr(src));
   e.strb(e.w3, ptr(dst));
-
-  e.L(done);
 }
 
 // ============================================================================
@@ -2058,20 +2218,30 @@ struct STVL_V128 : Sequence<STVL_V128, I<OPCODE_STVL, VoidOp, I64Op, V128Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
     // Store bytes offset..15 of the block holding the address, taking them from
     // the head of the byte-swapped source. That is 16 - offset bytes ending at
-    // the block boundary, so it is one contiguous copy.
+    // the block boundary, so it is one contiguous copy, and at offset 0 the
+    // whole block, which bulk copies to aligned buffers store this way.
     int s = SrcVReg(e, i.src2, 0);
-
-    // Stash rev32(src) so its bytes can be addressed individually.
     e.rev32(VReg(0).b16, VReg(s).b16);
+
+    // The host address has the guest address's alignment within the block.
+    ComputeGuestHostAddress(e, e.x0, i.src1, 1, true);
+    // The partial store stays inline, so an unaligned store only adds the
+    // untaken branch.
+    Xbyak_aarch64::Label aligned, done;
+    e.tst(e.x0, 0xF);
+    e.b_near(Xbyak_aarch64::EQ, aligned);
+    // Stash rev32(src) so its bytes can be addressed individually.
     e.str(QReg(0),
           ptr(e.sp, static_cast<uint32_t>(StackLayout::GUEST_SCRATCH)));
-
-    ComputeGuestHostAddress(e, e.x0, i.src1, 1, true);
     e.and_(e.w2, e.w0, 0xF);
     e.mov(e.w1, 16);
     e.sub(e.w2, e.w1, e.w2);
     e.add(e.x1, e.sp, static_cast<uint32_t>(StackLayout::GUEST_SCRATCH));
-    EmitPartialVectorStore(e, e.x0, e.x1, e.w2);
+    EmitPartialVectorStore(e, e.x0, e.x1, e.w2, done);
+    e.b(done);
+    e.LKeepingRemapBound(aligned);
+    e.str(QReg(0), ptr(e.x0));
+    e.LKeepingRemapBound(done);
   }
 };
 EMITTER_OPCODE_TABLE(OPCODE_STVL, STVL_V128);
@@ -2086,16 +2256,19 @@ struct STVR_V128 : Sequence<STVR_V128, I<OPCODE_STVR, VoidOp, I64Op, V128Op>> {
     // memcpy tails use stvrx on an address that can sit one past a valid page.
     int s = SrcVReg(e, i.src2, 0);
 
+    ComputeGuestHostAddress(e, e.x0, i.src1, 1, true);
+    Xbyak_aarch64::Label done;
+    e.tst(e.x0, 0xF);
+    e.b_near(Xbyak_aarch64::EQ, done);
     e.rev32(VReg(0).b16, VReg(s).b16);
     e.str(QReg(0),
           ptr(e.sp, static_cast<uint32_t>(StackLayout::GUEST_SCRATCH)));
-
-    ComputeGuestHostAddress(e, e.x0, i.src1, 1, true);
     e.and_(e.w2, e.w0, 0xF);
     e.and_(e.x0, e.x0, ~0xFull);
     e.add(e.x1, e.sp, static_cast<uint32_t>(StackLayout::GUEST_SCRATCH) + 16);
     e.sub(e.x1, e.x1, e.x2);
-    EmitPartialVectorStore(e, e.x0, e.x1, e.w2);
+    EmitPartialVectorStore(e, e.x0, e.x1, e.w2, done);
+    e.LKeepingRemapBound(done);
   }
 };
 EMITTER_OPCODE_TABLE(OPCODE_STVR, STVR_V128);

@@ -271,13 +271,6 @@ DEFINE_bool(use_fuzzy_alpha_epsilon, false,
             "GPU");
 
 DEFINE_bool(
-    force_depth_clamp, false,
-    "Use host depth clamping instead of near and far plane clipping when "
-    "guest clipping is enabled. X/Y/W clipping is unaffected. On Vulkan, "
-    "this requires depthClamp support.",
-    "GPU");
-
-DEFINE_bool(
     alu_round_toward_zero, true,
     "Round vertex shader ALU sums and products toward zero, with unfused "
     "multiply-adds and overflow saturating, instead of rounding to nearest "
@@ -285,8 +278,8 @@ DEFINE_bool(
     "Volition Engine titles. Pixel shaders keep rounding to nearest, the "
     "extra instructions per operation are too slow there. Unless the host "
     "GPU supports the rounding mode, vertex shaders only round results that "
-    "may reach a vertex fetch index, the address register, a memory export "
-    "or a floor, trunc or frc this way.",
+    "may reach a vertex fetch index, the address register, a memory export, "
+    "a floor, trunc or frc, or the position's Z or W this way.",
     "GPU");
 
 DEFINE_bool(

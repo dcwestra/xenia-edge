@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Runs a built xamgen corpus in Xenia or on a console and compares runs.
 
-    python3 tools/xamgen/run.py xenia OUTDIR
+    python3 tools/xamgen/run.py xenia OUTDIR [--arg=--name=value ...]
     python3 tools/xamgen/run.py console OUTDIR
     python3 tools/xamgen/run.py diff A.json B.json
     python3 tools/xamgen/run.py expect RESULTS.json EXPECTED.json --source TEXT
@@ -10,14 +10,14 @@
 xenia starts the host's Release build (or the Windows one from WSL, XENIA_EXE
 names another) on OUTDIR/xamgen.xex with XENIA_ARGS, waits for the results file
 the executor writes beside it and its DbgPrint line in the log, then kills it
-(Xenia doesn't quit when a title it was started on exits). console uploads the
+rather than wait for the title to end. console uploads the
 XEX to Hdd:\\oracle\\ over XBDM with XeCLI's rgh (RGH or on PATH), launches it,
 watches XBDM's debug output until the executor unloads or faults and fetches
 the results file. On a fault it reads the executor's progress word to name the
 step and launches Aurora again. An unwatched corpus runs with no notification
 session: console polls the executor's done word and writes its exit word, and
 names the step the same way if it isn't done in time. Both decode the results
-to OUTDIR/<where>_results.json.
+to OUTDIR/<where>_results.json. xenia's --arg adds an argument to XENIA_ARGS.
 
 Comparisons normalize first: the XUID and gamertag the corpus's identity
 scenario reads become <X0> and <NAME0>, and a wait only records whether the
@@ -69,9 +69,10 @@ CONSOLE_DIR = 'Hdd:\\oracle'
 AURORA = 'Hdd:\\Aurora\\Aurora.xex'
 # Settings a user's config may change that results depend on, at what a
 # console does. Without cache: the executor writes its results to game:, which
-# is OUTDIR once Xenia may write there.
-XENIA_ARGS = ['--license_mask=0', '--mount_cache=false',
-              '--allow_game_relative_writes=true']
+# is OUTDIR once Xenia may write there. Unattended, Xenia shows no dialog and
+# exits when the title crashes.
+XENIA_ARGS = ['--license_mask=0', '--allow_game_relative_writes=true',
+              '--unattended']
 
 
 def from_wsl(program):
@@ -152,7 +153,7 @@ def decode_into(outdir, where, results_path):
     return decoded
 
 
-def run_xenia(outdir, timeout):
+def run_xenia(outdir, timeout, extra_args=()):
     outdir = os.path.abspath(outdir)
     with open(os.path.join(outdir, 'xamgen.json')) as f:
         console_only = json.load(f).get('console_only')
@@ -171,27 +172,34 @@ def run_xenia(outdir, timeout):
     before = windows_pids(XENIA) if from_wsl(XENIA) else set()
     started = time.time()
     process = subprocess.Popen(
-        [XENIA, *XENIA_ARGS, f'--log_file={host_path(log, XENIA)}',
-         host_path(xex, XENIA)],
+        [XENIA, *XENIA_ARGS, *extra_args,
+         f'--log_file={host_path(log, XENIA)}', host_path(xex, XENIA)],
         cwd=os.path.dirname(XENIA), stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL)
     deadline = started + timeout
     summary = None
     last_step = None
+
+    def scan_log():
+        nonlocal summary, last_step
+        if not os.path.exists(log):
+            return
+        with open(log, errors='replace') as f:
+            for line in f:
+                if '(DbgPrint) xamgen:' in line:
+                    summary = line.strip()
+                elif '(DbgPrint) xamgen step ' in line:
+                    last_step = int(line.split('xamgen step ')[1])
+
     try:
         while time.time() < deadline and process.poll() is None:
             time.sleep(0.5)
-            if not os.path.exists(log):
-                continue
-            with open(log, errors='replace') as f:
-                for line in f:
-                    if '(DbgPrint) xamgen:' in line:
-                        summary = line.strip()
-                    elif '(DbgPrint) xamgen step ' in line:
-                        last_step = int(line.split('xamgen step ')[1])
+            scan_log()
             if summary and os.path.exists(results):
                 time.sleep(0.5)
                 break
+        # Xenia can end between two scans.
+        scan_log()
     finally:
         exit_code = process.poll()
         if from_wsl(XENIA):
@@ -521,6 +529,10 @@ def main():
         p = sub.add_parser(name)
         p.add_argument('outdir')
         p.add_argument('--timeout', type=int, default=30)
+        if name == 'xenia':
+            p.add_argument('--arg', action='append', default=[],
+                           dest='xenia_args', metavar='ARG',
+                           help='another Xenia argument, --arg=--name=value')
     p = sub.add_parser('diff')
     p.add_argument('a')
     p.add_argument('b')
@@ -534,7 +546,7 @@ def main():
     p.add_argument('results')
     args = parser.parse_args()
     if args.command == 'xenia':
-        run_xenia(args.outdir, args.timeout)
+        run_xenia(args.outdir, args.timeout, args.xenia_args)
     elif args.command == 'console':
         run_console(args.outdir, args.timeout)
     elif args.command == 'expect':

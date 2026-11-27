@@ -22,6 +22,13 @@ The corpus runs unwatched. With an XBDM notification session open, the
 console reported the first probe's fault as a first-chance exception 92 times
 in 35 ms, past the handler's call limit, so something other than the handler
 kept continuing it. With no session the handler was called once.
+
+The raise probes call RtlRaiseException with an EXCEPTION_RECORD in the
+arena. Left out because Xenia differs by design: the kernel takes the CONTEXT
+of a raise inside RtlRaiseException, so its iar, lr and r1 and the record's
+address are the kernel's, where Xenia reports the call to it. Records the
+kernel makes itself are on its stack, so they are only told apart from the
+corpus's own.
 """
 
 import struct
@@ -62,6 +69,7 @@ LOG_SIZE = 0x64
 # Guest EXCEPTION_RECORD, DISPATCHER_CONTEXT and CONTEXT offsets.
 RECORD_CODE = 0x00
 RECORD_FLAGS = 0x04
+RECORD_CHAIN = 0x08
 RECORD_INFORMATION = 0x14
 DISPATCHER_ESTABLISHER = 0x08
 DISPATCHER_CONTEXT = 0x0C
@@ -782,9 +790,11 @@ def c_leaf(a, r, thunk, log):
     r.function(r.label('leaf'), r.label('leaf'), r.label('leaf end'))
 
 
-def c_inner(a, r, thunk, log):
+def c_inner(a, r, thunk, log, finally_handler=None):
     """A framed function with a finally handler around a call to the leaf,
-    which logs its entry sp and sets r31 to INNER_MARKER."""
+    which logs its entry sp and sets r31 to INNER_MARKER. The finally handler
+    logs its call, or is what `finally_handler(a, r, thunk, log)` emits at the
+    label 'finally'."""
     c_words(a, thunk, r.label('inner scopes'))
     a.label(r.label('inner'))
     save_frame(a)
@@ -803,8 +813,20 @@ def c_inner(a, r, thunk, log):
     r.function(r.label('inner'), r.label('inner prolog end'),
                r.label('inner end'), handler=True)
     c_leaf(a, r, thunk, log)
-    # Called with r3 1 for an abnormal termination and r12 the establisher.
-    a.label(r.label('finally'))
+    if finally_handler:
+        finally_handler(a, r, thunk, log)
+    else:
+        a.label(r.label('finally'))
+        c_finally_logged(a, log)
+        a.blr()
+    scope_table(a, r.label('inner scopes'), [
+        (r.label('inner try'), r.label('inner try end'), r.label('finally'),
+         None)])
+
+
+def c_finally_logged(a, log):
+    """Logs a finally handler's call, made with r3 1 for an abnormal
+    termination and r12 the establisher."""
     a.load32(11, log.address)
     a.lwz(10, C_FINALLY, 11)
     a.addi(0, 10, 1)
@@ -813,16 +835,324 @@ def c_inner(a, r, thunk, log):
     a.lwz(10, C_INNER_ENTRY_SP, 11)
     a.subf(0, 10, 12)
     a.stw(0, C_FINALLY + 8, 11)
-    a.blr()
-    scope_table(a, r.label('inner scopes'), [
-        (r.label('inner try'), r.label('inner try end'), r.label('finally'),
-         None)])
+
+
+def raising_finally(record):
+    """A framed finally handler that logs its call and raises `record`."""
+    def emit(a, r, thunk, log):
+        a.label(r.label('finally'))
+        a.mflr(0)
+        a.stw(0, -8, 1)
+        a.stwu(1, -HANDLER_FRAME, 1)
+        a.label(r.label('finally prolog end'))
+        c_finally_logged(a, log)
+        a.load32(3, record.address)
+        a.call(thunk('RtlRaiseException'))
+        a.addi(1, 1, HANDLER_FRAME)
+        a.lwz(0, -8, 1)
+        a.mtlr(0)
+        a.blr()
+        a.label(r.label('finally end'))
+        r.function(r.label('finally'), r.label('finally prolog end'),
+                   r.label('finally end'))
+    return emit
 
 
 def c_call_inner(a, r):
     a.label(r.label('try'))
     a.bl(r.label('inner'))
     a.label(r.label('try end'))
+
+
+RECORD_SIZE = 0x50
+RAISE_CODE = 0xE0000001
+NESTED_RAISE_CODE = 0xE0000002
+RAISE_PARAMETERS = (0x11111111, 0x22222222)
+EXCEPTION_NONCONTINUABLE = 0x1
+# What no handler may return, searching or unwinding.
+INVALID_DISPOSITION = 4
+# How a raise handler logs a record pointer.
+NO_RECORD = 0
+OTHER_RECORD = 3
+
+
+def exception_record(s, name, code, flags=0, parameters=()):
+    data = struct.pack('>5I', code, flags, 0, 0, len(parameters))
+    data += struct.pack(f'>{len(parameters)}I', *parameters)
+    return s.alloc(RECORD_SIZE, name, data, fill=0)
+
+
+def record_captures(records):
+    """The records but for their addresses."""
+    captures = []
+    for record in records:
+        captures += [record.prefix(RECORD_ADDRESS),
+                     (record + RECORD_PARAMETERS).prefix(0xC)]
+    return captures
+
+
+def raise_handler(s, log, actions, records, first_logged=0):
+    """A framed language handler that logs its first LOGGED_CALLS calls into a
+    scripted handler's log and acts on call k as actions[k] says, searching
+    on past the end. Per call it logs the record's code and flags, which
+    record it chains to and which it is, its parameter count and first two
+    parameters (0 past the count), the establisher frame against the probe's
+    entry sp, the dispatcher context's control pc and function entry, its
+    establisher frame and context record against the arguments, and the
+    CONTEXT's r31 for the corpus's own records. Records are told by their
+    number in `records` from 1, NO_RECORD or OTHER_RECORD. The actions are
+    'continue' at the probe's recovery label with r3 0, 'return' to where it
+    was raised, 'search', 'unwind' to the frame whose handler it is at its
+    probe's recovery label with UNWIND_VALUE, 'raise' the second record with
+    r31 FAULT_R31, and 'invalid' to return INVALID_DISPOSITION. It logs the
+    calls from `first_logged` on."""
+    assert len(records) < OTHER_RECORD
+
+    def emit(a, r, thunk):
+        a.label(r.entry)
+        a.mflr(12)
+        a.stw(12, -8, 1)
+        a.std(31, -0x10, 1)
+        a.stwu(1, -HANDLER_FRAME, 1)
+        a.label(r.label('prolog end'))
+        a.load32(11, log.address)
+        a.lwz(12, H_CALLS, 11)
+        a.addi(0, 12, 1)
+        a.stw(0, H_CALLS, 11)
+        if first_logged:
+            a.addi(10, 12, -first_logged)
+            a.cmplwi(10, LOGGED_CALLS)
+            a.bge(r.label('act'))
+            a.mulli(10, 10, CALL_RECORD)
+        else:
+            a.cmpwi(12, LOGGED_CALLS)
+            a.bge(r.label('act'))
+            a.mulli(10, 12, CALL_RECORD)
+        a.add(10, 10, 11)
+        out = H_RECORDS
+
+        def store(reg):
+            nonlocal out
+            a.stw(reg, out, 10)
+            out += 4
+
+        def copy(base, offset):
+            a.lwz(0, offset, base)
+            store(0)
+
+        def difference(minuend_reg, subtrahend_reg):
+            a.subf(0, subtrahend_reg, minuend_reg)
+            store(0)
+
+        def record_number(reg, what):
+            """Logs which record reg points at, leaving it in r0."""
+            done = r.label(f'{what} told')
+            a.li(0, NO_RECORD)
+            a.cmpwi(reg, 0)
+            a.beq(done)
+            for number, record in enumerate(records, 1):
+                a.load32(9, record.address)
+                a.li(0, number)
+                a.cmpw(reg, 9)
+                a.beq(done)
+            a.li(0, OTHER_RECORD)
+            a.label(done)
+            store(0)
+
+        copy(3, RECORD_CODE)
+        copy(3, RECORD_FLAGS)
+        a.lwz(8, RECORD_CHAIN, 3)
+        record_number(8, 'chained record')
+        record_number(3, 'record')
+        a.mr(7, 0)
+        copy(3, RECORD_PARAMETERS)
+        for n in range(2):
+            a.lwz(9, RECORD_PARAMETERS, 3)
+            a.li(0, 0)
+            a.cmpwi(9, n)
+            a.ble(r.label(f'parameter {n} logged'))
+            a.lwz(0, RECORD_INFORMATION + 4 * n, 3)
+            a.label(r.label(f'parameter {n} logged'))
+            store(0)
+        a.lwz(9, L_ENTRY_SP, 11)
+        difference(4, 9)
+        copy(6, 0x0)
+        copy(6, 0x4)
+        a.lwz(9, DISPATCHER_ESTABLISHER, 6)
+        difference(9, 4)
+        a.lwz(9, DISPATCHER_CONTEXT, 6)
+        difference(9, 5)
+        a.li(0, 0)
+        a.cmpwi(7, OTHER_RECORD)
+        a.beq(r.label('r31 logged'))
+        a.lwz(0, gpr_low(31), 5)
+        a.label(r.label('r31 logged'))
+        store(0)
+        assert out == H_RECORDS + CALL_RECORD
+        a.sync()
+
+        a.label(r.label('act'))
+        for k in range(len(actions)):
+            a.cmpwi(12, k)
+            a.beq(r.label(f'action {k}'))
+        a.b(r.label('search'))
+        for k, action in enumerate(actions):
+            a.label(r.label(f'action {k}'))
+            if action == 'continue':
+                a.lwz(0, L_RECOVERY, 11)
+                a.stw(0, CONTEXT_IAR, 5)
+                a.li(0, 0)
+                a.stw(0, CONTEXT_GPR + 8, 5)
+                a.stw(0, CONTEXT_GPR + 8 * 3, 5)
+                a.stw(0, gpr_low(3), 5)
+                a.lwz(0, L_BODY_SP, 11)
+                a.stw(0, gpr_low(1), 5)
+                a.li(3, 0)              # ExceptionContinueExecution
+                a.b(r.label('return'))
+            elif action == 'return':
+                a.li(3, 0)              # ExceptionContinueExecution
+                a.b(r.label('return'))
+            elif action == 'invalid':
+                a.li(3, INVALID_DISPOSITION)
+                a.b(r.label('return'))
+            elif action == 'search':
+                a.b(r.label('search'))
+            elif action == 'unwind':
+                a.mr(5, 3)
+                a.mr(3, 4)
+                a.lwz(4, L_RECOVERY, 11)
+                a.load32(6, UNWIND_VALUE)
+                a.call(thunk('RtlUnwind'))
+                a.b(r.label('search'))
+            elif action == 'raise':
+                a.li(31, FAULT_R31)
+                a.load32(3, records[1].address)
+                a.call(thunk('RtlRaiseException'))
+                a.b(r.label('search'))
+            else:
+                raise ValueError(f'unknown action {action}')
+        a.label(r.label('search'))
+        a.li(3, 1)                      # ExceptionContinueSearch
+        a.label(r.label('return'))
+        a.addi(1, 1, HANDLER_FRAME)
+        a.lwz(12, -8, 1)
+        a.mtlr(12)
+        a.ld(31, -0x10, 1)
+        a.blr()
+        a.label(r.label('end'))
+        r.function(r.entry, r.label('prolog end'), r.label('end'))
+    return s.routine('raise handler', emit)
+
+
+def raises(record, log):
+    """A body raising `record`, which logs r1 against the probe's sp and r31
+    if the raise returns."""
+    def body(a, r, thunk):
+        a.load32(3, record.address)
+        a.call(thunk('RtlRaiseException'))
+        a.load32(11, log.address)
+        a.lwz(9, L_BODY_SP, 11)
+        a.subf(0, 9, 1)
+        a.stw(0, H_RESUMED + 4, 11)
+        a.stw(31, H_RESUMED + 8, 11)
+    return body
+
+
+def raise_scenario(corpus, name, actions, flags=0, nested=False):
+    """A probe raising a record with `flags`, with a raise handler. A
+    `nested` one has a second record for the handler to raise."""
+    s = corpus.scenario(name)
+    log = s.alloc(H_SIZE, 'log', fill=0)
+    records = [exception_record(s, 'record', RAISE_CODE, flags,
+                                RAISE_PARAMETERS)]
+    if nested:
+        records.append(exception_record(s, 'nested record',
+                                        NESTED_RAISE_CODE))
+    handler = raise_handler(s, log, actions, records)
+    routine = resumable(s, f'{name} probe', log, handler,
+                        raises(records[0], log))
+    s.call(routine, NULL, name=name,
+           capture=h_captures(log) + record_captures(records))
+
+
+def raise_outer_scenario(corpus, name, outer_actions, inner_actions):
+    """A probe with a raise handler calling another, which raises, each with
+    a log and marker of its own."""
+    s = corpus.scenario(name)
+    outer_log = s.alloc(H_SIZE, 'outer log', fill=0)
+    inner_log = s.alloc(H_SIZE, 'inner log', fill=0)
+    record = exception_record(s, 'record', RAISE_CODE, 0, RAISE_PARAMETERS)
+    inner = resumable(s, f'{name} inner', inner_log,
+                      raise_handler(s, inner_log, inner_actions, [record]),
+                      raises(record, inner_log), marker=INNER_MARKER)
+    outer = resumable(s, f'{name} outer', outer_log,
+                      raise_handler(s, outer_log, outer_actions, [record]),
+                      calls(inner))
+    s.call(outer, NULL, name=name,
+           capture=h_captures(outer_log) + h_captures(inner_log) +
+           record_captures([record]))
+
+
+def collided_scenario(corpus, name):
+    """A probe with a raise handler that unwinds, calling one whose raise
+    handler raises a second record as that unwind passes it. The outer handler
+    unwinds that one too, colliding with its first unwind. The inner handler's
+    log starts at its second call."""
+    s = corpus.scenario(name)
+    outer_log = s.alloc(H_SIZE, 'outer log', fill=0)
+    inner_log = s.alloc(H_SIZE, 'inner log', fill=0)
+    records = [exception_record(s, 'record', RAISE_CODE, 0, RAISE_PARAMETERS),
+               exception_record(s, 'nested record', NESTED_RAISE_CODE)]
+    inner_handler = raise_handler(s, inner_log,
+                                  ['search', 'raise', 'search', 'search'],
+                                  records, first_logged=1)
+    inner = resumable(s, f'{name} inner', inner_log, inner_handler,
+                      raises(records[0], inner_log), marker=INNER_MARKER)
+    outer = resumable(s, f'{name} outer', outer_log,
+                      raise_handler(s, outer_log,
+                                    ['unwind', 'unwind', 'search'], records),
+                      calls(inner))
+    s.call(outer, NULL, name=name,
+           capture=h_captures(outer_log) + h_captures(inner_log) +
+           record_captures(records))
+
+
+def collided_finally_scenario(corpus, name):
+    """A __C_specific_handler probe whose filter takes every exception,
+    calling a function whose finally handler raises a record as the unwind of
+    the fault in its leaf passes it. The filter takes that one too, and its
+    unwind collides with the first."""
+    s = corpus.scenario(name)
+    log = s.alloc(C_SIZE, 'log', fill=0)
+    record = exception_record(s, 'record', NESTED_RAISE_CODE)
+
+    def emit(a, r, thunk):
+        c_words(a, thunk, r.label('scopes'))
+        a.label(r.entry)
+        save_frame(a)
+        a.label(r.label('prolog end'))
+        setup(a, r, log)
+        c_call_inner(a, r)
+        a.li(3, 0)
+        a.b(r.label('epilog'))
+        a.label(r.label('except 1'))
+        c_resumed(a, r, log, 1)
+        a.label(r.label('recovery'))
+        c_resumed(a, r, log, 0)
+        a.label(r.label('epilog'))
+        epilog(a)
+        a.label(r.label('end'))
+        r.function(r.entry, r.label('prolog end'), r.label('end'),
+                   handler=True)
+        c_inner(a, r, thunk, log, raising_finally(record))
+        c_filter(a, r, log, 0, 1)
+        scope_table(a, r.label('scopes'), [
+            (r.label('try'), r.label('try end'), r.label('filter 0'),
+             r.label('except 1'))])
+
+    routine = s.routine(f'{name} probe', emit)
+    s.call(routine, NULL, name=name,
+           capture=c_captures(log) + record_captures([record]))
 
 
 def build(corpus):
@@ -911,3 +1241,40 @@ def build(corpus):
     # to the probe's frame.
     handler_scenario(corpus, 'unwind call fault', ['unwind', 'search'],
                      body=lambda a, r, thunk: call_target(a))
+
+    # A raise goes to the handlers from its caller's frame, with the caller's
+    # own record. One continues it at the recovery label.
+    raise_scenario(corpus, 'raise continue', ['continue'])
+    # Continuing it unchanged returns from the raise.
+    raise_scenario(corpus, 'raise return', ['return'])
+    # A handler unwinding to its own frame, which is called again to unwind.
+    raise_scenario(corpus, 'raise unwind', ['unwind', 'search'])
+    # A frame searching on passes it to its caller, whose control pc is its
+    # call, and the unwind from there passes the raising frame.
+    raise_outer_scenario(corpus, 'raise searched on', ['unwind', 'search'],
+                         ['search', 'search'])
+    # A raise in a handler is nested in the frames up to the one that handler
+    # ran for.
+    raise_scenario(corpus, 'raise in a handler', ['raise', 'continue'],
+                   nested=True)
+    # Continuing a noncontinuable exception raises another, which this
+    # handler unwinds.
+    raise_scenario(corpus, 'noncontinuable continued',
+                   ['continue', 'unwind', 'search'],
+                   flags=EXCEPTION_NONCONTINUABLE)
+    # A handler returning what none may raises another, which this handler
+    # unwinds.
+    raise_scenario(corpus, 'invalid disposition',
+                   ['invalid', 'unwind', 'search'])
+    # Continuing that one raises a third, chained to it.
+    raise_scenario(corpus, 'invalid disposition continued',
+                   ['invalid', 'continue', 'unwind', 'search'])
+    # One returned while unwinding is raised from the call that unwinds,
+    # here in the handler, so it is nested.
+    raise_scenario(corpus, 'invalid disposition in an unwind',
+                   ['unwind', 'invalid', 'unwind', 'search'])
+    # An unwind reaching another's handler call takes that one over from the
+    # frame whose handler it called, which is called again.
+    collided_scenario(corpus, 'collided unwind')
+    # The same through a finally handler, whose scope the collided call skips.
+    collided_finally_scenario(corpus, 'collided unwind through a finally')

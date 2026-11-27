@@ -11,7 +11,6 @@
 
 #include <charconv>
 
-#include "xenia/base/byte_stream.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
@@ -141,6 +140,9 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
             OnHostGpuLossFromAnyThread(is_responsible);
           });
     }
+    if (presenter_) {
+      presenter_->SetFrameRateSource([this]() { return GetFramesPerSecond(); });
+    }
   }
 
   // Create command processor. This will spin up a thread to process all
@@ -254,8 +256,6 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
             return 0;
           },
           kernel_state->GetIdleProcess()));
-  // As we run vblank interrupts the debugger must be able to suspend us.
-  frame_limiter_worker_thread_->set_can_debugger_suspend(true);
   frame_limiter_worker_thread_->set_name("GPU Frame limiter");
   frame_limiter_worker_thread_->Create();
   // Linux only sleeps, so kLowest (nice 15) would just add wake-up latency.
@@ -453,6 +453,44 @@ void GraphicsSystem::MarkVblank() {
   DispatchInterruptCallback(0, 2);
 }
 
+void GraphicsSystem::OnGuestSwap() {
+  const uint64_t now = Clock::QueryHostTickCount();
+  const uint64_t frequency = Clock::QueryHostTickFrequency();
+  const uint64_t previous =
+      frame_rate_last_swap_ticks_.exchange(now, std::memory_order_relaxed);
+
+  // The first swap, or the first after a stall, starts a period.
+  if (!previous || now - previous >= frequency * kFrameRateStallMs / 1000) {
+    frame_rate_frames_per_second_.store(0.0f, std::memory_order_relaxed);
+    frame_rate_period_start_ticks_ = now;
+    frame_rate_period_swaps_ = 0;
+    return;
+  }
+
+  ++frame_rate_period_swaps_;
+  const uint64_t elapsed = now - frame_rate_period_start_ticks_;
+  if (elapsed < frequency * kFrameRatePeriodMs / 1000) {
+    return;
+  }
+  frame_rate_frames_per_second_.store(
+      float(double(frame_rate_period_swaps_) * double(frequency) /
+            double(elapsed)),
+      std::memory_order_relaxed);
+  frame_rate_period_start_ticks_ = now;
+  frame_rate_period_swaps_ = 0;
+}
+
+float GraphicsSystem::GetFramesPerSecond() const {
+  const uint64_t last_swap =
+      frame_rate_last_swap_ticks_.load(std::memory_order_relaxed);
+  if (!last_swap ||
+      Clock::QueryHostTickCount() - last_swap >=
+          Clock::QueryHostTickFrequency() * kFrameRateStallMs / 1000) {
+    return 0.0f;
+  }
+  return frame_rate_frames_per_second_.load(std::memory_order_relaxed);
+}
+
 void GraphicsSystem::ClearCaches() {
   command_processor_->CallInThread(
       [&]() { command_processor_->ClearCaches(); });
@@ -474,29 +512,19 @@ void GraphicsSystem::InitializeShaderStorage(
     return;
   }
   if (blocking) {
-    if (command_processor_->is_paused()) {
-      // Safe to run on any thread while the command processor is paused, no
-      // race condition.
-      if (started_callback) {
-        started_callback();
-      }
-      command_processor_->InitializeShaderStorage(
-          cache_root, title_id, true, std::move(completion_callback));
-    } else {
-      xe::threading::Fence fence;
-      command_processor_->CallInThread(
-          [this, cache_root, title_id, &fence,
-           started_callback = std::move(started_callback),
-           completion_callback = std::move(completion_callback)]() mutable {
-            if (started_callback) {
-              started_callback();
-            }
-            command_processor_->InitializeShaderStorage(
-                cache_root, title_id, true, std::move(completion_callback));
-            fence.Signal();
-          });
-      fence.Wait();
-    }
+    xe::threading::Fence fence;
+    command_processor_->CallInThread(
+        [this, cache_root, title_id, &fence,
+         started_callback = std::move(started_callback),
+         completion_callback = std::move(completion_callback)]() mutable {
+          if (started_callback) {
+            started_callback();
+          }
+          command_processor_->InitializeShaderStorage(
+              cache_root, title_id, true, std::move(completion_callback));
+          fence.Signal();
+        });
+    fence.Wait();
   } else {
     command_processor_->CallInThread(
         [this, cache_root, title_id,
@@ -535,32 +563,6 @@ void GraphicsSystem::RequestEndTracing() {
 
 bool GraphicsSystem::is_tracing_stream() const {
   return command_processor_->is_tracing_stream();
-}
-
-void GraphicsSystem::Pause() {
-  paused_ = true;
-
-  command_processor_->Pause();
-}
-
-void GraphicsSystem::Resume() {
-  paused_ = false;
-
-  command_processor_->Resume();
-}
-
-bool GraphicsSystem::Save(ByteStream* stream) {
-  stream->Write<uint32_t>(interrupt_callback_);
-  stream->Write<uint32_t>(interrupt_callback_data_);
-
-  return command_processor_->Save(stream);
-}
-
-bool GraphicsSystem::Restore(ByteStream* stream) {
-  interrupt_callback_ = stream->Read<uint32_t>();
-  interrupt_callback_data_ = stream->Read<uint32_t>();
-
-  return command_processor_->Restore(stream);
 }
 
 std::pair<uint16_t, uint16_t> GraphicsSystem::GetInternalDisplayResolution() {

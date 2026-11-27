@@ -15,7 +15,6 @@
 
 #include "third_party/fmt/include/fmt/format.h"
 #include "third_party/stb/stb_image_write.h"
-#include "xenia/base/byte_stream.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
@@ -32,15 +31,11 @@
 #include "xenia/kernel/user_module.h"
 #include "xenia/ui/presenter.h"
 
-#if !defined(NDEBUG)
-
-#define XE_ENABLE_GPU_REG_WRITE_LOGGING 1
-#endif
 DEFINE_bool(
     log_guest_driven_gpu_register_written_values, false,
-    "Only does anything in debug builds, if set will log every write to a gpu "
-    "register done by a guest. Does not log writes that are done by the CP on "
-    "its own, just ones the guest makes or instructs it to make.",
+    "Log every write to a gpu register done by a guest, at the debug log "
+    "level. Does not log writes that are done by the CP on its own, just ones "
+    "the guest makes or instructs it to make.",
     "Logging");
 
 DEFINE_uint32(log_fps, 0,
@@ -68,7 +63,7 @@ DEFINE_bool(clear_memory_page_state, false,
 UPDATE_from_bool(clear_memory_page_state, 2026, 8, 1, 12, true);
 
 DEFINE_string(
-    occlusion_query, "fast",
+    occlusion_query, "strict",
     "Controls hardware occlusion query behavior for EVENT_WRITE_ZPD.\n"
     "Used for effects like lens flares, object culling, and auto-exposure.\n"
     "Titles that use QueryBatch are not currently supported and fall back to\n"
@@ -77,13 +72,14 @@ DEFINE_string(
     "       though some effects may look slightly wrong.\n"
     " fast: Ask the GPU but don't wait for the answer. Writes a cached\n"
     "       result immediately and updates it when the GPU catches up.\n"
-    "       Cached results bias toward visible when guessing. (default)\n"
+    "       Cached results bias toward visible when guessing.\n"
     " fast-alt: Variant of fast mode that keeps cached zero results for\n"
     "           unresolved reports. May improve effects relying on precise\n"
     "           visibility, but may be less stable for occlusion culling.\n"
     " strict: Ask the GPU and wait for the real result before continuing.\n"
-    "         Most accurate, but may be somewhat less performant.",
+    "         Most accurate, but may be somewhat less performant. (default)",
     "GPU");
+UPDATE_from_string(occlusion_query, 2026, 11, 23, 6, "fast");
 
 DEFINE_bool(
     occlusion_query_full_counters, false,
@@ -416,17 +412,23 @@ void CommandProcessor::CallInThread(std::function<void()> fn) {
       return;
     }
   }
+  // Outside the lock, fn may call in the thread again.
   fn();
 }
 
-void CommandProcessor::RunPendingFns() {
-  while (pending_fns_queued_.load(std::memory_order_acquire)) {
+bool CommandProcessor::HasPendingFunctions() const {
+  // Without the lock, for the worker's idle spin.
+  return pending_fns_queued_.load(std::memory_order_acquire);
+}
+
+void CommandProcessor::RunPendingFunctions() {
+  while (HasPendingFunctions()) {
     std::function<void()> fn;
     {
       std::lock_guard<std::mutex> lock(pending_fns_mutex_);
       if (pending_fns_.empty()) {
         pending_fns_queued_.store(false, std::memory_order_relaxed);
-        break;
+        return;
       }
       fn = std::move(pending_fns_.front());
       pending_fns_.pop();
@@ -452,15 +454,22 @@ void CommandProcessor::SetZPDMode(ZPDMode mode) {
   if (cached_zpd_mode_ == mode) {
     return;
   }
-  // Close any active query segment before the mode changes so that a
-  // BeginQuery recorded under the old mode gets a matching EndQuery.
-  // Without this, switching to kFake mid-frame would cause EndRenderPass
-  // to skip CloseQuerySegment, leaving the query dangling.
-  if (active_segment_.segment_active) {
-    CloseQuerySegment();
-  }
   cached_zpd_mode_ = mode;
-  zpd_mode_ = mode;
+  // The query state and the command list it records into belong to the
+  // command processor thread, while this is called from the UI.
+  CallInThread([this, mode]() {
+    if (zpd_mode_ == mode) {
+      return;
+    }
+    // Close any active query segment before the mode changes so that a
+    // BeginQuery recorded under the old mode gets a matching EndQuery.
+    // Without this, switching to kFake mid-frame would make Metal's
+    // EndRenderEncoder skip CloseQuerySegment, leaving the query dangling.
+    if (active_segment_.segment_active) {
+      CloseQuerySegment();
+    }
+    zpd_mode_ = mode;
+  });
   const char* mode_str = "fake";
   switch (mode) {
     case ZPDMode::kFast:
@@ -639,7 +648,7 @@ void CommandProcessor::WorkerThreadMain() {
   SetTitleStateSuffix(MakeTitleStateSuffix());
 
   while (worker_running_) {
-    RunPendingFns();
+    RunPendingFunctions();
 
     uint32_t write_ptr_index = write_ptr_index_.load();
     if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
@@ -656,7 +665,7 @@ void CommandProcessor::WorkerThreadMain() {
         // If we spin around too much, revert to a "low-power" state.
         if (loop_count > 500) {
           constexpr int wait_time_ms = 2;
-          xe::threading::Wait(write_ptr_index_event_.get(), true,
+          xe::threading::Wait(write_ptr_index_event_.get(),
                               std::chrono::milliseconds(wait_time_ms));
           // Strict ZPD may still owe the guest a report it's spinning on with
           // nothing left in the ring.
@@ -670,8 +679,7 @@ void CommandProcessor::WorkerThreadMain() {
         // The guest may be spinning on a held-back signal.
         SubmitHeldSignals();
         write_ptr_index = write_ptr_index_.load();
-      } while (worker_running_ &&
-               !pending_fns_queued_.load(std::memory_order_acquire) &&
+      } while (worker_running_ && !HasPendingFunctions() &&
                (write_ptr_index == 0xBAADF00D ||
                 read_ptr_index_ == write_ptr_index));
       ReturnFromWait();
@@ -681,8 +689,7 @@ void CommandProcessor::WorkerThreadMain() {
                 std::chrono::steady_clock::now() - stall_start)
                 .count();
       }
-      if (!worker_running_ ||
-          pending_fns_queued_.load(std::memory_order_acquire)) {
+      if (!worker_running_ || HasPendingFunctions()) {
         continue;
       }
     }
@@ -709,56 +716,6 @@ void CommandProcessor::WorkerThreadMain() {
   // The guest they are for is going away.
   held_guest_signals_.clear();
   ShutdownContext();
-}
-
-void CommandProcessor::Pause() {
-  if (paused_) {
-    return;
-  }
-  paused_ = true;
-
-  threading::Fence fence;
-  CallInThread([&fence]() {
-    fence.Signal();
-    threading::Thread::GetCurrentThread()->Suspend();
-  });
-
-  fence.Wait();
-}
-
-void CommandProcessor::Resume() {
-  if (!paused_) {
-    return;
-  }
-  paused_ = false;
-
-  worker_thread_->thread()->Resume();
-}
-
-bool CommandProcessor::Save(ByteStream* stream) {
-  assert_true(paused_);
-
-  stream->Write<uint32_t>(primary_buffer_ptr_);
-  stream->Write<uint32_t>(primary_buffer_size_);
-  stream->Write<uint32_t>(read_ptr_index_);
-  stream->Write<uint32_t>(read_ptr_update_freq_);
-  stream->Write<uint32_t>(read_ptr_writeback_ptr_);
-  stream->Write<uint32_t>(write_ptr_index_.load());
-
-  return true;
-}
-
-bool CommandProcessor::Restore(ByteStream* stream) {
-  assert_true(paused_);
-
-  primary_buffer_ptr_ = stream->Read<uint32_t>();
-  primary_buffer_size_ = stream->Read<uint32_t>();
-  read_ptr_index_ = stream->Read<uint32_t>();
-  read_ptr_update_freq_ = stream->Read<uint32_t>();
-  read_ptr_writeback_ptr_ = stream->Read<uint32_t>();
-  write_ptr_index_.store(stream->Read<uint32_t>());
-
-  return true;
 }
 
 bool CommandProcessor::SetupContext() {
@@ -831,7 +788,6 @@ void CommandProcessor::UpdateWritePointer(uint32_t value) {
 }
 
 void CommandProcessor::LogRegisterSet(uint32_t register_index, uint32_t value) {
-#if XE_ENABLE_GPU_REG_WRITE_LOGGING == 1
   if (cvars::log_guest_driven_gpu_register_written_values &&
       logging::ShouldLog(LogLevel::Debug)) {
     const RegisterInfo* reginfo = RegisterFile::GetRegisterInfo(register_index);
@@ -842,22 +798,14 @@ void CommandProcessor::LogRegisterSet(uint32_t register_index, uint32_t value) {
       XELOGD("{} <- {:08X}\n", reginfo->name, value);
     }
   }
-#endif
 }
 
 void CommandProcessor::LogRegisterSets(uint32_t base_register_index,
                                        const uint32_t* values,
                                        uint32_t n_values) {
-#if XE_ENABLE_GPU_REG_WRITE_LOGGING == 1
   if (cvars::log_guest_driven_gpu_register_written_values &&
       logging::ShouldLog(LogLevel::Debug)) {
-    auto target = logging::internal::GetThreadBuffer();
-
-    auto target_ptr = target.first;
-
-    size_t total_size = 0;
-
-    size_t rem_size = target.second;
+    logging::LoggerBatch<LogLevel::Debug> logger{};
 
     for (uint32_t i = 0; i < n_values; ++i) {
       uint32_t register_index = base_register_index + i;
@@ -868,24 +816,13 @@ void CommandProcessor::LogRegisterSets(uint32_t base_register_index,
           RegisterFile::GetRegisterInfo(register_index);
 
       if (!reginfo) {
-        auto tmpres = fmt::format_to_n(target_ptr, rem_size,
-                                       "Unknown_Reg{:04X} <- {:08X}\n",
-                                       register_index, value);
-        target_ptr = tmpres.out;
-        rem_size -= tmpres.size;
-        total_size += tmpres.size;
-
+        logger("Unknown_Reg{:04X} <- {:08X}\n", register_index, value);
       } else {
-        auto tmpres = fmt::format_to_n(target_ptr, rem_size, "{} <- {:08X}\n",
-                                       reginfo->name, value);
-        rem_size -= tmpres.size;
-        target_ptr = tmpres.out;
-        total_size += tmpres.size;
+        logger("{} <- {:08X}\n", reginfo->name, value);
       }
     }
-    logging::internal::AppendLogLine(LogLevel::Debug, 'd', total_size);
+    logger.submit('d');
   }
-#endif
 }
 
 void CommandProcessor::WriteGuestFence(uint8_t* destination,
@@ -1793,8 +1730,26 @@ void CommandProcessor::PrepareZPDForWait() {
   if (!wait_report || !wait_report->pending_segments) {
     return;
   }
-  if (AwaitQueryResolve(wait_report->handle,
-                        wait_report->last_segment_end_submission)) {
+  // Only a GPU wait on an empty ring can hold back commands the guest writes
+  // during it. Waits from WAIT_REG_MEM are mid-buffer and excluded.
+  const uint32_t write_ptr_index = write_ptr_index_.load();
+  const bool log_wait =
+      cvars::occlusion_query_log && write_ptr_index == read_ptr_index_ &&
+      wait_report->last_segment_end_submission > GetCompletedSubmission();
+  std::chrono::steady_clock::time_point wait_start;
+  if (log_wait) {
+    wait_start = std::chrono::steady_clock::now();
+  }
+  const bool resolved = AwaitQueryResolve(
+      wait_report->handle, wait_report->last_segment_end_submission);
+  if (log_wait && write_ptr_index_.load() != write_ptr_index) {
+    zpd_stats_.strict_waits_delaying++;
+    zpd_stats_.strict_waits_delaying_us +=
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - wait_start)
+            .count();
+  }
+  if (resolved) {
     PumpPendingRetire();
     return;
   }

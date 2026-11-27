@@ -28,6 +28,70 @@ Value* CalculateEA_0(PPCHIRBuilder& f, uint32_t ra, uint32_t rb);
 
 #define SHUFPS_SWAP_DWORDS 0x1B
 
+// Sets VSCR[SAT] if any lane of saturated is nonzero. SAT stays set until
+// mtvscr clears it. It's kept in vscr_sat, which mfvscr merges into the low
+// bit of VSCR, so a saturating instruction only ORs one byte. DID_SATURATE is
+// whether any lane is nonzero (vptest on x64, umaxv on ARM64). Without an
+// mfvscr to read it SAT isn't set, and the dead lane checks go.
+static void SetSatIfAny(PPCHIRBuilder& f, Value* saturated) {
+  if (!f.vscr_sat_observable()) {
+    return;
+  }
+  f.StoreSAT(f.Or(f.LoadSAT(), f.DidSaturate(saturated)));
+}
+
+// VSCR[SAT] after a saturating add or subtract: a lane saturated where the
+// result differs from the wrapping one
+static void StoreSatForAddSub(PPCHIRBuilder& f, Value* v, bool subtract,
+                              uint32_t va, uint32_t vb, TypeName part_type) {
+  Value* wrapped = subtract
+                       ? f.VectorSub(f.LoadVR(va), f.LoadVR(vb), part_type)
+                       : f.VectorAdd(f.LoadVR(va), f.LoadVR(vb), part_type);
+  SetSatIfAny(f, f.Not(f.VectorCompareEQ(v, wrapped, part_type)));
+}
+
+// VSCR[SAT] after a saturating pack: a lane of either input saturated where it
+// was outside the output's range. part_type is the input lanes' type.
+static void StoreSatForPack(PPCHIRBuilder& f, Value* v, uint32_t va,
+                            uint32_t vb, TypeName part_type, bool in_signed,
+                            bool out_signed) {
+  uint32_t bits = part_type == INT16_TYPE ? 8 : 16;
+  int32_t max = out_signed ? (1 << (bits - 1)) - 1 : (1 << bits) - 1;
+  int32_t min = out_signed ? -(1 << (bits - 1)) : 0;
+  auto splat = [&](int32_t value) {
+    return f.LoadConstantVec128(part_type == INT16_TYPE
+                                    ? vec128s(static_cast<uint16_t>(value))
+                                    : vec128i(static_cast<uint32_t>(value)));
+  };
+  Value* saturated = nullptr;
+  for (uint32_t vr : {va, vb}) {
+    Value* input = f.LoadVR(vr);
+    Value* out_of_range =
+        in_signed ? f.Or(f.VectorCompareSGT(input, splat(max), part_type),
+                         f.VectorCompareSGT(splat(min), input, part_type))
+                  : f.VectorCompareUGT(input, splat(max), part_type);
+    saturated = saturated ? f.Or(saturated, out_of_range) : out_of_range;
+  }
+  SetSatIfAny(f, saturated);
+}
+
+// VSCR[SAT] after vctsxs and vctuxs: an input that truncates outside the
+// result's range saturates. A NaN converts to 0 without setting SAT, and the
+// compares are false for it.
+static void StoreSatForConvert(PPCHIRBuilder& f, Value* v, Value* input,
+                               bool is_unsigned) {
+  float limit = is_unsigned ? 4294967296.0f : 2147483648.0f;
+  float lowest = is_unsigned ? -1.0f : -2147483648.0f;
+  Value* too_large = f.VectorCompareSGE(
+      input, f.Splat(f.LoadConstantFloat32(limit), VEC128_TYPE), FLOAT32_TYPE);
+  Value* lowest_v = f.Splat(f.LoadConstantFloat32(lowest), VEC128_TYPE);
+  // Signed, the lowest value itself is in range; unsigned, -1 truncates to -1
+  Value* too_small = is_unsigned
+                         ? f.VectorCompareSGE(lowest_v, input, FLOAT32_TYPE)
+                         : f.VectorCompareSGT(lowest_v, input, FLOAT32_TYPE);
+  SetSatIfAny(f, f.Or(too_large, too_small));
+}
+
 // Most of this file comes from:
 // http://biallas.net/doc/vmx128/vmx128.txt
 // https://github.com/kakaroto/ps3ida/blob/master/plugins/PPCAltivec/src/main.cpp
@@ -302,8 +366,11 @@ int InstrEmit_stvrxl128(PPCHIRBuilder& f, const InstrData& i) {
 
 int InstrEmit_mfvscr(PPCHIRBuilder& f, const InstrData& i) {
   // mfvscr VD - Move from VSCR to VD
-  f.StoreVR(i.VX.VD,
-            f.LoadContext(offsetof(PPCContext, vscr_vec), VEC128_TYPE));
+  // SAT is kept apart in vscr_sat (see SetSatIfAny), and goes in the low bit
+  Value* v = f.LoadContext(offsetof(PPCContext, vscr_vec), VEC128_TYPE);
+  Value* word = f.Or(f.Extract(v, (uint8_t)3, INT32_TYPE),
+                     f.ZeroExtend(f.LoadSAT(), INT32_TYPE));
+  f.StoreVR(i.VX.VD, f.Insert(v, uint64_t(3), word));
   return 0;
 }
 
@@ -317,6 +384,9 @@ int InstrEmit_mtvscr(PPCHIRBuilder& f, const InstrData& i) {
   Value* has_njm_value = f.Extract(v, (uint8_t)3, INT32_TYPE);
 
   f.SetNJM(f.IsTrue(f.And(has_njm_value, f.LoadConstantInt32(65536))));
+  // SAT, which the saturating instructions OR into vscr_sat
+  f.StoreSAT(
+      f.Truncate(f.And(has_njm_value, f.LoadConstantInt32(1)), INT8_TYPE));
 
   f.StoreContext(offsetof(PPCContext, vscr_vec), v);
   return 0;
@@ -348,7 +418,7 @@ int InstrEmit_vaddfp128(PPCHIRBuilder& f, const InstrData& i) {
 int InstrEmit_vaddsbs(PPCHIRBuilder& f, const InstrData& i) {
   Value* v = f.VectorAdd(f.LoadVR(i.VX.VA), f.LoadVR(i.VX.VB), INT8_TYPE,
                          ARITHMETIC_SATURATE);
-  f.StoreSAT(f.DidSaturate(v));
+  StoreSatForAddSub(f, v, false, i.VX.VA, i.VX.VB, INT8_TYPE);
   f.StoreVR(i.VX.VD, v);
   return 0;
 }
@@ -356,7 +426,7 @@ int InstrEmit_vaddsbs(PPCHIRBuilder& f, const InstrData& i) {
 int InstrEmit_vaddshs(PPCHIRBuilder& f, const InstrData& i) {
   Value* v = f.VectorAdd(f.LoadVR(i.VX.VA), f.LoadVR(i.VX.VB), INT16_TYPE,
                          ARITHMETIC_SATURATE);
-  f.StoreSAT(f.DidSaturate(v));
+  StoreSatForAddSub(f, v, false, i.VX.VA, i.VX.VB, INT16_TYPE);
   f.StoreVR(i.VX.VD, v);
   return 0;
 }
@@ -364,7 +434,7 @@ int InstrEmit_vaddshs(PPCHIRBuilder& f, const InstrData& i) {
 int InstrEmit_vaddsws(PPCHIRBuilder& f, const InstrData& i) {
   Value* v = f.VectorAdd(f.LoadVR(i.VX.VA), f.LoadVR(i.VX.VB), INT32_TYPE,
                          ARITHMETIC_SATURATE);
-  f.StoreSAT(f.DidSaturate(v));
+  StoreSatForAddSub(f, v, false, i.VX.VA, i.VX.VB, INT32_TYPE);
   f.StoreVR(i.VX.VD, v);
   return 0;
 }
@@ -379,7 +449,7 @@ int InstrEmit_vaddubm(PPCHIRBuilder& f, const InstrData& i) {
 int InstrEmit_vaddubs(PPCHIRBuilder& f, const InstrData& i) {
   Value* v = f.VectorAdd(f.LoadVR(i.VX.VA), f.LoadVR(i.VX.VB), INT8_TYPE,
                          ARITHMETIC_UNSIGNED | ARITHMETIC_SATURATE);
-  f.StoreSAT(f.DidSaturate(v));
+  StoreSatForAddSub(f, v, false, i.VX.VA, i.VX.VB, INT8_TYPE);
   f.StoreVR(i.VX.VD, v);
   return 0;
 }
@@ -394,7 +464,7 @@ int InstrEmit_vadduhm(PPCHIRBuilder& f, const InstrData& i) {
 int InstrEmit_vadduhs(PPCHIRBuilder& f, const InstrData& i) {
   Value* v = f.VectorAdd(f.LoadVR(i.VX.VA), f.LoadVR(i.VX.VB), INT16_TYPE,
                          ARITHMETIC_UNSIGNED | ARITHMETIC_SATURATE);
-  f.StoreSAT(f.DidSaturate(v));
+  StoreSatForAddSub(f, v, false, i.VX.VA, i.VX.VB, INT16_TYPE);
   f.StoreVR(i.VX.VD, v);
   return 0;
 }
@@ -409,7 +479,7 @@ int InstrEmit_vadduwm(PPCHIRBuilder& f, const InstrData& i) {
 int InstrEmit_vadduws(PPCHIRBuilder& f, const InstrData& i) {
   Value* v = f.VectorAdd(f.LoadVR(i.VX.VA), f.LoadVR(i.VX.VB), INT32_TYPE,
                          ARITHMETIC_UNSIGNED | ARITHMETIC_SATURATE);
-  f.StoreSAT(f.DidSaturate(v));
+  StoreSatForAddSub(f, v, false, i.VX.VA, i.VX.VB, INT32_TYPE);
   f.StoreVR(i.VX.VD, v);
   return 0;
 }
@@ -528,8 +598,9 @@ int InstrEmit_vctsxs_(PPCHIRBuilder& f, uint32_t vd, uint32_t vb,
   float fuimm = static_cast<float>(std::exp2(uimm));
   Value* v =
       f.Mul(f.LoadVR(vb), f.Splat(f.LoadConstantFloat32(fuimm), VEC128_TYPE));
+  Value* input = v;
   v = f.VectorConvertF2I(v);
-  f.StoreSAT(f.DidSaturate(v));
+  StoreSatForConvert(f, v, input, false);
   f.StoreVR(vd, v);
   return 0;
 }
@@ -546,8 +617,9 @@ int InstrEmit_vctuxs_(PPCHIRBuilder& f, uint32_t vd, uint32_t vb,
   float fuimm = static_cast<float>(std::exp2(uimm));
   Value* v =
       f.Mul(f.LoadVR(vb), f.Splat(f.LoadConstantFloat32(fuimm), VEC128_TYPE));
+  Value* input = v;
   v = f.VectorConvertF2I(v, ARITHMETIC_UNSIGNED);
-  f.StoreSAT(f.DidSaturate(v));
+  StoreSatForConvert(f, v, input, true);
   f.StoreVR(vd, v);
   return 0;
 }
@@ -1370,24 +1442,12 @@ int InstrEmit_vsel(PPCHIRBuilder& f, const InstrData& i) {
 int InstrEmit_vsel128(PPCHIRBuilder& f, const InstrData& i) {
   return InstrEmit_vsel_(f, VX128_VD128, VX128_VA128, VX128_VB128, VX128_VD128);
 }
-// chrispy: this is test code for checking whether a game takes advantage of the
-// VSR/VSL undocumented/undefined variable shift behavior
-static void AssertShiftElementsOk(PPCHIRBuilder& f, Value* v) {
-#if 0
-  Value* splatted = f.Splat(f.Extract(v, (uint8_t)0, INT8_TYPE), VEC128_TYPE);
-
-  Value* checkequal = f.Xor(splatted, v);
-  f.DebugBreakTrue(f.IsTrue(checkequal));
-#endif
-}
+// vsl and vsr shift each byte by the low 3 bits of its own byte of VB, taking
+// bits from the byte next to it. The books leave counts that differ
+// undefined. Code nearly always splats the count, and the backends check for
+// that.
 int InstrEmit_vsl(PPCHIRBuilder& f, const InstrData& i) {
-  Value* va = f.LoadVR(i.VX.VA);
-  Value* vb = f.LoadVR(i.VX.VB);
-
-  AssertShiftElementsOk(f, vb);
-  Value* v =
-      f.Shl(va, f.And(f.Extract(vb, 15, INT8_TYPE), f.LoadConstantInt8(0b111)));
-  f.StoreVR(i.VX.VD, v);
+  f.StoreVR(i.VX.VD, f.VectorShlBits(f.LoadVR(i.VX.VA), f.LoadVR(i.VX.VB)));
   return 0;
 }
 
@@ -1514,8 +1574,10 @@ int InstrEmit_vsplth(PPCHIRBuilder& f, const InstrData& i) {
 int InstrEmit_vspltw_(PPCHIRBuilder& f, uint32_t vd, uint32_t vb,
                       uint32_t uimm) {
   // (VD.xyzw) <- (VB.uimm)
-  Value* w = f.Extract(f.LoadVR(vb), uimm & 0x3, INT32_TYPE);
-  Value* v = f.Splat(w, VEC128_TYPE);
+  // One vpshufd, instead of extracting the word to a GPR and splatting it
+  uint32_t word = uimm & 0x3;
+  Value* v = f.Swizzle(f.LoadVR(vb), INT32_TYPE,
+                       MakeSwizzleMask(word, word, word, word));
   f.StoreVR(vd, v);
   return 0;
 }
@@ -1578,14 +1640,7 @@ int InstrEmit_vspltisw128(PPCHIRBuilder& f, const InstrData& i) {
 }
 
 int InstrEmit_vsr(PPCHIRBuilder& f, const InstrData& i) {
-  Value* va = f.LoadVR(i.VX.VA);
-  Value* vb = f.LoadVR(i.VX.VB);
-
-  AssertShiftElementsOk(f, vb);
-
-  Value* v =
-      f.Shr(va, f.And(f.Extract(vb, 15, INT8_TYPE), f.LoadConstantInt8(0b111)));
-  f.StoreVR(i.VX.VD, v);
+  f.StoreVR(i.VX.VD, f.VectorShrBits(f.LoadVR(i.VX.VA), f.LoadVR(i.VX.VB)));
   return 0;
 }
 
@@ -1687,7 +1742,7 @@ int InstrEmit_vsubsbs(PPCHIRBuilder& f, const InstrData& i) {
   // (VD) <- clamp(EXTS(VA) + ¬EXTS(VB) + 1, -128, 127)
   Value* v = f.VectorSub(f.LoadVR(i.VX.VA), f.LoadVR(i.VX.VB), INT8_TYPE,
                          ARITHMETIC_SATURATE);
-  f.StoreSAT(f.DidSaturate(v));
+  StoreSatForAddSub(f, v, true, i.VX.VA, i.VX.VB, INT8_TYPE);
   f.StoreVR(i.VX.VD, v);
   return 0;
 }
@@ -1696,7 +1751,7 @@ int InstrEmit_vsubshs(PPCHIRBuilder& f, const InstrData& i) {
   // (VD) <- clamp(EXTS(VA) + ¬EXTS(VB) + 1, -2^15, 2^15-1)
   Value* v = f.VectorSub(f.LoadVR(i.VX.VA), f.LoadVR(i.VX.VB), INT16_TYPE,
                          ARITHMETIC_SATURATE);
-  f.StoreSAT(f.DidSaturate(v));
+  StoreSatForAddSub(f, v, true, i.VX.VA, i.VX.VB, INT16_TYPE);
   f.StoreVR(i.VX.VD, v);
   return 0;
 }
@@ -1705,7 +1760,7 @@ int InstrEmit_vsubsws(PPCHIRBuilder& f, const InstrData& i) {
   // (VD) <- clamp(EXTS(VA) + ¬EXTS(VB) + 1, -2^31, 2^31-1)
   Value* v = f.VectorSub(f.LoadVR(i.VX.VA), f.LoadVR(i.VX.VB), INT32_TYPE,
                          ARITHMETIC_SATURATE);
-  f.StoreSAT(f.DidSaturate(v));
+  StoreSatForAddSub(f, v, true, i.VX.VA, i.VX.VB, INT32_TYPE);
   f.StoreVR(i.VX.VD, v);
   return 0;
 }
@@ -1738,7 +1793,7 @@ int InstrEmit_vsububs(PPCHIRBuilder& f, const InstrData& i) {
   // (VD) <- clamp(EXTZ(VA) + ¬EXTZ(VB) + 1, 0, 256)
   Value* v = f.VectorSub(f.LoadVR(i.VX.VA), f.LoadVR(i.VX.VB), INT8_TYPE,
                          ARITHMETIC_SATURATE | ARITHMETIC_UNSIGNED);
-  f.StoreSAT(f.DidSaturate(v));
+  StoreSatForAddSub(f, v, true, i.VX.VA, i.VX.VB, INT8_TYPE);
   f.StoreVR(i.VX.VD, v);
   return 0;
 }
@@ -1747,7 +1802,7 @@ int InstrEmit_vsubuhs(PPCHIRBuilder& f, const InstrData& i) {
   // (VD) <- clamp(EXTZ(VA) + ¬EXTZ(VB) + 1, 0, 2^16-1)
   Value* v = f.VectorSub(f.LoadVR(i.VX.VA), f.LoadVR(i.VX.VB), INT16_TYPE,
                          ARITHMETIC_SATURATE | ARITHMETIC_UNSIGNED);
-  f.StoreSAT(f.DidSaturate(v));
+  StoreSatForAddSub(f, v, true, i.VX.VA, i.VX.VB, INT16_TYPE);
   f.StoreVR(i.VX.VD, v);
   return 0;
 }
@@ -1756,7 +1811,7 @@ int InstrEmit_vsubuws(PPCHIRBuilder& f, const InstrData& i) {
   // (VD) <- clamp(EXTZ(VA) + ¬EXTZ(VB) + 1, 0, 2^32-1)
   Value* v = f.VectorSub(f.LoadVR(i.VX.VA), f.LoadVR(i.VX.VB), INT32_TYPE,
                          ARITHMETIC_SATURATE | ARITHMETIC_UNSIGNED);
-  f.StoreSAT(f.DidSaturate(v));
+  StoreSatForAddSub(f, v, true, i.VX.VA, i.VX.VB, INT32_TYPE);
   f.StoreVR(i.VX.VD, v);
   return 0;
 }
@@ -1831,7 +1886,7 @@ int InstrEmit_vpkshss_(PPCHIRBuilder& f, uint32_t vd, uint32_t va,
   Value* v = f.Pack(f.LoadVR(va), f.LoadVR(vb),
                     PACK_TYPE_8_IN_16 | PACK_TYPE_IN_SIGNED |
                         PACK_TYPE_OUT_SIGNED | PACK_TYPE_OUT_SATURATE);
-  f.StoreSAT(f.DidSaturate(v));
+  StoreSatForPack(f, v, va, vb, INT16_TYPE, true, true);
   f.StoreVR(vd, v);
   return 0;
 }
@@ -1853,7 +1908,7 @@ int InstrEmit_vpkswss_(PPCHIRBuilder& f, uint32_t vd, uint32_t va,
   Value* v = f.Pack(f.LoadVR(va), f.LoadVR(vb),
                     PACK_TYPE_16_IN_32 | PACK_TYPE_IN_SIGNED |
                         PACK_TYPE_OUT_SIGNED | PACK_TYPE_OUT_SATURATE);
-  f.StoreSAT(f.DidSaturate(v));
+  StoreSatForPack(f, v, va, vb, INT32_TYPE, true, true);
   f.StoreVR(vd, v);
   return 0;
 }
@@ -1875,7 +1930,7 @@ int InstrEmit_vpkswus_(PPCHIRBuilder& f, uint32_t vd, uint32_t va,
   Value* v = f.Pack(f.LoadVR(va), f.LoadVR(vb),
                     PACK_TYPE_16_IN_32 | PACK_TYPE_IN_SIGNED |
                         PACK_TYPE_OUT_UNSIGNED | PACK_TYPE_OUT_SATURATE);
-  f.StoreSAT(f.DidSaturate(v));
+  StoreSatForPack(f, v, va, vb, INT32_TYPE, true, false);
   f.StoreVR(vd, v);
   return 0;
 }
@@ -1917,7 +1972,7 @@ int InstrEmit_vpkuhus_(PPCHIRBuilder& f, uint32_t vd, uint32_t va,
   Value* v = f.Pack(f.LoadVR(va), f.LoadVR(vb),
                     PACK_TYPE_8_IN_16 | PACK_TYPE_IN_UNSIGNED |
                         PACK_TYPE_OUT_UNSIGNED | PACK_TYPE_OUT_SATURATE);
-  f.StoreSAT(f.DidSaturate(v));
+  StoreSatForPack(f, v, va, vb, INT16_TYPE, false, false);
   f.StoreVR(vd, v);
   return 0;
 }
@@ -1939,7 +1994,7 @@ int InstrEmit_vpkshus_(PPCHIRBuilder& f, uint32_t vd, uint32_t va,
   Value* v = f.Pack(f.LoadVR(va), f.LoadVR(vb),
                     PACK_TYPE_8_IN_16 | PACK_TYPE_IN_SIGNED |
                         PACK_TYPE_OUT_UNSIGNED | PACK_TYPE_OUT_SATURATE);
-  f.StoreSAT(f.DidSaturate(v));
+  StoreSatForPack(f, v, va, vb, INT16_TYPE, true, false);
   f.StoreVR(vd, v);
   return 0;
 }
@@ -1981,7 +2036,7 @@ int InstrEmit_vpkuwus_(PPCHIRBuilder& f, uint32_t vd, uint32_t va,
   Value* v = f.Pack(f.LoadVR(va), f.LoadVR(vb),
                     PACK_TYPE_16_IN_32 | PACK_TYPE_IN_UNSIGNED |
                         PACK_TYPE_OUT_UNSIGNED | PACK_TYPE_OUT_SATURATE);
-  f.StoreSAT(f.DidSaturate(v));
+  StoreSatForPack(f, v, va, vb, INT32_TYPE, false, false);
   f.StoreVR(vd, v);
   return 0;
 }
@@ -1992,14 +2047,32 @@ int InstrEmit_vpkuwus128(PPCHIRBuilder& f, const InstrData& i) {
   return InstrEmit_vpkuwus_(f, VX128_VD128, VX128_VA128, VX128_VB128);
 }
 
+int InstrEmit_vupkpx_(PPCHIRBuilder& f, const InstrData& i, uint32_t half) {
+  // Vector Unpack High/Low Pixel
+  // Each 1:5:5:5 halfword becomes a word: the sign bit extended to a byte, then
+  // each 5-bit field zero-extended to a byte. Sign-extending the halfwords to
+  // words gives the first byte, then the fields are shifted into place.
+  Value* v = f.Unpack(f.LoadVR(i.VX.VB), half | PACK_TYPE_16_IN_32 |
+                                             PACK_TYPE_IN_SIGNED |
+                                             PACK_TYPE_OUT_SIGNED);
+  Value* sign = f.And(v, f.LoadConstantVec128(vec128i(0xFF000000)));
+  Value* red =
+      f.And(f.VectorShl(v, f.LoadConstantVec128(vec128i(6)), INT32_TYPE),
+            f.LoadConstantVec128(vec128i(0x001F0000)));
+  Value* green =
+      f.And(f.VectorShl(v, f.LoadConstantVec128(vec128i(3)), INT32_TYPE),
+            f.LoadConstantVec128(vec128i(0x00001F00)));
+  Value* blue = f.And(v, f.LoadConstantVec128(vec128i(0x0000001F)));
+  f.StoreVR(i.VX.VD, f.Or(f.Or(sign, red), f.Or(green, blue)));
+  return 0;
+}
+
 int InstrEmit_vupkhpx(PPCHIRBuilder& f, const InstrData& i) {
-  XEINSTRNOTIMPLEMENTED();
-  return 1;
+  return InstrEmit_vupkpx_(f, i, PACK_TYPE_TO_HI);
 }
 
 int InstrEmit_vupklpx(PPCHIRBuilder& f, const InstrData& i) {
-  XEINSTRNOTIMPLEMENTED();
-  return 1;
+  return InstrEmit_vupkpx_(f, i, PACK_TYPE_TO_LO);
 }
 
 int InstrEmit_vupkhsh_(PPCHIRBuilder& f, uint32_t vd, uint32_t vb) {
@@ -2072,22 +2145,23 @@ int InstrEmit_vpkd3d128(PPCHIRBuilder& f, const InstrData& i) {
   uint32_t type = i.VX128_4.IMM >> 2;
   uint32_t pack = i.VX128_4.IMM & 0x3;
   uint32_t shift = i.VX128_4.z;
+  const uint32_t sat = f.vscr_sat_observable() ? PACK_TYPE_SET_SAT : 0;
   Value* v = f.LoadVR(vb);
   switch (type) {
     case 0:  // VPACK_D3DCOLOR
-      v = f.Pack(v, PACK_TYPE_D3DCOLOR);
+      v = f.Pack(v, PACK_TYPE_D3DCOLOR | sat);
       break;
     case 1:  // VPACK_NORMSHORT2
-      v = f.Pack(v, PACK_TYPE_SHORT_2);
+      v = f.Pack(v, PACK_TYPE_SHORT_2 | sat);
       break;
     case 2:  // VPACK_NORMPACKED32 2_10_10_10 w_z_y_x
-      v = f.Pack(v, PACK_TYPE_UINT_2101010);
+      v = f.Pack(v, PACK_TYPE_UINT_2101010 | sat);
       break;
     case 3:  // VPACK_FLOAT16_2 DXGI_FORMAT_R16G16_FLOAT
       v = f.Pack(v, PACK_TYPE_FLOAT16_2);
       break;
     case 4:  // VPACK_NORMSHORT4
-      v = f.Pack(v, PACK_TYPE_SHORT_4);
+      v = f.Pack(v, PACK_TYPE_SHORT_4 | sat);
       break;
     case 5:  // VPACK_FLOAT16_4 DXGI_FORMAT_R16G16B16A16_FLOAT
       v = f.Pack(v, PACK_TYPE_FLOAT16_4);
@@ -2095,7 +2169,7 @@ int InstrEmit_vpkd3d128(PPCHIRBuilder& f, const InstrData& i) {
     case 6:  // VPACK_NORMPACKED64 4_20_20_20 w_z_y_x
       // Used in 54540829 and other installments in the series, pretty rarely in
       // general.
-      v = f.Pack(v, PACK_TYPE_ULONG_4202020);
+      v = f.Pack(v, PACK_TYPE_ULONG_4202020 | sat);
       break;
     default:
       assert_unhandled_case(type);

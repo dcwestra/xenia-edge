@@ -218,6 +218,19 @@ const std::map<uint32_t, uint32_t> supported_controls = {
 const std::map<uint32_t, int> supported_levels = {{0xFFFF, SOL_SOCKET},
                                                   {0x6, IPPROTO_TCP}};
 
+// Winsock FD_* flags split into asio wait_read / wait_write groups.
+namespace {
+constexpr uint32_t kFD_READ = 1;
+constexpr uint32_t kFD_WRITE = 2;
+constexpr uint32_t kFD_ACCEPT = 8;
+constexpr uint32_t kFD_CONNECT = 16;
+constexpr uint32_t kFD_CLOSE = 32;
+constexpr uint32_t kReadEvents = kFD_READ | kFD_ACCEPT | kFD_CLOSE;
+constexpr uint32_t kWriteEvents = kFD_WRITE | kFD_CONNECT;
+// What the console's WSAEventSelect keeps, everything but FD_OOB.
+constexpr uint32_t kSelectableEvents = kReadEvents | kWriteEvents;
+}  // namespace
+
 // asio error_code -> Winsock WSAE* code. Guests look up by Winsock value;
 // returning raw POSIX errno makes recoverable errors look fatal (e.g. COD4
 // MP treats unrecognized recvfrom error as a hard init failure).
@@ -303,15 +316,145 @@ uint32_t AsioErrorToWSAError(const asio::error_code& ec) {
   return static_cast<uint32_t>(ec.value());
 }
 
-// The Winsock code of the last call that failed on a host socket.
-static uint32_t HostSocketError() {
+// The error of the last call that failed on a host socket.
+static asio::error_code HostSocketErrorCode() {
 #if XE_PLATFORM_WIN32
   const int host_error = WSAGetLastError();
 #else
   const int host_error = errno;
 #endif  // XE_PLATFORM_WIN32
-  return AsioErrorToWSAError(
-      asio::error_code(host_error, asio::error::get_system_category()));
+  return asio::error_code(host_error, asio::error::get_system_category());
+}
+
+// The Winsock code of the last call that failed on a host socket.
+static uint32_t HostSocketError() {
+  return AsioErrorToWSAError(HostSocketErrorCode());
+}
+
+// Starts a connect on a non-blocking host socket, would_block while it runs.
+static asio::error_code StartHostConnect(
+    uint64_t handle, const asio::ip::tcp::endpoint& endpoint) {
+  if (::connect(static_cast<int>(handle), endpoint.data(),
+                static_cast<socklen_t>(endpoint.size())) == 0) {
+    return {};
+  }
+  const asio::error_code ec = HostSocketErrorCode();
+  // POSIX hosts report EINPROGRESS where Winsock reports WSAEWOULDBLOCK.
+  return ec == asio::error::in_progress ? asio::error::would_block : ec;
+}
+
+// How a finished connect went, by the host's SO_ERROR.
+static asio::error_code HostConnectError(uint64_t handle) {
+  int error = 0;
+  socklen_t length = sizeof(error);
+  if (getsockopt(static_cast<int>(handle), SOL_SOCKET, SO_ERROR,
+                 reinterpret_cast<char*>(&error), &length) < 0) {
+    return HostSocketErrorCode();
+  }
+  return asio::error_code(error, asio::error::get_system_category());
+}
+
+// How a connect StartHostConnect began is going, would_block while it runs.
+static asio::error_code PollHostConnect(uint64_t handle) {
+  fd_set write_set;
+  fd_set error_set;
+  FD_ZERO(&write_set);
+  FD_ZERO(&error_set);
+  FD_SET(handle, &write_set);
+  FD_SET(handle, &error_set);
+  timeval now = {0, 0};
+  const int ready = select(static_cast<int>(handle) + 1, nullptr, &write_set,
+                           &error_set, &now);
+  if (ready < 0) {
+    return HostSocketErrorCode();
+  }
+  return ready ? HostConnectError(handle) : asio::error::would_block;
+}
+
+// SOL_SOCKET and IPPROTO_TCP values are a big-endian word, or a byte below 4
+// bytes, which the host takes in its own byte order and layout. Other levels'
+// values pass as they are.
+static bool HasNumericValue(uint32_t level) {
+  return level == 0xFFFF || level == IPPROTO_TCP;
+}
+
+static bool IsTimeout(uint32_t level, uint32_t optname) {
+  return level == 0xFFFF && (optname == 0x1005 || optname == 0x1006);
+}
+
+template <typename T>
+static std::vector<char> ValueBytes(const T& value) {
+  const char* bytes = reinterpret_cast<const char*>(&value);
+  return {bytes, bytes + sizeof(value)};
+}
+
+// The SO_SNDBUF or SO_RCVBUF a guest gets for the size it asks for.
+static uint32_t GuestBufferSize(uint32_t optname, uint32_t requested) {
+  constexpr int32_t kMaxBufferSize = 63 * 1024;
+  const int32_t size = int32_t(requested);
+  if (size > kMaxBufferSize) {
+    return kMaxBufferSize;
+  }
+  if (size > 0) {
+    return uint32_t(size);
+  }
+  return optname == 0x1001 ? 1 : 0;
+}
+
+// The guest's value of an option as the host's setsockopt takes it.
+static std::vector<char> HostOptionValue(uint32_t level, uint32_t optname,
+                                         const void* optval, uint32_t optlen) {
+  const char* guest = static_cast<const char*>(optval);
+  if (!HasNumericValue(level) || !optlen) {
+    return {guest, guest + optlen};
+  }
+  if (level == 0xFFFF && optname == 0x0080 && optlen >= 4) {
+    const auto* words = static_cast<const xe::be<uint16_t>*>(optval);
+    linger value = {};
+    value.l_onoff = words[0];
+    value.l_linger = words[1];
+    return ValueBytes(value);
+  }
+  if (IsTimeout(level, optname)) {
+    const uint32_t ms = net::SocketOptionValue(optval, optlen);
+#if XE_PLATFORM_WIN32
+    return ValueBytes(DWORD(ms));
+#else
+    timeval value = {};
+    value.tv_sec = ms / 1000;
+    value.tv_usec = ms % 1000 * 1000;
+    return ValueBytes(value);
+#endif  // XE_PLATFORM_WIN32
+  }
+  const uint32_t value = net::SocketOptionValue(optval, optlen);
+  if (level == 0xFFFF && (optname == 0x1001 || optname == 0x1002)) {
+    return ValueBytes(int(GuestBufferSize(optname, value)));
+  }
+  // The rest are BOOLs, which Windows reads by their first byte.
+  return ValueBytes(int(value != 0));
+}
+
+// Reads a host option back into the guest's layout, false on a host error.
+static bool ReadHostOption(uint64_t handle, int native_level, int native_name,
+                           uint32_t level, void* optval, uint32_t* optlen) {
+  if (!HasNumericValue(level) || !*optlen) {
+    socklen_t length = static_cast<socklen_t>(*optlen);
+    if (getsockopt(static_cast<int>(handle), native_level, native_name,
+                   static_cast<char*>(optval), &length) != 0) {
+      return false;
+    }
+    *optlen = static_cast<uint32_t>(length);
+    return true;
+  }
+  // Zeroed first, as Windows gives some BOOLs in a single byte.
+  int host = 0;
+  socklen_t length = sizeof(host);
+  if (getsockopt(static_cast<int>(handle), native_level, native_name,
+                 reinterpret_cast<char*>(&host), &length) != 0) {
+    return false;
+  }
+  net::StoreSocketOptionValue(optval, *optlen, uint32_t(host));
+  return true;
 }
 
 XSocket::XSocket(KernelState* kernel_state)
@@ -364,6 +507,11 @@ X_STATUS XSocket::Initialize(AddressFamily af, Type type, Protocol proto) {
   af_ = af;
   type_ = type;
   proto_ = proto;
+  const net::StartupParams params =
+      kernel_state_->GetKernelModule<xam::XamModule>("xam.xex")
+          ->xnet_startup_params();
+  receive_buffer_size_ = uint32_t(params[4]) << 10;
+  send_buffer_size_ = uint32_t(params[5]) << 10;
 
   if (proto == Protocol::X_IPPROTO_VDP) {
     // VDP is a layer on top of UDP.
@@ -424,7 +572,7 @@ X_STATUS XSocket::Close() {
     system_link_port_->Close();
   }
   if (system_link_stream_) {
-    system_link_stream_->Close(linger_abort_);
+    system_link_stream_->Close(linger_on_ && !linger_seconds_);
   }
 
   asio::error_code ec;
@@ -468,6 +616,20 @@ X_STATUS XSocket::GetOption(uint32_t level, uint32_t optname, void* optval_ptr,
     net::StoreSocketOptionValue(optval_ptr, *optlen, broadcast_socket_);
     return X_STATUS_SUCCESS;
   }
+  // SO_ERROR is refused, a guest learns how a connect went from select's sets.
+  if (level == 0xFFFF && optname == 0x1007) {
+    last_error_ = AsioErrorToWSAError(asio::error::no_protocol_option);
+    return X_STATUS_UNSUCCESSFUL;
+  }
+  if (const std::optional<uint32_t> value = GuestOption(level, optname)) {
+    net::StoreSocketOptionValue(optval_ptr, *optlen, *value);
+    return X_STATUS_SUCCESS;
+  }
+  // IPPROTO_IP's numbers aren't the host's.
+  if (level == 0) {
+    last_error_ = 10042;  // WSAENOPROTOOPT
+    return X_STATUS_UNSUCCESSFUL;
+  }
 
   // Map Xbox socket levels to native
   int native_level = level;
@@ -483,23 +645,17 @@ X_STATUS XSocket::GetOption(uint32_t level, uint32_t optname, void* optval_ptr,
     native_optname = supported_tcp_options.at(optname);
   }
 
-  asio::error_code ec;
-  socklen_t native_optlen = static_cast<socklen_t>(*optlen);
-
-  int native_handle_val = static_cast<int>(native_handle());
-  if (native_handle_val == -1) {
+  const uint64_t handle = native_handle();
+  if (handle == static_cast<uint64_t>(-1)) {
     last_error_ = AsioErrorToWSAError(asio::error::not_socket);
     return X_STATUS_INVALID_HANDLE;
   }
 
-  int ret = getsockopt(native_handle_val, native_level, native_optname,
-                       static_cast<char*>(optval_ptr), &native_optlen);
-  if (ret < 0) {
+  if (!ReadHostOption(handle, native_level, native_optname, level, optval_ptr,
+                      optlen)) {
     last_error_ = HostSocketError();
     return X_STATUS_UNSUCCESSFUL;
   }
-
-  *optlen = static_cast<uint32_t>(native_optlen);
   return X_STATUS_SUCCESS;
 }
 
@@ -510,17 +666,12 @@ X_STATUS XSocket::SetOption(uint32_t level, uint32_t optname, void* optval_ptr,
     secure_ = false;
     return X_STATUS_SUCCESS;
   }
+  if (level == 0) {
+    return SetIpOption(optname, optval_ptr, optlen);
+  }
 
   if (system_link_stream_) {
-    // Buffer sizes, Nagle and the like change nothing the guest sees.
-    KeepTimeout(level, optname, optval_ptr, optlen);
-    // SO_LINGER is two big-endian WORDs, l_onoff and l_linger.
-    if (level == 0xFFFF && optname == 0x0080 && optlen >= 4) {
-      const auto* linger = static_cast<const xe::be<uint16_t>*>(optval_ptr);
-      linger_abort_ = linger[0] && !linger[1];
-    } else if (level == 0xFFFF && optname == ~0x0080u) {
-      linger_abort_ = false;
-    }
+    KeepOption(level, optname, optval_ptr, optlen);
     return X_STATUS_SUCCESS;
   }
 
@@ -563,69 +714,189 @@ X_STATUS XSocket::SetOption(uint32_t level, uint32_t optname, void* optval_ptr,
     return X_STATUS_INVALID_HANDLE;
   }
 
+  std::vector<char> value = HostOptionValue(level, optname, optval_ptr, optlen);
   int ret = setsockopt(native_handle_val, native_level, native_optname,
-                       static_cast<char*>(optval_ptr), optlen);
-  if (ret < 0) {
+                       value.data(), static_cast<socklen_t>(value.size()));
+  // getsockopt reports the guest's buffer sizes and a host refusing one, as
+  // macOS does a receive buffer of 0, changes nothing the guest sees.
+  const bool buffer_size =
+      level == 0xFFFF && (optname == 0x1001 || optname == 0x1002);
+  if (ret < 0 && !buffer_size) {
     last_error_ = HostSocketError();
     XELOGE("XSocket::SetOption: failed with error {:08X}", last_error_);
     return X_STATUS_UNSUCCESSFUL;
   }
+  if (ret == 0 && acceptor_) {
+    acceptor_options_.push_back(
+        {native_level, native_optname, std::move(value)});
+  }
 
-  KeepTimeout(level, optname, optval_ptr, optlen);
+  KeepOption(level, optname, optval_ptr, optlen);
   return X_STATUS_SUCCESS;
 }
 
-void XSocket::KeepTimeout(uint32_t level, uint32_t optname,
-                          const void* optval_ptr, uint32_t optlen) {
-  // SO_SNDTIMEO / SO_RCVTIMEO in milliseconds. Kept for the cooperative retry
-  // loop, which never sees the host option take effect.
-  if (level == 0xFFFF && (optname == 0x1005 || optname == 0x1006)) {
-    uint32_t timeout_ms = net::SocketOptionValue(optval_ptr, optlen);
-    if (optname == 0x1006) {
-      recv_timeout_ms_ = timeout_ms;
-    } else {
-      send_timeout_ms_ = timeout_ms;
-    }
+void XSocket::KeepOption(uint32_t level, uint32_t optname,
+                         const void* optval_ptr, uint32_t optlen) {
+  const uint32_t value = net::SocketOptionValue(optval_ptr, optlen);
+  if (level == 0xFFFF && optname == 0x1005) {
+    send_timeout_ms_ = value;
+  } else if (level == 0xFFFF && optname == 0x1006) {
+    recv_timeout_ms_ = value;
+  } else if (level == 0xFFFF && (optname == 0x1001 || optname == 0x1002)) {
+    (optname == 0x1001 ? send_buffer_size_ : receive_buffer_size_) =
+        GuestBufferSize(optname, value);
+  } else if (level == 0xFFFF && optname == 0x0080 && optlen >= 4) {
+    // Two big-endian WORDs, l_onoff and l_linger.
+    const auto* linger = static_cast<const xe::be<uint16_t>*>(optval_ptr);
+    linger_on_ = linger[0];
+    linger_seconds_ = linger[1];
+  } else if (level == 0xFFFF && optname == ~0x0080u) {
+    linger_on_ = !value;
+  } else if (level == X_IPPROTO_TCP && optname == 0x0001) {
+    no_delay_ = value != 0;
   }
+}
+
+std::optional<uint32_t> XSocket::GuestOption(uint32_t level,
+                                             uint32_t optname) const {
+  if (level == X_IPPROTO_TCP && optname == 0x0001) {
+    return uint32_t(no_delay_);
+  }
+  if (level == 0 && optname == 7) {
+    return ip_ttl_;
+  }
+  if (level == 0 && optname == 0x64) {
+    return ip_dscp_;
+  }
+  if (level != 0xFFFF) {
+    return std::nullopt;
+  }
+  switch (optname) {
+    case 0x0080:
+      return uint32_t(linger_on_) << 16 | linger_seconds_;
+    case ~0x0080u:
+      return uint32_t(!linger_on_);
+    case 0x1001:
+      return send_buffer_size_;
+    case 0x1002:
+      return receive_buffer_size_;
+    case 0x1005:
+      return send_timeout_ms_;
+    case 0x1006:
+      return recv_timeout_ms_;
+    default:
+      return std::nullopt;
+  }
+}
+
+void XSocket::TakeListenerOptions(XSocket& accepted) const {
+  accepted.recv_timeout_ms_ = recv_timeout_ms_;
+  accepted.send_timeout_ms_ = send_timeout_ms_;
+  accepted.send_buffer_size_ = send_buffer_size_;
+  accepted.receive_buffer_size_ = receive_buffer_size_;
+  accepted.linger_on_ = linger_on_;
+  accepted.linger_seconds_ = linger_seconds_;
+  accepted.no_delay_ = no_delay_;
+  accepted.ip_ttl_ = ip_ttl_;
+  accepted.ip_dscp_ = ip_dscp_;
+}
+
+X_STATUS XSocket::SetIpOption(uint32_t optname, const void* optval_ptr,
+                              uint32_t optlen) {
+  const uint32_t value = net::SocketOptionValue(optval_ptr, optlen);
+  int host_name = 0;
+  int host_value = 0;
+  switch (optname) {
+    case 7:  // IP_TTL
+      if (optlen != 4 || !value || value > 0xFF) {
+        last_error_ = uint32_t(X_WSAError::X_WSAEINVAL);
+        return X_STATUS_UNSUCCESSFUL;
+      }
+      ip_ttl_ = uint8_t(value);
+      host_name = IP_TTL;
+      host_value = int(value);
+      break;
+    case 0x64:  // The DSCP, the TOS byte's top 6 bits
+      if (optlen != 1 || value > 0x3F) {
+        last_error_ = uint32_t(X_WSAError::X_WSAEINVAL);
+        return X_STATUS_UNSUCCESSFUL;
+      }
+      ip_dscp_ = uint8_t(value);
+      host_name = IP_TOS;
+      host_value = int(value << 2);
+      break;
+    case 5:  // IP_ADD_MEMBERSHIP
+    case 6:  // IP_DROP_MEMBERSHIP
+      return SetMulticastGroup(optname == 5, value);
+    default:
+      last_error_ = 10042;  // WSAENOPROTOOPT
+      return X_STATUS_UNSUCCESSFUL;
+  }
+  // A System Link stream has no host socket. A host refusing IP_TOS changes
+  // nothing the guest sees.
+  const uint64_t handle = native_handle();
+  if (handle == static_cast<uint64_t>(-1)) {
+    return X_STATUS_SUCCESS;
+  }
+  std::vector<char> bytes = ValueBytes(host_value);
+  if (setsockopt(static_cast<int>(handle), IPPROTO_IP, host_name, bytes.data(),
+                 static_cast<socklen_t>(bytes.size())) == 0 &&
+      acceptor_) {
+    acceptor_options_.push_back({IPPROTO_IP, host_name, std::move(bytes)});
+  }
+  return X_STATUS_SUCCESS;
+}
+
+X_STATUS XSocket::SetMulticastGroup(bool join, uint32_t group) {
+  if (type_ != Type::X_SOCK_DGRAM) {
+    last_error_ = 10042;  // WSAENOPROTOOPT
+    return X_STATUS_UNSUCCESSFUL;
+  }
+  const auto it = std::ranges::find(multicast_groups_, group);
+  if (!join && it == multicast_groups_.end()) {
+    last_error_ = uint32_t(X_WSAError::X_WSAEINVAL);
+    return X_STATUS_UNSUCCESSFUL;
+  }
+  if (join && it != multicast_groups_.end()) {
+    return X_STATUS_SUCCESS;
+  }
+  if (join) {
+    multicast_groups_.push_back(group);
+  } else {
+    multicast_groups_.erase(it);
+  }
+  // The host joins too so the group's datagrams arrive.
+  ip_mreq request = {};
+  request.imr_multiaddr.s_addr = htonl(group);
+  request.imr_interface.s_addr = htonl(INADDR_ANY);
+  const uint64_t handle = native_handle();
+  if (handle != static_cast<uint64_t>(-1) &&
+      setsockopt(static_cast<int>(handle), IPPROTO_IP,
+                 join ? IP_ADD_MEMBERSHIP : IP_DROP_MEMBERSHIP,
+                 reinterpret_cast<const char*>(&request),
+                 sizeof(request)) < 0) {
+    XELOGW("XSocket: host multicast {} of {:08X} failed: {:08X}",
+           join ? "join" : "leave", group, HostSocketError());
+  }
+  return X_STATUS_SUCCESS;
 }
 
 X_STATUS XSocket::StreamGetOption(uint32_t level, uint32_t optname,
                                   void* optval_ptr, uint32_t* optlen) {
-  if (*optlen < sizeof(uint32_t)) {
-    last_error_ = uint32_t(X_WSAError::X_WSAEFAULT);
-    return X_STATUS_UNSUCCESSFUL;
-  }
-  uint32_t value;
-  if (level == 0xFFFF && optname == 0x1007) {
-    // SO_ERROR, which tells why a non-blocking connect failed.
-    value = system_link_stream_->ConnectError();
-  } else if (level == 0xFFFF && optname == 0x1008) {
+  std::optional<uint32_t> value = GuestOption(level, optname);
+  if (level == 0xFFFF && optname == 0x1008) {
     value = X_SOCK_STREAM;
-  } else if (level == 0xFFFF && (optname == 0x1001 || optname == 0x1002)) {
-    value = uint32_t(net::tcp::kBufferSize);
-  } else if (level == 0xFFFF && optname == 0x1005) {
-    value = send_timeout_ms_;
-  } else if (level == 0xFFFF && optname == 0x1006) {
-    value = recv_timeout_ms_;
-  } else if (level == 0xFFFF && optname == 0x0080) {
-    // SO_LINGER, l_onoff and then l_linger.
-    value = linger_abort_ ? 0x00010000 : 0;
-  } else if (level == 0xFFFF && optname == ~0x0080u) {
-    value = !linger_abort_;
   } else if (level == 0xFFFF && (optname == 0x0004 || optname == 0x0008 ||
                                  optname == 0x0020 || optname == 0x0100)) {
     // SO_REUSEADDR, SO_KEEPALIVE, SO_BROADCAST and SO_OOBINLINE, which no
     // stream uses.
     value = 0;
-  } else if (level == X_IPPROTO_TCP && optname == 0x0001) {
-    // Segments always leave right away.
-    value = 1;
-  } else {
+  }
+  if (!value) {
     last_error_ = 10042;  // WSAENOPROTOOPT
     return X_STATUS_UNSUCCESSFUL;
   }
-  xe::store_and_swap<uint32_t>(optval_ptr, value);
-  *optlen = sizeof(uint32_t);
+  net::StoreSocketOptionValue(optval_ptr, *optlen, *value);
   return X_STATUS_SUCCESS;
 }
 
@@ -691,7 +962,7 @@ X_STATUS XSocket::IOControl(uint32_t cmd, uint8_t* arg_ptr) {
       return X_STATUS_UNSUCCESSFUL;
     }
 
-    *reinterpret_cast<uint32_t*>(arg_ptr) = static_cast<uint32_t>(available);
+    xe::store_and_swap<uint32_t>(arg_ptr, static_cast<uint32_t>(available));
     return X_STATUS_SUCCESS;
   }
 
@@ -710,15 +981,9 @@ void XSocket::SetHostNonBlocking(bool enable) {
   }
 }
 
-// The guest thread RunCooperatively parks between attempts, null when it runs
-// them just once.
-static XThread* CooperativeThread() {
-  return GuestScheduler::enabled() ? XThread::GetCurrentFiberThread() : nullptr;
-}
-
 void XSocket::RunCooperatively(asio::error_code& ec, RetryMode mode,
                                const std::function<void()>& attempt) {
-  XThread* self = CooperativeThread();
+  XThread* self = XThread::GetCurrentFiberThread();
   if (!self || guest_non_blocking_) {
     attempt();
     return;
@@ -789,10 +1054,41 @@ X_STATUS XSocket::Connect(N_XSOCKADDR* name, int name_len) {
 
   asio::error_code ec;
 
+  // asio's connect waits for the connection. A non-blocking guest gets
+  // WSAEWOULDBLOCK and waits for it in select. A blocking one parks between
+  // polls, as waiting would stall the other guest threads on this host thread.
+  auto connect_stream = [&](const asio::ip::tcp::endpoint& endpoint) {
+    const uint64_t handle = tcp_socket_->native_handle();
+    if (!guest_non_blocking_) {
+      bool started = false;
+      RunCooperatively(ec, RetryMode::kConnect, [&]() {
+        if (!XThread::GetCurrentFiberThread()) {
+          tcp_socket_->connect(endpoint, ec);
+        } else if (!started) {
+          started = true;
+          ec = StartHostConnect(handle, endpoint);
+        } else {
+          ec = PollHostConnect(handle);
+        }
+      });
+      connect_state_ = ConnectState::kNone;
+      return;
+    }
+    ec = StartHostConnect(handle, endpoint);
+    if (ec == asio::error::would_block) {
+      connect_state_ = ConnectState::kConnecting;
+    } else if (ec != asio::error::already_started) {
+      // WSAEALREADY leaves the pending connect to select.
+      connect_state_ = ConnectState::kNone;
+    }
+  };
+
   if (acceptor_) {
     // Transition from acceptor to tcp_socket for client connection.
     // The acceptor was created in Initialize() before we knew whether this
     // socket would listen or connect.
+    const asio::ip::tcp::endpoint bound_endpoint =
+        bound_ ? acceptor_->local_endpoint(ec) : asio::ip::tcp::endpoint();
     acceptor_->close(ec);
     acceptor_.reset();
 
@@ -802,14 +1098,36 @@ X_STATUS XSocket::Connect(N_XSOCKADDR* name, int name_len) {
       last_error_ = AsioErrorToWSAError(ec);
       return X_STATUS_UNSUCCESSFUL;
     }
+    // The new socket takes the FIONBIO and options the guest set on the
+    // acceptor.
+    if (guest_non_blocking_) {
+      tcp_socket_->non_blocking(true, ec);
+      if (ec) {
+        last_error_ = AsioErrorToWSAError(ec);
+        return X_STATUS_UNSUCCESSFUL;
+      }
+    }
+    const int handle = static_cast<int>(tcp_socket_->native_handle());
+    for (const HostOption& option : acceptor_options_) {
+      if (setsockopt(handle, option.level, option.name, option.value.data(),
+                     static_cast<socklen_t>(option.value.size())) < 0) {
+        XELOGW("XSocket::Connect: option {}/{} not kept: {:08X}", option.level,
+               option.name, HostSocketError());
+      }
+    }
+    acceptor_options_.clear();
+    // And the address the guest bound it to.
+    if (bound_) {
+      tcp_socket_->bind(bound_endpoint, ec);
+      if (ec) {
+        last_error_ = AsioErrorToWSAError(ec);
+        return X_STATUS_UNSUCCESSFUL;
+      }
+    }
 
-    asio::ip::tcp::endpoint endpoint(addr, port);
-    RunCooperatively(ec, RetryMode::kConnect,
-                     [&]() { tcp_socket_->connect(endpoint, ec); });
+    connect_stream(asio::ip::tcp::endpoint(addr, port));
   } else if (tcp_socket_) {
-    asio::ip::tcp::endpoint endpoint(addr, port);
-    RunCooperatively(ec, RetryMode::kConnect,
-                     [&]() { tcp_socket_->connect(endpoint, ec); });
+    connect_stream(asio::ip::tcp::endpoint(addr, port));
   } else if (udp_socket_) {
     asio::ip::udp::endpoint endpoint(addr, port);
     udp_socket_->connect(endpoint, ec);
@@ -821,6 +1139,14 @@ X_STATUS XSocket::Connect(N_XSOCKADDR* name, int name_len) {
   }
 
   return X_STATUS_SUCCESS;
+}
+
+void XSocket::SettleConnect() {
+  if (connect_state_ != ConnectState::kConnecting) {
+    return;
+  }
+  connect_state_ = HostConnectError(native_handle()) ? ConnectState::kFailed
+                                                     : ConnectState::kNone;
 }
 
 X_STATUS XSocket::Bind(N_XSOCKADDR_IN* name, int name_len) {
@@ -881,6 +1207,7 @@ X_STATUS XSocket::Bind(N_XSOCKADDR_IN* name, int name_len) {
   }
 
   bound_ = true;
+  bound_address_ = name->sin_addr;
 
   // Get the actual bound port (important when binding to port 0)
   if (acceptor_) {
@@ -961,6 +1288,7 @@ object_ref<XSocket> XSocket::Accept(N_XSOCKADDR* name, int* name_len) {
   RunCooperatively(ec, RetryMode::kAccept, [&]() {
     acceptor_->accept(*new_socket, peer_endpoint, ec);
   });
+  ReenableHostEvents(kFD_ACCEPT);
 
   if (ec) {
     last_error_ = AsioErrorToWSAError(ec);
@@ -975,10 +1303,20 @@ object_ref<XSocket> XSocket::Accept(N_XSOCKADDR* name, int* name_len) {
   auto socket =
       object_ref<XSocket>(new XSocket(kernel_state_, std::move(*new_socket)));
   socket->bound_ = true;
+  socket->bound_address_ = bound_address_;
+  TakeListenerOptions(*socket);
   // An accepted socket starts in the listener's non-blocking mode.
   if (guest_non_blocking_) {
     socket->SetHostNonBlocking(true);
     socket->guest_non_blocking_ = true;
+  }
+  // It takes over the listener's WSAEventSelect too.
+  std::lock_guard lock(select_mutex_);
+  if (selected_event_ && selected_event_flags_) {
+    std::lock_guard accepted_lock(socket->select_mutex_);
+    socket->selected_event_ = selected_event_;
+    socket->selected_event_flags_ = selected_event_flags_;
+    socket->ArmHostReady(selected_event_flags_);
   }
 
   return socket;
@@ -1064,6 +1402,7 @@ int XSocket::Recv(uint8_t* buf, uint32_t buf_len, uint32_t flags) {
           tcp_socket_->receive(asio::buffer(buf, buf_len), flags, ec);
     });
   }
+  ReenableHostEvents(kFD_READ);
 
   // A stream peer that closed the connection reads as 0 bytes.
   if (ec == asio::error::eof) {
@@ -1116,6 +1455,7 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags,
           tcp_socket_->receive(asio::buffer(buf, buf_len), flags, ec);
     });
   }
+  ReenableHostEvents(kFD_READ);
 
   // A stream peer that closed the connection reads as 0 bytes.
   if (ec == asio::error::eof) {
@@ -1157,6 +1497,10 @@ int XSocket::Send(const uint8_t* buf, uint32_t buf_len, uint32_t flags) {
 
   if (ec) {
     last_error_ = AsioErrorToWSAError(ec);
+    // A send that would block re-enables FD_WRITE.
+    if (last_error_ == 10035) {
+      ReenableHostEvents(kFD_WRITE);
+    }
     return -1;
   }
 
@@ -1205,6 +1549,10 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags,
 
   if (ec) {
     last_error_ = AsioErrorToWSAError(ec);
+    // A send that would block re-enables FD_WRITE.
+    if (last_error_ == 10035) {
+      ReenableHostEvents(kFD_WRITE);
+    }
     return -1;
   }
 
@@ -1296,23 +1644,13 @@ bool XSocket::IsOverlappedPending(const XWSAOVERLAPPED* overlapped) const {
   return overlapped_receives_->Pending(overlapped);
 }
 
-// Winsock FD_* flags split into asio wait_read / wait_write groups.
-namespace {
-constexpr uint32_t kFD_READ = 1;
-constexpr uint32_t kFD_WRITE = 2;
-constexpr uint32_t kFD_OOB = 4;
-constexpr uint32_t kFD_ACCEPT = 8;
-constexpr uint32_t kFD_CONNECT = 16;
-constexpr uint32_t kFD_CLOSE = 32;
-constexpr uint32_t kReadEvents = kFD_READ | kFD_ACCEPT | kFD_CLOSE | kFD_OOB;
-constexpr uint32_t kWriteEvents = kFD_WRITE | kFD_CONNECT;
-}  // namespace
-
 int XSocket::WSAEventSelect(object_ref<XEvent> event, uint32_t flags) {
   if (!tcp_socket_ && !udp_socket_ && !acceptor_ && !system_link_stream_) {
     last_error_ = uint32_t(X_WSAError::X_WSAENOTSOCK);
     return -1;
   }
+  // The console drops FD_OOB and any bit it doesn't know.
+  flags &= kSelectableEvents;
 
   asio::error_code ec;
 
@@ -1339,13 +1677,16 @@ int XSocket::WSAEventSelect(object_ref<XEvent> event, uint32_t flags) {
       udp_socket_->cancel(cancel_ec);
     }
   }
+  ++select_generation_;
+  host_read_wait_ = false;
+  host_write_wait_ = false;
 
   selected_event_ = std::move(event);
   selected_event_flags_ = flags;
   // Arming clears the event. Readiness that already holds sets it again
-  // below. FD_OOB alone leaves it as is. Host sockets keep theirs since the
-  // I/O thread would only set it again later.
-  if (on_system_link_ && selected_event_ && (flags & ~kFD_OOB)) {
+  // below. Host sockets keep theirs since the I/O thread would only set it
+  // again later.
+  if (on_system_link_ && selected_event_ && flags) {
     selected_event_->Reset();
   }
 
@@ -1354,42 +1695,54 @@ int XSocket::WSAEventSelect(object_ref<XEvent> event, uint32_t flags) {
     return 0;
   }
 
-  if (flags == 0 || !selected_event_) {
-    return 0;
-  }
-
-  const bool want_read = (flags & kReadEvents) != 0;
-  const bool want_write = (flags & kWriteEvents) != 0;
-
-  // Capture strong refs so the socket and event outlive any pending wait.
-  auto handler = [self = retain_object(this),
-                  ev = selected_event_](const asio::error_code& wait_ec) {
-    if (wait_ec) {
-      return;  // cancelled or socket closed
-    }
-    ev->Set(0, false);
-  };
-
-  if (want_read) {
-    if (acceptor_) {
-      acceptor_->async_wait(asio::socket_base::wait_read, handler);
-    } else if (tcp_socket_) {
-      tcp_socket_->async_wait(asio::socket_base::wait_read, handler);
-    } else if (udp_socket_) {
-      udp_socket_->async_wait(asio::socket_base::wait_read, handler);
-    }
-  }
-  if (want_write) {
-    if (acceptor_) {
-      acceptor_->async_wait(asio::socket_base::wait_write, handler);
-    } else if (tcp_socket_) {
-      tcp_socket_->async_wait(asio::socket_base::wait_write, handler);
-    } else if (udp_socket_) {
-      udp_socket_->async_wait(asio::socket_base::wait_write, handler);
-    }
-  }
-
+  ArmHostReady(flags);
   return 0;
+}
+
+void XSocket::ArmHostReady(uint32_t events) {
+  if (!selected_event_) {
+    return;
+  }
+  // Only a listener accepts, and it does nothing else.
+  events &= selected_event_flags_ & (acceptor_ ? kFD_ACCEPT : ~kFD_ACCEPT);
+  auto wait = [this](bool read) {
+    (read ? host_read_wait_ : host_write_wait_) = true;
+    // Strong refs so the socket and event outlive the wait.
+    auto handler = [self = retain_object(this), ev = selected_event_,
+                    generation = select_generation_,
+                    read](const asio::error_code& wait_ec) {
+      {
+        std::lock_guard lock(self->select_mutex_);
+        if (generation == self->select_generation_) {
+          (read ? self->host_read_wait_ : self->host_write_wait_) = false;
+        }
+      }
+      // A cancelled wait or a closed socket sets nothing.
+      if (!wait_ec) {
+        ev->Set(0, false);
+      }
+    };
+    const auto type =
+        read ? asio::socket_base::wait_read : asio::socket_base::wait_write;
+    if (acceptor_) {
+      acceptor_->async_wait(type, handler);
+    } else if (tcp_socket_) {
+      tcp_socket_->async_wait(type, handler);
+    } else if (udp_socket_) {
+      udp_socket_->async_wait(type, handler);
+    }
+  };
+  if ((events & kReadEvents) && !host_read_wait_) {
+    wait(true);
+  }
+  if ((events & kWriteEvents) && !host_write_wait_) {
+    wait(false);
+  }
+}
+
+void XSocket::ReenableHostEvents(uint32_t events) {
+  std::lock_guard lock(select_mutex_);
+  ArmHostReady(events);
 }
 
 bool XSocket::QueuePacket(uint32_t src_ip, uint16_t src_port,
@@ -1446,7 +1799,7 @@ X_STATUS XSocket::QueryName(bool peer, N_XSOCKADDR_IN* name) {
 
   name->sin_family = host_name.sin_family;
   name->sin_port = ntohs(host_name.sin_port);
-  name->sin_addr = ntohl(host_name.sin_addr.s_addr);
+  name->sin_addr = peer ? ntohl(host_name.sin_addr.s_addr) : bound_address_;
   std::memset(name->x_sin_zero, 0, sizeof(name->x_sin_zero));
   return X_STATUS_SUCCESS;
 }
@@ -1557,6 +1910,14 @@ int XSocket::SystemLinkReceive(uint8_t* buf, uint32_t buf_len, uint32_t flags,
     last_error_ = SystemLinkError(ec, error);
     return -1;
   }
+  // Like the console, post FD_READ again while datagrams remain.
+  if (!peek && !system_link_stream_) {
+    std::lock_guard<std::mutex> lock(select_mutex_);
+    if (selected_event_ && (selected_event_flags_ & kFD_READ) &&
+        system_link_port_->Readable()) {
+      selected_event_->Set(0, false);
+    }
+  }
   if (from && source) {
     from->sin_family = AF_INET;
     from->sin_addr = source->address;
@@ -1629,9 +1990,7 @@ object_ref<XSocket> XSocket::StreamAccept(N_XSOCKADDR* name, int* name_len) {
   AcceptedName(name, name_len, peer);
   auto socket =
       object_ref<XSocket>(new XSocket(kernel_state_, std::move(accepted)));
-  socket->recv_timeout_ms_ = recv_timeout_ms_;
-  socket->send_timeout_ms_ = send_timeout_ms_;
-  socket->linger_abort_ = linger_abort_;
+  TakeListenerOptions(*socket);
   // An accepted socket starts in the listener's non-blocking mode and takes
   // over its WSAEventSelect, which makes it non-blocking either way.
   socket->guest_non_blocking_ = guest_non_blocking_;
@@ -1675,7 +2034,7 @@ int XSocket::SystemLinkSend(const uint8_t* buf, uint32_t buf_len,
 
 uint32_t XSocket::SystemLinkWait(RetryMode mode) const {
   // RunCooperatively retries on a fiber so only a host thread waits here.
-  if (guest_non_blocking_ || CooperativeThread()) {
+  if (guest_non_blocking_ || XThread::GetCurrentFiberThread()) {
     return 0;
   }
   // No socket timeout bounds a connect or accept.

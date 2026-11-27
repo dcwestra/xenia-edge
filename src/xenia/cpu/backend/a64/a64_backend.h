@@ -107,36 +107,16 @@ enum : uint32_t {
   kA64BackendFPCRModeBit = 0,
   kA64BackendHasReserveBit = 1,
   kA64BackendNJMOn = 2,
-  kA64BackendNonIEEEMode = 3,
 };
 
 // Located prior to the context register (x20) in memory.
-// vexptefp/vlogefp estimate constants, splatted across all four lanes. a64 has
-// no memory operands and only v0-v3 are scratch, so these live in the backend
-// context and load with a single ldr q rather than being materialized.
-enum A64EstConst {
-  kEstExp2Poly = 0,                 // 6 entries, 2^f minimax on [0,1)
-  kEstLog2Poly = kEstExp2Poly + 6,  // 7 entries, log2(1+u) minimax on [0,1]
-  kEstScale = kEstLog2Poly + 7,     // 2048.0f
-  kEstUnscale,                      // 1.0f / 2048.0f
-  kEstExp2Max,                      // 128.0f
-  kEstExp2Min,                      // -126.0f
-  kEstOne,                          // 0x3F800000
-  kEstInt127,                       // 127
-  kEstPosInf,                       // 0x7F800000
-  kEstNegInf,                       // 0xFF800000
-  kEstQNaN,                         // 0x7FC00000
-  kEstMantissaMask,                 // 0x007FFFFF
-  kEstQuietBit,                     // 0x00400000
-  kEstConstCount,
-};
-
 struct A64BackendContext {
-  alignas(16) uint32_t est_consts[kEstConstCount][4];
   // Scratch vectors for helper routines.
   // Using uint8_t[16] instead of NEON intrinsic types to avoid including
   // arm_neon.h in the header.
   alignas(16) uint8_t helper_scratch_v128s[4][16];
+  // vrefp's 32 segments as slope << 16 | base >> 9, for RECIP_V128
+  uint32_t vrefp_table[32];
   union {
     uint64_t helper_scratch_u64s[8];
     uint32_t helper_scratch_u32s[16];
@@ -158,6 +138,10 @@ struct A64BackendContext {
   uint64_t synchronize_guest_and_host_stack_helper_address;
   uint64_t vrsqrtefp_scalar_helper_address;
   uint64_t vrsqrtefp_vector_helper_address;
+  // POW2_V128's and LOG2_V128's tables, 2048 entries each, and RECIP_F64's
+  uint64_t vexptefp_table_address;
+  uint64_t vlogefp_table_address;
+  uint64_t fres_table_address;
   uint64_t frsqrte_helper_address;
   uint64_t reserved_store_32_helper_address;
   uint64_t reserved_store_64_helper_address;
@@ -194,17 +178,12 @@ struct A64BackendContext {
 constexpr unsigned int DEFAULT_FPU_FPCR = 0;
 // Default FPCR for VMX mode (flush to zero, preserve NaN payloads).
 constexpr unsigned int DEFAULT_VMX_FPCR = (1 << 24);  // FZ
-// PPC rounding control (RN in bits 0-1, NI in bit 2) to FPCR. RMode is bits
-// 23:22, and NI maps to FZ (bit 24).
-inline constexpr uint32_t kGuestFpcrTable[8] = {
-    (0b00 << 22),              // PPC 0: nearest, IEEE
-    (0b11 << 22),              // PPC 1: toward zero, IEEE
-    (0b01 << 22),              // PPC 2: toward +inf, IEEE
-    (0b10 << 22),              // PPC 3: toward -inf, IEEE
-    (0b00 << 22) | (1 << 24),  // PPC 4: nearest, flush-to-zero
-    (0b11 << 22) | (1 << 24),  // PPC 5: toward zero, flush-to-zero
-    (0b01 << 22) | (1 << 24),  // PPC 6: toward +inf, flush-to-zero
-    (0b10 << 22) | (1 << 24),  // PPC 7: toward -inf, flush-to-zero
+// PPC rounding control (RN) to FPCR RMode (bits 23:22)
+inline constexpr uint32_t kGuestFpcrTable[4] = {
+    (0b00 << 22),  // PPC 0: nearest
+    (0b11 << 22),  // PPC 1: toward zero
+    (0b01 << 22),  // PPC 2: toward +inf
+    (0b10 << 22),  // PPC 3: toward -inf
 };
 // The NaN fixups rely on FPCR.DN (bit 25) and FPCR.AH (bit 1) being clear in
 // every FPCR the guest runs with. SET_NJM only toggles FZ.
@@ -245,12 +224,6 @@ class A64Backend : public Backend {
   std::unique_ptr<GuestFunction> CreateGuestFunction(Module* module,
                                                      uint32_t address) override;
 
-  uint64_t CalculateNextHostInstruction(ThreadDebugInfo* thread_info,
-                                        uint64_t current_pc) override;
-
-  void InstallBreakpoint(Breakpoint* breakpoint) override;
-  void InstallBreakpoint(Breakpoint* breakpoint, Function* fn) override;
-  void UninstallBreakpoint(Breakpoint* breakpoint) override;
   void InitializeBackendContext(void* ctx) override;
   void DeinitializeBackendContext(void* ctx) override;
   void PrepareForReentry(void* ctx) override;
@@ -297,8 +270,6 @@ class A64Backend : public Backend {
   static bool ExceptionCallbackThunk(Exception* ex, void* data);
   bool ExceptionCallback(Exception* ex);
   static uint64_t ReleaseFaultingReservedStore(void* data, Exception* ex);
-
-  uintptr_t capstone_handle_ = 0;
 
   std::unique_ptr<A64CodeCache> code_cache_;
   uintptr_t emitter_data_ = 0;

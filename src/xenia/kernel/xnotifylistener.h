@@ -29,7 +29,8 @@ union XNotificationKey {
     uint32_t local_id : 16;
     uint32_t version : 9;
     uint32_t mask_index : 6;
-    uint32_t : 1;
+    // Only system listeners get these.
+    uint32_t system_only : 1;
   };
 
   constexpr XNotificationKey(
@@ -54,13 +55,12 @@ class XNotifyListener : public XObject {
 
   void Initialize(uint64_t mask, uint32_t is_system, uint32_t max_version);
 
-  void EnqueueNotification(XNotificationID id, uint32_t data);
+  // Queues |id| with |data|. Unless |signal| is false, a wait on the
+  // listener then returns.
+  void EnqueueNotification(XNotificationID id, uint32_t data,
+                           bool signal = true);
   bool DequeueNotification(XNotificationID* out_id, uint32_t* out_data);
   bool DequeueNotification(XNotificationID id, uint32_t* out_data);
-
-  bool Save(ByteStream* stream) override;
-  static object_ref<XNotifyListener> Restore(KernelState* kernel_state,
-                                             ByteStream* stream);
 
  protected:
   xe::threading::WaitHandle* GetWaitHandle() override {

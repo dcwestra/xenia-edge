@@ -17,9 +17,10 @@ namespace xam {
 namespace ui {
 
 SigninUI::SigninUI(xe::ui::ImGuiDrawer* imgui_drawer,
+                   xe::hid::InputSystem* input_system,
                    ProfileManager* profile_manager, uint32_t last_used_slot,
                    uint32_t users_needed)
-    : XamDialog(imgui_drawer),
+    : XamGamepadDialog(imgui_drawer, input_system),
       profile_manager_(profile_manager),
       last_user_(last_used_slot),
       users_needed_(users_needed),
@@ -52,9 +53,9 @@ void SigninUI::OnDraw(ImGuiIO& io) {
     ReloadProfiles(true);
   }
 
-  // Center the window on screen
+  // Center every frame so the window follows resizes.
   ImVec2 center = ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f);
-  ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+  ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
   ImGui::SetNextWindowSizeConstraints(ImVec2(400, 0), ImVec2(600, 500));
 
   // Style like Xbox - white background, black text, Xbox green highlights

@@ -39,6 +39,9 @@ namespace apu {
 // Set while the audio worker runs the title's capture callback.
 static thread_local bool in_capture_callback = false;
 
+// The voice category titles put their music in.
+constexpr uint32_t kMusicVoiceCategory = 1;
+
 int32_t InitializeAndOpenAvCodec(std::span<uint8_t> song_data,
                                  AVFormatContext*& format_context,
                                  AVCodecContext*& av_context) {
@@ -184,19 +187,24 @@ ProcessAudioResult ProcessAudioLoop(AudioMediaPlayer* player,
 }
 
 AudioMediaPlayer::AudioMediaPlayer(apu::AudioSystem* audio_system,
-                                   kernel::KernelState* kernel_state)
+                                   kernel::KernelState* kernel_state,
+                                   HostMediaSession* host_media)
     : audio_system_(audio_system),
       kernel_state_(kernel_state),
       active_playlist_(nullptr),
-      active_song_(nullptr) {};
+      active_song_(nullptr),
+      host_media_(host_media) {};
 
 AudioMediaPlayer::~AudioMediaPlayer() {
+  if (host_media_) {
+    host_media_->SetListener(nullptr);
+  }
   Stop();
   // Thread::reset() only closes the handle; must wait for the worker to exit.
   worker_running_ = false;
   resume_fence_.Signal();
   if (worker_thread_) {
-    xe::threading::Wait(worker_thread_.get(), false);
+    xe::threading::Wait(worker_thread_.get());
     worker_thread_.reset();
   }
   if (client_registered_) {
@@ -225,6 +233,11 @@ void AudioMediaPlayer::Setup() {
   worker_running_ = true;
   worker_thread_ = threading::Thread::Create({}, [&] { WorkerThreadMain(); });
   worker_thread_->set_name("Audio Media Player");
+  if (host_media_) {
+    host_media_->SetListener([this]() { OnHostMediaChanged(); });
+    // Music the user left playing holds playback in the next title too.
+    OnHostMediaChanged();
+  }
 };
 
 X_STATUS AudioMediaPlayer::Play(uint32_t playlist_handle, uint32_t song_handle,
@@ -234,6 +247,7 @@ X_STATUS AudioMediaPlayer::Play(uint32_t playlist_handle, uint32_t song_handle,
     return X_STATUS_UNSUCCESSFUL;
   }
 
+  ReplaceHostPlayback();
   active_playlist_ = playlist_itr->second.get();
 
   // I've set it to false (force) for PGR3
@@ -333,6 +347,12 @@ void AudioMediaPlayer::Pause() {
 
 void AudioMediaPlayer::Stop(bool change_state, bool force) {
   if (IsIdle()) {
+    return;
+  }
+
+  // Only a title's stop waits. The user's song has no decoder to wait for.
+  if (!force && host_playback_) {
+    ReplaceHostPlayback();
     return;
   }
 
@@ -475,9 +495,9 @@ void AudioMediaPlayer::AddPlaylist(uint32_t handle,
   playlists_.insert({handle, std::move(playlist)});
 }
 
-void AudioMediaPlayer::RemovePlaylist(uint32_t handle) {
+bool AudioMediaPlayer::RemovePlaylist(uint32_t handle) {
   if (playlists_.count(handle) == 0) {
-    return;
+    return false;
   }
 
   // TODO: Check if currently played song is from that playlist and stop
@@ -486,7 +506,12 @@ void AudioMediaPlayer::RemovePlaylist(uint32_t handle) {
     Stop();
   }
 
+  const bool current = active_playlist_ && active_playlist_->handle == handle;
+  if (current) {
+    active_playlist_ = nullptr;
+  }
   playlists_.erase(handle);
+  return current;
 }
 
 X_STATUS AudioMediaPlayer::SetVolume(float volume) {
@@ -514,6 +539,10 @@ void AudioMediaPlayer::SetPlaybackController(
       uint32_t(playback_controller) >= xe::countof(controller_settings_)) {
     return;
   }
+  // The user's music silences the title's.
+  audio_system_->SetVoiceCategoryVolume(
+      kMusicVoiceCategory,
+      playback_controller == PlaybackController::kUser ? 0.0f : 1.0f);
 
   const ControllerSettings& settings =
       controller_settings_[uint32_t(playback_controller)];
@@ -521,6 +550,187 @@ void AudioMediaPlayer::SetPlaybackController(
   SetRepeatMode(settings.repeat_mode);
   SetPlaybackFlags(settings.playback_flags);
   SetVolume(settings.volume);
+}
+
+X_HRESULT AudioMediaPlayer::RequestPlaybackController(
+    XmpClient xmp_client, PlaybackController request, bool locked) {
+  std::lock_guard<std::mutex> lock(host_mutex_);
+  // xam 81704300, then 81702DE0.
+  const bool title_locked =
+      playback_controller_ == PlaybackController::kGame && xmp_override_;
+  if (xmp_client == XmpClient::kGame) {
+    if (request == PlaybackController::kRestore) {
+      // Only a locked hold has anything to give back.
+      if (!title_locked) {
+        return X_E_FUNCTION_FAILED;
+      }
+    } else if (request != PlaybackController::kGame) {
+      return X_E_INVALIDARG;
+    } else if (locked && title_locked) {
+      return X_E_FUNCTION_FAILED;
+    }
+  }
+  if (xmp_override_ && xmp_client != xmp_client_) {
+    return X_E_ACCESS_DENIED;
+  }
+  if (request > PlaybackController::kRestore) {
+    return X_E_FUNCTION_FAILED;
+  }
+
+  const bool restore = request == PlaybackController::kRestore;
+  bool resumed = false;
+  if (restore) {
+    SetXMPClient(XmpClient::kGame);
+    SetXMPOverride(false);
+    if (host_playback_) {
+      // Resumed ahead of the controller change.
+      if (host_paused_for_title_) {
+        resumed = true;
+        host_media_->Resume();
+        state_ = XmpApp::State::kPlaying;
+        OnStateChanged();
+      }
+      SetPlaybackController(PlaybackController::kUser);
+    } else {
+      SetPlaybackController(PlaybackController::kGame);
+    }
+  } else {
+    if (host_playback_ && request == PlaybackController::kGame && IsPlaying()) {
+      host_paused_for_title_ = true;
+      host_media_->Pause();
+      state_ = XmpApp::State::kPaused;
+      OnStateChanged();
+    }
+    SetXMPClient(xmp_client);
+    SetPlaybackController(request);
+    SetXMPOverride(locked);
+  }
+
+  // 58411446
+  kernel_state_->BroadcastNotification(
+      kXNotificationXmpPlaybackControllerChanged, IsTitleInPlaybackControl());
+
+  // What the user's music did while the title held playback shows now.
+  if (restore && host_media_) {
+    HostMedia media = host_media_->GetMedia();
+    // The app reads paused until the resume reaches it.
+    if (resumed && media.status == HostMedia::Status::kPaused) {
+      media.status = HostMedia::Status::kPlaying;
+    }
+    ApplyHostMedia(media);
+  }
+  return X_E_SUCCESS;
+}
+
+void AudioMediaPlayer::ReplaceHostPlayback() {
+  if (!host_playback_) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(host_mutex_);
+  if (!host_playback_) {
+    return;
+  }
+  XELOGI("XMP: the title's playback replaces the user's music on the host");
+  EndHostPlayback();
+  host_media_->ReleaseHold();
+}
+
+void AudioMediaPlayer::OnHostMediaChanged() {
+  std::lock_guard<std::mutex> lock(host_mutex_);
+  ApplyHostMedia(host_media_->GetMedia());
+}
+
+void AudioMediaPlayer::ApplyHostMedia(const HostMedia& media) {
+  if (media.status == HostMedia::Status::kPlaying) {
+    host_paused_for_title_ = false;
+  }
+  if (media.status == HostMedia::Status::kNone) {
+    if (host_playback_) {
+      EndHostPlayback();
+    }
+    return;
+  }
+  // A title holding playback locked keeps it until it gives it back.
+  if (xmp_override_) {
+    return;
+  }
+  if (!host_playback_) {
+    BeginHostPlayback(media);
+    return;
+  }
+  // Playing takes playback back from a title holding it unlocked.
+  if (media.status == HostMedia::Status::kPlaying &&
+      playback_controller_ != PlaybackController::kUser) {
+    SetPlaybackController(PlaybackController::kUser);
+    kernel_state_->BroadcastNotification(
+        kXNotificationXmpPlaybackControllerChanged, IsTitleInPlaybackControl());
+  }
+  UpdateHostPlayback(media);
+}
+
+void AudioMediaPlayer::BeginHostPlayback(const HostMedia& media) {
+  XELOGI("XMP: the user's music on the host takes over playback");
+  // It replaces the title's own. Set first so the decoder stops at once.
+  host_playback_ = true;
+  if (!IsIdle()) {
+    Stop(false, true);
+  }
+  active_playlist_ = nullptr;
+  active_song_ = nullptr;
+  SetPlaybackController(PlaybackController::kUser);
+  kernel_state_->BroadcastNotification(
+      kXNotificationXmpPlaybackControllerChanged, IsTitleInPlaybackControl());
+  UpdateHostPlayback(media);
+}
+
+void AudioMediaPlayer::UpdateHostPlayback(const HostMedia& media) {
+  const bool new_song = !active_song_ ||
+                        media.title != host_media_state_.title ||
+                        media.artist != host_media_state_.artist ||
+                        media.album != host_media_state_.album;
+  host_media_state_ = media;
+  if (new_song) {
+    SetHostSong(media);
+  }
+  const auto state = media.status == HostMedia::Status::kPlaying
+                         ? XmpApp::State::kPlaying
+                         : XmpApp::State::kPaused;
+  if (new_song || state != state_) {
+    state_ = state;
+    OnStateChanged();
+  }
+}
+
+void AudioMediaPlayer::EndHostPlayback() {
+  XELOGI("XMP: the user's music on the host stopped");
+  host_playback_ = false;
+  host_paused_for_title_ = false;
+  host_media_state_ = {};
+  state_ = XmpApp::State::kIdle;
+  active_song_ = nullptr;
+  OnStateChanged();
+  // A title holding playback keeps it.
+  if (playback_controller_ == PlaybackController::kUser) {
+    SetPlaybackController(PlaybackController::kGame);
+    kernel_state_->BroadcastNotification(
+        kXNotificationXmpPlaybackControllerChanged, IsTitleInPlaybackControl());
+  }
+}
+
+void AudioMediaPlayer::SetHostSong(const HostMedia& media) {
+  auto song = std::make_unique<XmpApp::Song>();
+  song->handle = static_cast<uint32_t>(host_songs_.size());
+  song->name = media.title;
+  song->artist = media.artist;
+  song->album = media.album;
+  song->album_artist = media.album_artist;
+  song->genre = media.genre;
+  song->track_number = media.track_number;
+  song->duration_ms = media.duration_ms;
+  song->format = XmpApp::SongFormat::kWma;
+  active_song_ = song.get();
+  current_song_handle_ = song->handle;
+  host_songs_.push_back(std::move(song));
 }
 
 bool AudioMediaPlayer::IsLastSongInPlaylist() const {
@@ -560,8 +770,9 @@ void AudioMediaPlayer::SetCaptureCallback(uint32_t callback, uint32_t context,
 }
 
 void AudioMediaPlayer::OnStateChanged() {
+  // The parameter says whether a song is playing or paused.
   kernel_state_->BroadcastNotification(kXNotificationXmpStateChanged,
-                                       static_cast<uint32_t>(state_));
+                                       state_ != XmpApp::State::kIdle);
 }
 
 bool AudioMediaPlayer::PushSamples(const float* samples, size_t frames) {

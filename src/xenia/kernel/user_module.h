@@ -114,11 +114,6 @@ class UserModule : public XModule {
 
   void Dump();
 
-  bool Save(ByteStream* stream) override;
-  static object_ref<UserModule> Restore(KernelState* kernel_state,
-                                        ByteStream* stream,
-                                        const std::string_view path);
-
   // TODO(Gliniak): This shouldn't be required. It is used for initial DLL
   // initialization. Which should happen on main thread before main execution
   // which isn't really possible right now.
@@ -130,9 +125,13 @@ class UserModule : public XModule {
 
   std::string name_;
   std::string path_;
+  // The name a module loaded from memory was given, extension included.
+  std::string memory_load_name_;
   std::optional<uint64_t> hash_ = std::nullopt;
 
   uint32_t guest_xex_header_ = 0;
+  // FullDllName and BaseDllName of the loader data.
+  uint32_t guest_dll_name_ = 0;
   ModuleFormat module_format_ = kModuleFormatUndefined;
 
   bool is_dll_module_ = false;

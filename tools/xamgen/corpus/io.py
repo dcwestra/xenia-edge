@@ -1,8 +1,10 @@
 """File corpus: a plain open, opens of a path's target directory, which open
 the directory holding the last component and say whether that exists, failed
-opens, a file's basic information, times set on a file, a write past the end
-of a sized file, an overwritten file sized again, a rename to a \\?? path
-and back, and names under \\System?? next to \\??. Everything is under
+opens, a file's basic information, times set on a file, a write time stamped
+by name and read back from its folder's listing, a write past the end
+of a sized file, an overwritten file sized again, a written file's size listed
+with its folder, a rename to a \\?? path and back, and names under
+\\System?? next to \\??. Everything is under
 game:\\krnlgen, which the first scenario makes.
 
 The target directory's handle is checked through its attributes. A failed
@@ -38,11 +40,13 @@ OPEN_TARGET_DIRECTORY = 0x4
 FILE_BASIC_INFORMATION = 4
 BASIC_INFORMATION_SIZE = 0x28
 FILE_RENAME_INFORMATION = 10
+FILE_DISPOSITION_INFORMATION = 13
 FILE_POSITION_INFORMATION = 14
 FILE_ALLOCATION_INFORMATION = 19
 FILE_END_OF_FILE_INFORMATION = 20
 FILE_NETWORK_OPEN_INFORMATION = 34
 NETWORK_OPEN_INFORMATION_SIZE = 0x38
+DIRECTORY_INFORMATION_SIZE = 0x100
 
 ROOT = 'game:\\krnlgen'
 FILE = ROOT + '\\file'
@@ -186,6 +190,22 @@ def read(s, handle, size):
            capture=[iosb, data.prefix(0x10), data + (size - 0x10)])
 
 
+def list_file(s, directory, mask, name, times=False):
+    """NtQueryDirectoryFile for `mask` from the start, capturing the end of
+    file listed and the name's length, or with `times` the four times instead.
+    FATX's Information isn't the point, so only the status is captured."""
+    iosb = s.alloc(8, 'list iosb')
+    info = s.alloc(DIRECTORY_INFORMATION_SIZE, 'directory information',
+                   fill=0)
+    if times:
+        parts = [(info + 0x8).prefix(0x20)]
+    else:
+        parts = [(info + 0x28).prefix(8), (info + 0x3C).prefix(4)]
+    s.call('NtQueryDirectoryFile', directory, 0, 0, 0, iosb, info,
+           DIRECTORY_INFORMATION_SIZE, ansi(s, mask, 'mask'), 1,
+           capture=[iosb.prefix(4), *parts], name=name)
+
+
 def rename(s, handle, root, path, name):
     """FileRenameInformation, not replacing, naming `path` under `root`.
     FATX leaves the Information of the cache's last page read through the
@@ -314,6 +334,41 @@ def build(corpus):
     query_attributes(s, handle, times=True)
     s.call('NtClose', handle)
 
+    # A write time stamped through a handle opened by name, as titles stamp
+    # the copies they cache, read back from the folder's listing, which
+    # FindFirstFile reads, as well as through handles.
+    s = corpus.scenario('stamp times listed with folder')
+    path = ROOT + '\\stamped'
+    access = GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE
+    handle = create(s, path, access, FILE_ATTRIBUTE_NORMAL,
+                    FILE_OVERWRITE_IF,
+                    FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+                    capture_status=False)
+    write(s, handle)
+    set_times(s, handle, CREATION_TIME, ACCESS_TIME, REWRITE_TIME,
+              'set all times')
+    s.call('NtClose', handle)
+    directory = create(s, ROOT, GENERIC_READ | SYNCHRONIZE, 0, FILE_OPEN,
+                       FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+                       variable='directory')
+    for write_time, name in (
+            (WRITE_TIME, 'stamp write time'),
+            (EVEN_WRITE_TIME, 'stamp write time past an even second')):
+        handle = create(s, path, access, 0, FILE_OPEN,
+                        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT)
+        set_times(s, handle, 0, 0, write_time, name)
+        query_attributes(s, handle, times=True)
+        list_file(s, directory, 'stamped', f'list while open, {name}',
+                  times=True)
+        s.call('NtClose', handle)
+        list_file(s, directory, 'stamped', f'list after close, {name}',
+                  times=True)
+    handle = create(s, path, GENERIC_READ | SYNCHRONIZE, 0, FILE_OPEN,
+                    FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT)
+    query_attributes(s, handle, times=True)
+    s.call('NtClose', handle)
+    s.call('NtClose', directory)
+
     s = corpus.scenario('set end of file')
     handle = create(s, FILE, GENERIC_WRITE | SYNCHRONIZE, 0, FILE_OPEN,
                     FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT)
@@ -358,6 +413,31 @@ def build(corpus):
     query_attributes(s, handle, end_of_file=True)
     read(s, handle, 0x400)
     s.call('NtClose', handle)
+
+    # A new file's size listed with its folder after a write grows it, while
+    # the handle that wrote it is open and once it's closed. One left by an
+    # earlier run is deleted first, since one that's overwritten is sized
+    # differently.
+    s = corpus.scenario('list after write')
+    path = ROOT + '\\listed'
+    handle = create(s, path, GENERIC_WRITE | DELETE | SYNCHRONIZE,
+                    FILE_ATTRIBUTE_NORMAL, FILE_OPEN_IF,
+                    FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+                    capture_status=False)
+    set_information(s, handle, FILE_DISPOSITION_INFORMATION, b'\x01',
+                    'delete', status_only=True)
+    s.call('NtClose', handle)
+    handle = create(s, path, GENERIC_WRITE | SYNCHRONIZE,
+                    FILE_ATTRIBUTE_NORMAL, FILE_CREATE,
+                    FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT)
+    write(s, handle, 0x300)
+    directory = create(s, ROOT, GENERIC_READ | SYNCHRONIZE, 0, FILE_OPEN,
+                       FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+                       variable='directory')
+    list_file(s, directory, 'listed', 'list while open')
+    s.call('NtClose', handle)
+    list_file(s, directory, 'listed', 'list after close')
+    s.call('NtClose', directory)
 
     # A full \\?? name with no root, as XeFu renames, and back by a name under
     # the DOS devices root.

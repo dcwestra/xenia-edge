@@ -331,7 +331,7 @@ typedef struct alignas(64) PPCContext_s {
                             //                      01 = toward zero
                             //                      10 = toward +infinity
                             //                      11 = toward -infinity
-      uint32_t ni : 1;      // Floating-point non-IEEE mode
+      uint32_t ni : 1;      // Non-IEEE mode, not implemented: reads 0
       uint32_t xe : 1;      // IEEE floating-point inexact exception enable
       uint32_t ze : 1;      // IEEE floating-point zero divide exception enable
       uint32_t ue : 1;      // IEEE floating-point underflow exception enable
@@ -390,12 +390,14 @@ typedef struct alignas(64) PPCContext_s {
   uint8_t xer_ca;
   uint8_t xer_ov;
   uint8_t xer_so;
+  // XER[25:31], the byte count of lswx and stswx
+  uint8_t xer_count;
 
   // Condition registers:
   // These are split to make it easier to do DCE on unused stores.
   uint64_t cr() const;
   void set_cr(uint64_t value);
-  // Only CA, OV and SO are modelled, the rest read as zero.
+  // Only CA, OV, SO and the byte count are modelled, the rest read as zero.
   uint32_t xer() const;
   void set_xer(uint32_t value);
   // todo: remove, saturation should be represented by a vector

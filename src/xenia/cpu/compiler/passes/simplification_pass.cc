@@ -32,12 +32,14 @@ SimplificationPass::SimplificationPass() : ConditionalGroupSubpass() {}
 
 SimplificationPass::~SimplificationPass() {}
 
-static bool IsNeverF64Denormal(hir::Value* v, int depth);
+static bool IsInSingleRange(const Value* v) {
+  return v && v->IsInSingleRange();
+}
 
-// IsNeverF64Denormal stops at a load_context, so carry the proof for the 32
+// IsInSingleRange stops at a load_context, so carry the proof for the 32
 // FPR context slots across blocks: a forward must-analysis where a slot is
 // clean if every path to it stored a clean value. Loads of clean slots are
-// tagged VALUE_NEVER_F64_DENORMAL.
+// tagged VALUE_IN_SINGLE_RANGE.
 namespace {
 
 constexpr size_t kGuestFPRCount = 32;
@@ -60,8 +62,10 @@ bool GuestFPRSlot(uint32_t offset, TypeName type, size_t* out_index) {
   return true;
 }
 
-// Anything that can write guest context without a visible store. Not
-// OPCODE_FLAG_VOLATILE, which conditional branches carry too.
+// Anything that can write a guest FPR without a visible store. Not
+// OPCODE_FLAG_VOLATILE, which conditional branches carry too. Not a preemption
+// check either: its yield runs other threads on their own contexts and nothing
+// writes the FPRs of a thread that is not running.
 bool ClobbersGuestContext(const Instr* i) {
   switch (i->GetOpcodeNum()) {
     case OPCODE_CALL:
@@ -69,7 +73,6 @@ bool ClobbersGuestContext(const Instr* i) {
     case OPCODE_CALL_INDIRECT:
     case OPCODE_CALL_INDIRECT_TRUE:
     case OPCODE_CALL_EXTERN:
-    case OPCODE_CHECK_PREEMPT:
     case OPCODE_TRAP:
     case OPCODE_TRAP_TRUE:
     case OPCODE_DEBUG_BREAK:
@@ -82,7 +85,8 @@ bool ClobbersGuestContext(const Instr* i) {
 
 }  // namespace
 
-bool SimplificationPass::PropagateGuestFPRDenormalProof(HIRBuilder* builder) {
+bool SimplificationPass::PropagateGuestFPRSingleRangeProof(
+    HIRBuilder* builder) {
   // Block::ordinal is 16 bits.
   size_t block_count = 0;
   for (Block* b = builder->first_block(); b; b = b->next) {
@@ -117,8 +121,8 @@ bool SimplificationPass::PropagateGuestFPRDenormalProof(HIRBuilder* builder) {
       if (op == OPCODE_LOAD_CONTEXT) {
         if (tag && i->dest && GuestFPRSlot(offset, i->dest->type, &slot) &&
             (clean & (uint32_t(1) << slot)) &&
-            !(i->dest->flags & VALUE_NEVER_F64_DENORMAL)) {
-          i->dest->flags |= VALUE_NEVER_F64_DENORMAL;
+            !(i->dest->flags & VALUE_IN_SINGLE_RANGE)) {
+          i->dest->flags |= VALUE_IN_SINGLE_RANGE;
           tagged = true;
         }
         continue;
@@ -128,7 +132,7 @@ bool SimplificationPass::PropagateGuestFPRDenormalProof(HIRBuilder* builder) {
       }
       Value* stored = i->src2.value;
       if (GuestFPRSlot(offset, stored->type, &slot)) {
-        if (IsNeverF64Denormal(stored, 4)) {
+        if (IsInSingleRange(stored)) {
           clean |= uint32_t(1) << slot;
         } else {
           clean &= ~(uint32_t(1) << slot);
@@ -220,7 +224,7 @@ bool SimplificationPass::PropagateGuestFPRDenormalProof(HIRBuilder* builder) {
 bool SimplificationPass::Run(HIRBuilder* builder, bool& result) {
   result = false;
 
-  result |= PropagateGuestFPRDenormalProof(builder);
+  result |= PropagateGuestFPRSingleRangeProof(builder);
   result |= SimplifyBitArith(builder);
   result |= EliminateConversions(builder);
   result |= SimplifyAssignments(builder);
@@ -1554,53 +1558,35 @@ bool SimplificationPass::SimplifySHLArith(hir::Instr* i,
   return true;
 }
 
-// A single's smallest denormal (2^-149) is far above double's normal floor.
-static bool IsNeverF64Denormal(hir::Value* v, int depth) {
-  if (!v || v->type != FLOAT64_TYPE) {
-    return false;
-  }
-  if (v->IsConstant()) {
-    uint64_t bits;
-    std::memcpy(&bits, &v->constant.f64, sizeof(bits));
-    return (bits & 0x7FF0000000000000ull) != 0 ||
-           (bits & 0x000FFFFFFFFFFFFFull) == 0;
-  }
-  if (v->flags & VALUE_NEVER_F64_DENORMAL) {
-    return true;
-  }
-  hir::Instr* def = v->GetDefSkipAssigns();
-  if (!def || depth <= 0) {
-    return false;
-  }
-  switch (def->GetOpcodeNum()) {
-    case OPCODE_TO_SINGLE:
-      // Under --no_round_to_single the x64 TO_SINGLE is an identity.
-      return !cvars::no_round_to_single;
-    case OPCODE_UNPACK_SINGLE:
-      return true;
-    case OPCODE_CONVERT:
-      return def->src1.value && def->src1.value->type == FLOAT32_TYPE;
-    case OPCODE_SELECT:
-      return IsNeverF64Denormal(def->src2.value, depth - 1) &&
-             IsNeverF64Denormal(def->src3.value, depth - 1);
-    case OPCODE_NEG:
-    case OPCODE_ABS:
-      return IsNeverF64Denormal(def->src1.value, depth - 1);
-    default:
-      return false;
-  }
-}
-
 bool SimplificationPass::SimplifyBasicArith(hir::Instr* i,
                                             hir::HIRBuilder* builder) {
   if (!i->dest) {
     return false;
   }
+  hir::Opcode op = i->GetOpcodeNum();
+  // The operation's own single-range check goes once every operand is proven
+  // in range.
+  switch (op) {
+    case OPCODE_ADD:
+    case OPCODE_SUB:
+    case OPCODE_MUL:
+    case OPCODE_MUL_ADD:
+    case OPCODE_MUL_SUB:
+      if (i->dest->type == FLOAT64_TYPE &&
+          (i->flags & ARITHMETIC_SINGLE_RANGE) &&
+          IsInSingleRange(i->src1.value) && IsInSingleRange(i->src2.value) &&
+          (op == OPCODE_ADD || op == OPCODE_SUB || op == OPCODE_MUL ||
+           IsInSingleRange(i->src3.value))) {
+        i->flags &= ~ARITHMETIC_SINGLE_RANGE;
+        return true;
+      }
+      break;
+    default:
+      break;
+  }
   if (i->dest->MaybeFloaty()) {
     return false;
   }
-
-  hir::Opcode op = i->GetOpcodeNum();
 
   switch (op) {
     case OPCODE_ADD: {
@@ -1612,10 +1598,9 @@ bool SimplificationPass::SimplifyBasicArith(hir::Instr* i,
     case OPCODE_SHL: {
       return SimplifySHLArith(i, builder);
     }
-    case OPCODE_DENORMAL_QUIRK: {
-      if (IsNeverF64Denormal(i->src1.value, 4) &&
-          IsNeverF64Denormal(i->src2.value, 4) &&
-          IsNeverF64Denormal(i->src3.value, 4)) {
+    case OPCODE_SINGLE_RANGE_QUIRK: {
+      if (IsInSingleRange(i->src1.value) && IsInSingleRange(i->src2.value) &&
+          IsInSingleRange(i->src3.value)) {
         i->Replace(&OPCODE_ASSIGN_info, 0);
         i->set_src1(builder->LoadZeroInt8());
         return true;
