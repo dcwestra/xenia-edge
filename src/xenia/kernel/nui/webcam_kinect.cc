@@ -140,8 +140,16 @@ constexpr float kHeightFollowSeconds = 4.0f;
 constexpr size_t kLeanSamples = 1800;
 constexpr size_t kLeanSamplesPerUpdate = 30;
 constexpr float kLeanFollowSeconds = 0.5f;
-// How slowly the scale of MediaPipe's body to the drawn one follows it.
+// How slowly the scale of MediaPipe's body to the drawn one follows the
+// median of its last kScaleSampleSeconds, taken as it is for the first
+// kScaleSnapSamples.
 constexpr float kScaleFollowSeconds = 5.0f;
+constexpr double kScaleSampleSeconds = 5.0;
+constexpr size_t kScaleSnapSamples = 30;
+// After those, how far off a measurement may be (a fraction), and for how
+// long only those that are must come to start afresh.
+constexpr float kScaleOutlier = 0.25f;
+constexpr double kScaleRestartSeconds = 3.0;
 constexpr float kMinVisibility = 0.5f;
 // A leg's bones follow the webcam's picture once it shows the joint at each
 // one's end (in the picture, at kLegShownVisibility), until it hasn't for
@@ -847,7 +855,6 @@ class KinectCameraWebcam : public KinectCamera {
     for (OneEuroFilter& filter : image_filters_) {
       filter.Reset();
     }
-    mediapipe_scale_ = 0.0f;
   }
 
   // Streams from the webcam ChooseWebcam chose instead. A webcam can only be
@@ -862,6 +869,12 @@ class KinectCameraWebcam : public KinectCamera {
     }
     ResetTracking();
     have_rest_ = false;
+    // Someone else may be in front of it.
+    mediapipe_scale_ = 0.0f;
+    scale_whole_body_ = false;
+    scale_samples_.clear();
+    scale_sample_count_ = 0;
+    scale_outliers_since_ = -1.0;
   }
 
   // The hip center's position from the webcam, by least squares over the
@@ -1015,14 +1028,63 @@ class KinectCameraWebcam : public KinectCamera {
                   std::max(shoulder_width + (shoulders - hips).Length(), 0.1f)
             : 2.0f * kShoulderHalfWidth * s / std::max(shoulder_width, 0.05f);
     // A constant of the player's, which MediaPipe's shoulders shift a little
-    // with their arms: followed slowly.
-    if (mediapipe_scale_ <= 0.0f) {
+    // with their arms: the median of kScaleSampleSeconds, followed slowly
+    // once kScaleSnapSamples have been taken. Seen head to foot it's measured
+    // best: near the webcam, with their feet out of the picture, MediaPipe's
+    // body comes out smaller, and for a few pictures as it finds them again.
+    // Once a picture has shown all of them, only those count.
+    const bool whole_body = hips_seen && visible(L::kAnkleLeft) &&
+                            visible(L::kAnkleRight) &&
+                            pose.image[L::kAnkleLeft][1] < height &&
+                            pose.image[L::kAnkleRight][1] < height;
+    if (whole_body && !scale_whole_body_) {
+      scale_whole_body_ = true;
+      scale_samples_.clear();
+      scale_sample_count_ = 0;
+    }
+    bool take_scale = whole_body || !scale_whole_body_;
+    // After those, one far from the scale found is taken for MediaPipe
+    // losing track of them, unless only such keep coming for
+    // kScaleRestartSeconds, when it's found afresh.
+    if (take_scale && scale_sample_count_ > kScaleSnapSamples &&
+        std::abs(measured_scale / mediapipe_scale_ - 1.0f) > kScaleOutlier) {
+      take_scale = false;
+      if (scale_outliers_since_ < 0.0) {
+        scale_outliers_since_ = time;
+      } else if (time - scale_outliers_since_ > kScaleRestartSeconds) {
+        scale_samples_.clear();
+        scale_sample_count_ = 0;
+        take_scale = true;
+      }
+    }
+    if (take_scale) {
+      scale_outliers_since_ = -1.0;
+      scale_samples_.push_back({time, measured_scale});
+      ++scale_sample_count_;
+    }
+    while (!scale_samples_.empty() &&
+           scale_samples_.front().first < time - kScaleSampleSeconds) {
+      scale_samples_.pop_front();
+    }
+    if (!scale_samples_.empty()) {
+      std::vector<float> values;
+      for (const auto& [when, value] : scale_samples_) {
+        values.push_back(value);
+      }
+      std::nth_element(values.begin(), values.begin() + values.size() / 2,
+                       values.end());
+      const float median = values[values.size() / 2];
+      if (mediapipe_scale_ <= 0.0f ||
+          scale_sample_count_ <= kScaleSnapSamples) {
+        mediapipe_scale_ = median;
+      } else {
+        mediapipe_scale_ +=
+            (median - mediapipe_scale_) *
+            (1.0f - std::exp(-float(std::clamp(time - scale_time_, 0.0, 1.0)) /
+                             kScaleFollowSeconds));
+      }
+    } else if (mediapipe_scale_ <= 0.0f) {
       mediapipe_scale_ = measured_scale;
-    } else {
-      mediapipe_scale_ +=
-          (measured_scale - mediapipe_scale_) *
-          (1.0f - std::exp(-float(std::clamp(time - scale_time_, 0.0, 1.0)) /
-                           kScaleFollowSeconds));
     }
     scale_time_ = time;
     const float mediapipe_scale = mediapipe_scale_;
@@ -1559,8 +1621,13 @@ class KinectCameraWebcam : public KinectCamera {
   // speeds about 200 times the meters a second of landmark_filters_'.
   std::vector<OneEuroFilter> image_filters_ =
       std::vector<OneEuroFilter>(L::kCount * 2, OneEuroFilter(1.5f, 0.025f));
-  // PlaceBody's: how much larger the drawn body is than MediaPipe's.
+  // PlaceBody's: how much larger the drawn body is than MediaPipe's, and
+  // whether it was measured from a picture showing all of them.
   float mediapipe_scale_ = 0.0f;
+  bool scale_whole_body_ = false;
+  std::deque<std::pair<double, float>> scale_samples_;
+  size_t scale_sample_count_ = 0;
+  double scale_outliers_since_ = -1.0;
   double scale_time_ = 0.0;
   // UpdateBackground's.
   RgbFrame background_;
