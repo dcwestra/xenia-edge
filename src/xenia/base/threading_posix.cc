@@ -321,7 +321,6 @@ static void ParkMultiWaiter(uint32_t wait_gen,
 #endif
 }
 
-
 class PosixConditionBase {
  public:
   virtual ~PosixConditionBase() = default;

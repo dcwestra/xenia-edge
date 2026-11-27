@@ -1409,11 +1409,10 @@ X_RESULT xeXamShowSigninUI(uint32_t user_index, uint32_t users_needed,
   xe::ui::ImGuiDrawer* imgui_drawer = emulator->imgui_drawer();
   return xeXamDispatchDialogAsync<ui::SigninUI>(
       [&]() {
-        auto* dialog =
-            new ui::SigninUI(imgui_drawer, emulator->input_system(),
-                             kernel_state()->xam_state()->profile_manager(),
-                             emulator->input_system()->GetLastUsedSlot(),
-                             users_needed);
+        auto* dialog = new ui::SigninUI(
+            imgui_drawer, emulator->input_system(),
+            kernel_state()->xam_state()->profile_manager(),
+            emulator->input_system()->GetLastUsedSlot(), users_needed);
         if (kinect) {
           dialog->EnableKinectCursor(kinect_tracking_id);
         }
