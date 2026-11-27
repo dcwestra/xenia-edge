@@ -256,6 +256,9 @@ class FrameSource {
   // tangent of half of it: 0.75 for a 4:3 mode cut from a 16:9 sensor.
   // kinect_webcam_fov is the full view's.
   virtual float field_fraction() const { return 1.0f; }
+  // How long ago the last frame was taken, as far as the source knows, in
+  // milliseconds (relative to how old its first was).
+  virtual double frame_age_ms() const { return 0.0; }
 };
 
 class SdlCameraSource : public FrameSource {
@@ -368,6 +371,7 @@ class SdlCameraSource : public FrameSource {
   }
 
   float field_fraction() const override { return field_fraction_; }
+  double frame_age_ms() const override { return frame_age_ms_; }
 
   bool Next(RgbFrame& frame) override {
     using clock = std::chrono::steady_clock;
@@ -391,6 +395,8 @@ class SdlCameraSource : public FrameSource {
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
         continue;
       }
+      frame_age_ms_ =
+          timestamp ? double(SDL_GetTicksNS() - timestamp) / 1e6 : 0.0;
       bool ok = true;
       SDL_Surface* rgb = newest;
       if (newest->format != SDL_PIXELFORMAT_RGB24) {
@@ -423,6 +429,7 @@ class SdlCameraSource : public FrameSource {
   SDL_Camera* camera_ = nullptr;
   std::string name_;
   float field_fraction_ = 1.0f;
+  double frame_age_ms_ = 0.0;
   KeepFrameRate keep_frame_rate_;
 };
 
@@ -606,6 +613,7 @@ class KinectCameraWebcam : public KinectCamera {
       }
       const auto now = clock::now();
       const double time = std::chrono::duration<double>(now - start).count();
+      LogKinectTiming("capture", source_->frame_age_ms());
       // The view as titles have tilted the (simulated) sensor: they find the
       // floor and frame their players by tilting it.
       renderer_.SetCamera(kCameraHeight, KinectMotor::SimulatedTiltDegrees());
@@ -622,6 +630,11 @@ class KinectCameraWebcam : public KinectCamera {
         ResetTracking();
       }
       found += seen;
+      if (placed) {
+        // The hands' heights the title is shown, to time its skeletons by.
+        LogKinectTiming("hand_left", body[BodyJoint::kHandLeft].y);
+        LogKinectTiming("hand_right", body[BodyJoint::kHandRight].y);
+      }
       renderer_.Render(&body, placed ? 1 : 0,
                        float(cvars::kinect_webcam_player_height), raw.data());
       if (cvars::kinect_mirror) {

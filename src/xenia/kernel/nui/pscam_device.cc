@@ -224,6 +224,7 @@ X_STATUS PsCamDevice::QueueFrameBuffer(uint32_t request_address) {
   switch (request->stream) {
     case kStreamDepth:
       depth_buffers_.push_back(request_address);
+      LogKinectTiming("queue", double(depth_buffers_.size()));
       break;
     case kStreamColor:
       color_buffers_.push_back(request_address);
@@ -311,6 +312,7 @@ void PsCamDevice::StartStreaming() {
 }
 
 void PsCamDevice::OnDepthFrame(const uint8_t* data, size_t size) {
+  LogKinectTiming("sensor");
   if (recorder_) {
     recorder_->AddFrame(KinectRecorder::Stream::kDepth, data, size);
   }
@@ -337,6 +339,7 @@ void PsCamDevice::OnDepthFrame(const uint8_t* data, size_t size) {
 }
 
 void PsCamDevice::OnColorFrame(const uint8_t* data, size_t size) {
+  LogKinectTiming("color");
   if (recorder_) {
     recorder_->AddFrame(camera_->IsColorRegistered()
                             ? KinectRecorder::Stream::kRegisteredColor
@@ -466,6 +469,7 @@ void PsCamDevice::WorkerMain() {
           args, xe::countof(args));
     }
     if (depth_request) {
+      LogKinectTiming("deliver", double(depth_number));
       CompleteFrameBuffer(depth_request, depth.data(), uint32_t(depth.size()),
                           depth_number, depth_time_ms);
     }

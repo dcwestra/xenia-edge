@@ -18,6 +18,7 @@
 #include "xenia/base/logging.h"
 #include "xenia/base/memory.h"
 #include "xenia/base/string.h"
+#include "xenia/kernel/nui/kinect_camera.h"
 
 DEFINE_path(kinect_skeleton_log, "",
             "Write the skeletons a Kinect title tracks, every frame it hands "
@@ -78,6 +79,11 @@ void NuiHud::OnSkeletonFrame(const uint8_t* message, uint32_t size) {
     }
   }
   frame_time_ = std::chrono::steady_clock::now();
+  int tracked = 0;
+  for (const Skeleton& skeleton : skeletons_) {
+    tracked += skeleton.state == kTrackingStateTracked;
+  }
+  LogKinectTiming("skeleton", tracked);
   LogSkeletons();
 }
 

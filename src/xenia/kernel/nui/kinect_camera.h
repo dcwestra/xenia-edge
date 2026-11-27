@@ -71,6 +71,11 @@ class KinectCamera {
   virtual void Stop() = 0;
 };
 
+// For measuring how long frames take to reach titles: an event as a frame
+// passes a stage, with a value, to kinect_timing_log (milliseconds since its
+// first event). Does nothing without it.
+void LogKinectTiming(const char* event, double value = 0.0);
+
 // The raw depth value a Kinect for Xbox 360 reports for a distance, the
 // inverse of KinectRawDepthToMillimeters: 2047, no reading, for 0 and for
 // distances outside the sensor's range. For depth from other sources.

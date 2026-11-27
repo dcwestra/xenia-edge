@@ -13,7 +13,9 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -36,6 +38,14 @@ DEFINE_string(kinect_camera, "auto",
               "else a webcam standing in for one), kinect or webcam.",
               "Kernel");
 
+DEFINE_path(kinect_timing_log, "",
+            "For measuring the Kinect's delay: write when each frame passes "
+            "each stage on its way to a title to this CSV file - from the "
+            "sensor (depth and color, or a webcam's picture and how old it "
+            "was), the title's frame buffers queued and filled, the skeletons "
+            "it tracks.",
+            "Kernel");
+
 DEFINE_path(kinect_playback_path, "",
             "Play a recording made with kinect_record_path to Kinect titles, "
             "over and over, instead of streaming from a Kinect.",
@@ -51,6 +61,37 @@ struct KinectRecordingFrame {
   uint32_t time_ms;  // Since the recording started.
   uint32_t size;
 };
+
+void LogKinectTiming(const char* event, double value) {
+  if (cvars::kinect_timing_log.empty()) {
+    return;
+  }
+  static std::mutex mutex;
+  static FILE* file = nullptr;
+  static bool failed = false;
+  static std::chrono::steady_clock::time_point start;
+  const auto now = std::chrono::steady_clock::now();
+  std::lock_guard<std::mutex> lock(mutex);
+  if (!file) {
+    if (failed) {
+      return;
+    }
+    file = xe::filesystem::OpenFile(cvars::kinect_timing_log, "w");
+    if (!file) {
+      failed = true;
+      XELOGW("Kinect: can't write the timing log {}",
+             xe::strip_pii(xe::path_to_utf8(cvars::kinect_timing_log)));
+      return;
+    }
+    // A line at a time, so quitting loses none.
+    std::setvbuf(file, nullptr, _IOLBF, 1 << 16);
+    std::fputs("ms,event,value\n", file);
+    start = now;
+  }
+  std::fprintf(file, "%.2f,%s,%g\n",
+               std::chrono::duration<double, std::milli>(now - start).count(),
+               event, value);
+}
 
 KinectRecorder::KinectRecorder(const std::filesystem::path& path) {
   file_ = xe::filesystem::OpenFile(path, "wb");
