@@ -113,6 +113,37 @@ void PoseEstimator::Roi::ToImage(float u, float v, int out_size, float& x,
   y = cy + s * du + c * dv;
 }
 
+float PoseMask::At(float x, float y) const {
+  if (!valid_) {
+    return 0.0f;
+  }
+  // Roi::ToImage undone.
+  const float dx = x - cx_;
+  const float dy = y - cy_;
+  const float u = (cos_ * dx + sin_ * dy) / scale_ + kSize * 0.5f;
+  const float v = (-sin_ * dx + cos_ * dy) / scale_ + kSize * 0.5f;
+  if (!(u >= 0.0f && v >= 0.0f && u < kSize - 1 && v < kSize - 1)) {
+    return 0.0f;
+  }
+  const int u0 = int(u);
+  const int v0 = int(v);
+  const float wu = u - u0;
+  const float wv = v - v0;
+  const uint8_t* p = &values_[size_t(v0) * kSize + u0];
+  const float top = p[0] + (p[1] - p[0]) * wu;
+  const float bottom = p[kSize] + (p[kSize + 1] - p[kSize]) * wu;
+  return (top + (bottom - top) * wv) * (1.0f / 255.0f);
+}
+
+void PoseMask::Bounds(float& x0, float& y0, float& x1, float& y1) const {
+  const float half = kSize * 0.5f * scale_;
+  const float extent = half * (std::abs(cos_) + std::abs(sin_));
+  x0 = cx_ - extent;
+  x1 = cx_ + extent;
+  y0 = cy_ - extent;
+  y1 = cy_ + extent;
+}
+
 PoseEstimator::~PoseEstimator() = default;
 
 std::unique_ptr<PoseEstimator> PoseEstimator::Create(
@@ -242,14 +273,15 @@ bool PoseEstimator::Landmarks(const Frame& frame, const Roi& roi,
       }
     }
   }
-  if (!landmarker_->Run("input_1", input_.data(),
-                        {1, kLandmarkSize, kLandmarkSize, 3},
-                        {"Identity", "Identity_1", "Identity_4"}, outputs_)) {
+  if (!landmarker_->Run(
+          "input_1", input_.data(), {1, kLandmarkSize, kLandmarkSize, 3},
+          {"Identity", "Identity_1", "Identity_4", "Identity_2"}, outputs_)) {
     return false;
   }
   const std::vector<float>& raw = outputs_[0];
   const std::vector<float>& flag = outputs_[1];
   const std::vector<float>& world = outputs_[2];
+  const std::vector<float>& segmentation = outputs_[3];
   if (raw.size() < kModelLandmarks * 5 || flag.empty() ||
       world.size() < kModelLandmarks * 3) {
     return false;
@@ -261,7 +293,23 @@ bool PoseEstimator::Landmarks(const Frame& frame, const Roi& roi,
   for (int i = 0; i < PoseLandmarks::kCount; ++i) {
     const float* r = &raw[i * 5];
     roi.ToImage(r[0], r[1], kLandmarkSize, pose.image[i][0], pose.image[i][1]);
-    pose.visibility[i] = std::min(Sigmoid(r[3]), Sigmoid(r[4]));
+    pose.presence[i] = Sigmoid(r[4]);
+    pose.visibility[i] = std::min(Sigmoid(r[3]), pose.presence[i]);
+  }
+  // The mask, as logits over the square.
+  constexpr size_t kMaskPixels = size_t(PoseMask::kSize) * PoseMask::kSize;
+  mask_.valid_ = segmentation.size() >= kMaskPixels;
+  if (mask_.valid_) {
+    mask_.values_.resize(kMaskPixels);
+    for (size_t i = 0; i < kMaskPixels; ++i) {
+      mask_.values_[i] = uint8_t(
+          Sigmoid(std::clamp(segmentation[i], -20.0f, 20.0f)) * 255.0f + 0.5f);
+    }
+    mask_.cx_ = roi.cx;
+    mask_.cy_ = roi.cy;
+    mask_.cos_ = std::cos(roi.rotation);
+    mask_.sin_ = std::sin(roi.rotation);
+    mask_.scale_ = roi.size / kLandmarkSize;
   }
   // World landmarks come in the square's orientation: turned back to the
   // camera's.
@@ -283,6 +331,7 @@ bool PoseEstimator::Landmarks(const Frame& frame, const Roi& roi,
 bool PoseEstimator::Process(const uint8_t* rgb, int width, int height,
                             size_t stride, PoseLandmarks& pose) {
   const Frame frame = {rgb, width, height, stride};
+  mask_.valid_ = false;
   Roi next;
   // Following the person from the last frame.
   if (tracking_) {

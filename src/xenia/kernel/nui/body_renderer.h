@@ -13,6 +13,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 namespace xe {
@@ -86,16 +87,44 @@ class BodyRenderer {
   static constexpr float kCenterX = 319.5f;
   static constexpr float kCenterY = 239.5f;
 
+  // The first body's outline as a picture of the player shows it. Titles
+  // show players the depth of their bodies, and a body drawn from simple
+  // shapes alone looks like a mannequin: with an outline, the body takes the
+  // player's, bone by bone, so it stays where its skeleton is.
+  struct Outline {
+    // Each joint's place in the picture, in its pixels.
+    std::array<std::array<float, 2>, size_t(BodyJoint::kCount)> joints;
+    // Whether the picture shows the joint where it's drawn: a bone between
+    // joints it doesn't show keeps its shapes.
+    std::array<bool, size_t(BodyJoint::kCount)> shown;
+    // The picture's pixels per pixel of the sensor's view, across the body.
+    float scale;
+    // 0 to 1, how likely a picture pixel is to show the player.
+    std::function<float(float x, float y)> mask;
+  };
+
   BodyRenderer();
 
   // The sensor's height above the floor and its tilt up, in degrees.
   void SetCamera(float height, float tilt_degrees);
   // A room point in the sensor's view: x right, y up, z (depth) out.
   Vec3 ToCamera(const Vec3& room) const;
+  // A point in the sensor's view to its pixel.
+  static void Project(const Vec3& camera, float& x, float& y) {
+    x = kCenterX + kFocalLength * camera.x / camera.z;
+    y = kCenterY - kFocalLength * camera.y / camera.z;
+  }
   // Raw depth values (KinectCamera's format, 2047 for no reading), for the
-  // bodies given, sized for a person of the given height.
+  // bodies given, sized for a person of the given height, the first in the
+  // outline given if any.
   void Render(const Body* bodies, size_t body_count, float player_height,
-              uint16_t* raw);
+              uint16_t* raw, const Outline* outline = nullptr);
+  // After Render with an outline, for each pixel of the body (before the
+  // view is mirrored), where in the picture it is: x, y pairs, NaN for
+  // pixels that aren't the body's.
+  const std::vector<float>& source() const { return source_; }
+  // Whether the last Render had an outline.
+  bool outlined() const { return outlined_; }
 
  private:
   struct Ellipsoid {
@@ -108,6 +137,8 @@ class BodyRenderer {
   void AddLimb(const Vec3& p0, const Vec3& p1, float r0, float r1);
   void DrawRoom();
   void Draw(const Ellipsoid& e);
+  void TraceOutline(const Body& body, float player_height,
+                    const Outline& outline);
   void CastShadow();
 
   float camera_height_ = 0.85f;
@@ -117,6 +148,19 @@ class BodyRenderer {
   std::vector<float> depth_;
   std::vector<Ellipsoid> shapes_;
   std::vector<uint16_t> raw_from_mm_;
+  // TraceOutline's, per pixel.
+  struct Nearest {
+    // The bone, -1 for none; how far outside its shape (negative inside),
+    // in pixels; its axis' depth there; where it puts the pixel in the
+    // picture; and whether the pixel is in the shape's core.
+    int bone;
+    float outside, axis_depth, x, y;
+    bool core;
+  };
+  std::vector<Nearest> nearest_[2];
+  std::vector<uint8_t> in_kept_shape_;
+  std::vector<float> source_;
+  bool outlined_ = false;
 };
 
 }  // namespace nui

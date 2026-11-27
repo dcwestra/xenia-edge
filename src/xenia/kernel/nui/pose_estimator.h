@@ -57,6 +57,29 @@ struct PoseLandmarks {
   float world[kCount][3];
   // How likely each is to be in view and not hidden, 0 to 1.
   float visibility[kCount];
+  // How likely each is to be within the picture, hidden or not, 0 to 1.
+  float presence[kCount];
+};
+
+// Which of a frame's pixels show the person: MediaPipe's segmentation, over
+// the square the landmark model read.
+class PoseMask {
+ public:
+  static constexpr int kSize = 256;
+
+  bool valid() const { return valid_; }
+  // 0 to 1 at a frame pixel (centers on whole numbers), 0 outside the square.
+  float At(float x, float y) const;
+  // The frame pixels the square covers, a bounding box.
+  void Bounds(float& x0, float& y0, float& x1, float& y1) const;
+
+ private:
+  friend class PoseEstimator;
+  bool valid_ = false;
+  // The square: its center and turn in the frame, and frame pixels per mask
+  // pixel.
+  float cx_ = 0.0f, cy_ = 0.0f, cos_ = 1.0f, sin_ = 0.0f, scale_ = 1.0f;
+  std::vector<uint8_t> values_;
 };
 
 // Finds one person's pose in each frame of a video, with MediaPipe's pose
@@ -76,6 +99,8 @@ class PoseEstimator {
   // An RGB frame, 3 bytes a pixel. False if no one is found.
   bool Process(const uint8_t* rgb, int width, int height, size_t stride,
                PoseLandmarks& pose);
+  // The person's mask in the last frame Process found them in.
+  const PoseMask& mask() const { return mask_; }
 
  private:
   struct Roi {
@@ -102,6 +127,7 @@ class PoseEstimator {
   std::vector<std::vector<float>> outputs_;
   bool tracking_ = false;
   Roi roi_ = {};
+  PoseMask mask_;
 };
 
 }  // namespace nui

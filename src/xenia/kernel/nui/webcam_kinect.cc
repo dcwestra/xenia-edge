@@ -12,11 +12,13 @@
 #include <SDL3/SDL.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
 #include <deque>
+#include <limits>
 #include <mutex>
 #include <thread>
 #include <tuple>
@@ -79,6 +81,13 @@ DEFINE_double(kinect_webcam_depth_gain, 1.5,
               "rein pulled back or an arm swung forward moves less than the "
               "player's. 1 takes the pose as found.",
               "Kernel");
+DEFINE_bool(kinect_webcam_outline, true,
+            "Give the body Kinect titles see the webcam player's outline, as "
+            "the webcam's picture shows it, rather than only the simple shapes "
+            "it's drawn from: titles that show players their bodies, such as "
+            "Your Shape: Fitness Evolved's figure, show theirs, and the color "
+            "picture fits it.",
+            "Kernel");
 DEFINE_path(kinect_webcam_models_path, "",
             "The folder with the webcam Kinect's pose models "
             "(pose_detector.onnx and pose_landmarks_detector.onnx). Empty is "
@@ -120,15 +129,28 @@ constexpr double kForgetSeconds = 3.0;
 // playing: they settle afresh once they're back.
 constexpr float kAtWebcamDistance = 0.8f;
 constexpr float kHeightFollowSeconds = 4.0f;
+// How slowly the scale of MediaPipe's body to the drawn one follows it.
+constexpr float kScaleFollowSeconds = 5.0f;
 constexpr float kMinVisibility = 0.5f;
+// A leg's bones follow the webcam's picture once it shows the joint at each
+// one's end (in the picture, at kLegShownVisibility), until it hasn't for
+// kLegHoldSeconds (out of the picture, or below kLegHiddenVisibility):
+// MediaPipe's visibility drops while one leg passes behind the other, and its
+// estimate of the hidden one holds up. Otherwise the leg stands straight. The
+// bones blend between the two over kLegBlendSeconds.
+constexpr float kLegShownVisibility = 0.5f;
+constexpr float kLegHiddenVisibility = 0.15f;
+constexpr double kLegHoldSeconds = 0.3;
+constexpr float kLegBlendSeconds = 0.25f;
 // The drawn body's bones, in meters for a player 1.70 m tall, scaled to
 // kinect_webcam_player_height: the proportions of the bodies titles' trackers
 // were tested with (tools' kbodyrender.py). The hips are 0.49 m below the
-// shoulders' center.
+// shoulders' center. The arms are as long as Kinect Sports' and Your Shape's
+// trackers measure a 1.90 m player's on a real Kinect, scaled.
 constexpr float kHeadLength = 0.22f;  // Shoulders' center to the head's.
 constexpr float kShoulderHalfWidth = 0.19f;
-constexpr float kUpperArmLength = 0.35f;
-constexpr float kForearmLength = 0.27f;
+constexpr float kUpperArmLength = 0.313f;
+constexpr float kForearmLength = 0.242f;
 constexpr float kHandLength = 0.08f;  // Wrist to the hand's center.
 constexpr float kHipHalfWidth = 0.09f;
 constexpr float kThighLength = 0.42f;
@@ -619,6 +641,41 @@ class KinectCameraWebcam : public KinectCamera {
     bool legs_seen;
     // From the Kinect, in the room titles see.
     float play_distance;
+    // Whether the picture shows each joint where it's drawn.
+    std::array<bool, size_t(BodyJoint::kCount)> shown;
+    // How far out from between MediaPipe's hips the drawn hip joints are,
+    // as a fraction of the way to its.
+    float hip_fraction;
+    // How much larger the drawn body is than MediaPipe's, and the player
+    // than t has them.
+    float mediapipe_scale;
+  };
+
+  // Whether a leg's bone follows the picture (see kLegShownVisibility).
+  struct LegBone {
+    bool following = false;
+    double hidden_since = -1.0;
+    // 0 standing straight to 1 following.
+    float weight = 0.0f;
+    double time = 0.0;
+
+    void Update(bool shown, bool hidden, double now) {
+      if (!following) {
+        following = shown;
+        hidden_since = -1.0;
+      } else if (!hidden) {
+        hidden_since = -1.0;
+      } else if (hidden_since < 0.0) {
+        hidden_since = now;
+      } else if (now - hidden_since > kLegHoldSeconds) {
+        following = false;
+      }
+      const float dt =
+          float(std::clamp(now - time, 0.0, 0.1)) / kLegBlendSeconds;
+      time = now;
+      weight =
+          following ? std::min(weight + dt, 1.0f) : std::max(weight - dt, 0.0f);
+    }
   };
 
   void ThreadMain() {
@@ -672,8 +729,19 @@ class KinectCameraWebcam : public KinectCamera {
         LogKinectTiming("hand_left", body[BodyJoint::kHandLeft].y);
         LogKinectTiming("hand_right", body[BodyJoint::kHandRight].y);
       }
+      BodyRenderer::Outline outline;
+      const PoseMask& mask = pose_estimator_->mask();
+      const bool outlined = placed && cvars::kinect_webcam_outline &&
+                            mask.valid() &&
+                            MakeOutline(pose, body, placement, time, outline);
+      if (outlined) {
+        outline.mask = [&mask](float x, float y) { return mask.At(x, y); };
+      } else {
+        outline_scale_filter_.Reset();
+      }
       renderer_.Render(&body, placed ? 1 : 0,
-                       float(cvars::kinect_webcam_player_height), raw.data());
+                       float(cvars::kinect_webcam_player_height), raw.data(),
+                       outlined ? &outline : nullptr);
       if (cvars::kinect_mirror) {
         for (int y = 0; y < kHeight; ++y) {
           std::reverse(raw.begin() + y * kWidth,
@@ -684,7 +752,9 @@ class KinectCameraWebcam : public KinectCamera {
       const uint32_t timestamp = uint32_t(time * 1000.0);
       depth_callback_(depth.data(), depth.size(), timestamp);
       if (color_callback_) {
-        MakeColor(frame, placed ? &body : nullptr, placement, color.data());
+        MakeColor(frame, placed ? &body : nullptr, placement,
+                  outlined ? &outline : nullptr, outlined ? &mask : nullptr,
+                  color.data());
         color_callback_(color.data(), color.size(), timestamp);
       }
       ++frames;
@@ -739,7 +809,7 @@ class KinectCameraWebcam : public KinectCamera {
     webcam.tilt_degrees = KinectMotor::SimulatedTiltDegrees();
     if (webcam.seen) {
       webcam.legs_seen = placement->legs_seen;
-      webcam.distance = placement->t[2];
+      webcam.distance = placement->t[2] * placement->mediapipe_scale;
       webcam.play_distance = placement->play_distance;
       for (int i = 0; i < L::kCount; ++i) {
         webcam.landmarks[i][0] = pose->image[i][0] / frame.width;
@@ -758,6 +828,14 @@ class KinectCameraWebcam : public KinectCamera {
     for (OneEuroFilter& filter : position_filters_) {
       filter.Reset();
     }
+    for (LegBone& bone : leg_bones_) {
+      bone = LegBone();
+    }
+    outline_scale_filter_.Reset();
+    for (OneEuroFilter& filter : image_filters_) {
+      filter.Reset();
+    }
+    mediapipe_scale_ = 0.0f;
   }
 
   // Streams from the webcam ChooseWebcam chose instead. A webcam can only be
@@ -899,20 +977,42 @@ class KinectCameraWebcam : public KinectCamera {
     for (int k = 0; k < 3; ++k) {
       t[k] = position_filters_[k].Filter(t[k], time);
     }
-    UpdateRest(t, time);
     // In the room's axes (y up), from MediaPipe's origin between the hips.
     auto world = [&](int i) {
       return Vec3(pose.world[i][0], -pose.world[i][1], pose.world[i][2]);
     };
     auto mid = [&](int a, int b) { return (world(a) + world(b)) * 0.5f; };
+    auto visible = [&](int i) { return pose.visibility[i] >= kMinVisibility; };
     using J = BodyJoint;
     const float s = float(cvars::kinect_webcam_player_height) / 1.70f;
     const Vec3 shoulders = mid(L::kShoulderLeft, L::kShoulderRight);
     Vec3 hips = mid(L::kHipLeft, L::kHipRight);
     Vec3 hip_left = world(L::kHipLeft);
     Vec3 hip_right = world(L::kHipRight);
-    if (std::min(pose.visibility[L::kHipLeft], pose.visibility[L::kHipRight]) <
-        kMinVisibility) {
+    const bool hips_seen = visible(L::kHipLeft) && visible(L::kHipRight);
+    // How much larger the drawn body is than MediaPipe's, whose comes out
+    // smaller than the player's: by the shoulders, and the torso if the hips
+    // are seen.
+    const float shoulder_width =
+        (world(L::kShoulderLeft) - world(L::kShoulderRight)).Length();
+    const float measured_scale =
+        hips_seen
+            ? (2.0f * kShoulderHalfWidth + 0.49f) * s /
+                  std::max(shoulder_width + (shoulders - hips).Length(), 0.1f)
+            : 2.0f * kShoulderHalfWidth * s / std::max(shoulder_width, 0.05f);
+    // A constant of the player's, which MediaPipe's shoulders shift a little
+    // with their arms: followed slowly.
+    if (mediapipe_scale_ <= 0.0f) {
+      mediapipe_scale_ = measured_scale;
+    } else {
+      mediapipe_scale_ +=
+          (measured_scale - mediapipe_scale_) *
+          (1.0f - std::exp(-float(std::clamp(time - scale_time_, 0.0, 1.0)) /
+                           kScaleFollowSeconds));
+    }
+    scale_time_ = time;
+    const float mediapipe_scale = mediapipe_scale_;
+    if (!hips_seen) {
       // Out of view, as they are close to the webcam, the hips MediaPipe
       // guesses are too high, shortening the body: a torso of the usual
       // length under the shoulders instead.
@@ -931,10 +1031,13 @@ class KinectCameraWebcam : public KinectCamera {
     // Limbs reach deeper toward or away from the webcam than found
     // (kinect_webcam_depth_gain).
     const float depth_gain = float(cvars::kinect_webcam_depth_gain);
-    auto bone = [&](const Vec3& from, const Vec3& to, float length) {
+    auto direction = [&](const Vec3& from, const Vec3& to) {
       Vec3 v = to - from;
       v.z *= depth_gain;
-      return v.Normalized() * (length * s);
+      return v.Normalized();
+    };
+    auto bone = [&](const Vec3& from, const Vec3& to, float length) {
+      return direction(from, to) * (length * s);
     };
     // Perpendicular to the torso, toward the player's left.
     auto across = [&](const Vec3& left_side, const Vec3& up) {
@@ -944,12 +1047,20 @@ class KinectCameraWebcam : public KinectCamera {
     const Vec3 shoulder_side =
         across(world(L::kShoulderLeft) - world(L::kShoulderRight), up);
     const Vec3 hip_side = across(hip_left - hip_right, up);
+    std::array<bool, size_t(J::kCount)>& shown = placement.shown;
+    shown.fill(false);
+    const bool shoulders_seen =
+        visible(L::kShoulderLeft) && visible(L::kShoulderRight);
     body[J::kHipCenter] = Vec3();
     body[J::kShoulderCenter] = up * (0.49f * s);
     body[J::kSpine] = body[J::kShoulderCenter] * 0.2f;
     body[J::kHead] = body[J::kShoulderCenter] +
                      (mid(L::kEarLeft, L::kEarRight) - shoulders).Normalized() *
                          (kHeadLength * s);
+    shown[size_t(J::kHipCenter)] = hips_seen;
+    shown[size_t(J::kShoulderCenter)] = shoulders_seen;
+    shown[size_t(J::kSpine)] = hips_seen && shoulders_seen;
+    shown[size_t(J::kHead)] = visible(L::kEarLeft) || visible(L::kEarRight);
     for (auto [shoulder, elbow, wrist, hand, sign, mp_shoulder, mp_elbow,
                mp_wrist, mp_pinky, mp_index] :
          {std::tuple{J::kShoulderLeft, J::kElbowLeft, J::kWristLeft,
@@ -967,63 +1078,125 @@ class KinectCameraWebcam : public KinectCamera {
           body[elbow] + bone(world(mp_elbow), world(mp_wrist), kForearmLength);
       body[hand] = body[wrist] +
                    bone(world(mp_wrist), mid(mp_pinky, mp_index), kHandLength);
+      shown[size_t(shoulder)] = visible(mp_shoulder);
+      shown[size_t(elbow)] = visible(mp_elbow);
+      shown[size_t(wrist)] = visible(mp_wrist);
+      shown[size_t(hand)] = visible(mp_wrist);
     }
     body[J::kHipLeft] = hip_side * (kHipHalfWidth * s) - up * (0.05f * s);
     body[J::kHipRight] = hip_side * (-kHipHalfWidth * s) - up * (0.05f * s);
-    const bool legs_seen =
-        std::min({pose.visibility[L::kKneeLeft], pose.visibility[L::kKneeRight],
-                  pose.visibility[L::kAnkleLeft],
-                  pose.visibility[L::kAnkleRight]}) > 0.6f;
-    for (auto [hip, knee, ankle, foot, mp_hip, mp_knee, mp_ankle, mp_foot] :
-         {std::tuple{J::kHipLeft, J::kKneeLeft, J::kAnkleLeft, J::kFootLeft,
+    shown[size_t(J::kHipLeft)] = shown[size_t(J::kHipRight)] = hips_seen;
+    // MediaPipe's hips are wider apart than the drawn ones, the joints titles
+    // track, so its thighs slope in to the knees more: a thigh aims from the
+    // drawn hip at MediaPipe's knee, as far out as MediaPipe has it, or the
+    // knees would meet.
+    const float mediapipe_hip_half_width =
+        0.5f * (hip_left - hip_right).Length() * mediapipe_scale;
+    placement.hip_fraction =
+        mediapipe_hip_half_width > 0.02f
+            ? std::clamp(kHipHalfWidth * s / mediapipe_hip_half_width, 0.3f,
+                         1.5f)
+            : 1.0f;
+    // Each leg's bones follow the picture while it shows them, a bone at a
+    // time from the hip (a webcam that sees down to the knees still shows a
+    // squat), and otherwise stand straight, as titles' trackers want.
+    auto in_picture = [&](int i) {
+      return pose.image[i][0] >= 0.0f && pose.image[i][0] < width &&
+             pose.image[i][1] >= 0.0f && pose.image[i][1] < height - 1;
+    };
+    auto joint_shown = [&](int i) {
+      return in_picture(i) && pose.presence[i] >= 0.5f &&
+             pose.visibility[i] >= kLegShownVisibility;
+    };
+    auto joint_hidden = [&](int i) {
+      return !in_picture(i) || pose.presence[i] < 0.5f ||
+             pose.visibility[i] < kLegHiddenVisibility;
+    };
+    // Straight down from the hip, the knee a little forward and the foot
+    // flat.
+    const Vec3 standing[3] = {
+        Vec3(0.0f, -kThighLength * s, -0.02f).Normalized(),
+        Vec3(0.0f, -kShinLength * s, 0.02f).Normalized(),
+        Vec3(0.0f, -0.05f, -0.13f).Normalized()};
+    const float lengths[3] = {kThighLength, kShinLength, kFootLength};
+    bool legs_seen = true;
+    for (auto [side, hip, knee, ankle, foot, mp_hip, mp_knee, mp_ankle,
+               mp_foot] :
+         {std::tuple{0, J::kHipLeft, J::kKneeLeft, J::kAnkleLeft, J::kFootLeft,
                      L::kHipLeft, L::kKneeLeft, L::kAnkleLeft, L::kFootLeft},
-          std::tuple{J::kHipRight, J::kKneeRight, J::kAnkleRight, J::kFootRight,
-                     L::kHipRight, L::kKneeRight, L::kAnkleRight,
+          std::tuple{1, J::kHipRight, J::kKneeRight, J::kAnkleRight,
+                     J::kFootRight, L::kHipRight, L::kKneeRight, L::kAnkleRight,
                      L::kFootRight}}) {
-      if (legs_seen) {
-        body[knee] =
-            body[hip] + bone(world(mp_hip), world(mp_knee), kThighLength);
-        body[ankle] =
-            body[knee] + bone(world(mp_knee), world(mp_ankle), kShinLength);
-        body[foot] =
-            body[ankle] + bone(world(mp_ankle), world(mp_foot), kFootLength);
-      } else {
-        // Out of the webcam's view, as they are for a seated player: standing
-        // legs, which titles' trackers want.
-        body[knee] = body[hip] + Vec3(0.0f, -kThighLength * s, -0.02f);
-        body[ankle] = body[knee] + Vec3(0.0f, -kShinLength * s, 0.02f);
-        body[foot] = body[ankle] + Vec3(0.0f, -0.05f * s, -0.13f * s);
+      const J joints[4] = {hip, knee, ankle, foot};
+      const int landmarks[4] = {mp_hip, mp_knee, mp_ankle, mp_foot};
+      bool parent_following = hips_seen;
+      for (int b = 0; b < 3; ++b) {
+        LegBone& leg_bone = leg_bones_[side * 3 + b];
+        const int end = landmarks[b + 1];
+        leg_bone.Update(parent_following && joint_shown(end),
+                        !parent_following || joint_hidden(end), time);
+        parent_following = leg_bone.following;
+        const float w = leg_bone.weight;
+        Vec3 d = standing[b];
+        if (w > 0.0f) {
+          // The drawn hip where it is in MediaPipe's body.
+          const Vec3 from =
+              b ? world(landmarks[b])
+                : hips + body[joints[0]] * (1.0f / mediapipe_scale);
+          const Vec3 followed = direction(from, world(end));
+          d = (standing[b] * (1.0f - w) + followed * w).Normalized();
+        }
+        body[joints[b + 1]] = body[joints[b]] + d * (lengths[b] * s);
+        shown[size_t(joints[b + 1])] = w >= 1.0f && shown[size_t(joints[b])];
       }
+      legs_seen = legs_seen && leg_bones_[side * 3 + 1].weight >= 1.0f;
     }
-    // Standing on the lower of the feet, the heel just under the ankle, with a
-    // little room so the floor and the soles stay apart.
-    float floor = 0.0f;
-    for (J joint : {J::kFootLeft, J::kFootRight}) {
-      floor = std::min(floor, body[joint].y);
-    }
-    for (J joint : {J::kAnkleLeft, J::kAnkleRight}) {
-      floor = std::min(floor, body[joint].y - 0.05f * s);
+    // Resting on whatever of the body is lowest, less the flesh under that
+    // joint, with a little room so the floor and the body stay apart: the
+    // feet standing, the knees kneeling, the hands and feet in a push-up, the
+    // back lying down.
+    static constexpr std::pair<J, float> kContacts[] = {
+        {J::kFootLeft, 0.0f},       {J::kFootRight, 0.0f},
+        {J::kAnkleLeft, 0.05f},     {J::kAnkleRight, 0.05f},
+        {J::kKneeLeft, 0.06f},      {J::kKneeRight, 0.06f},
+        {J::kHipCenter, 0.13f},     {J::kHandLeft, 0.03f},
+        {J::kHandRight, 0.03f},     {J::kElbowLeft, 0.045f},
+        {J::kElbowRight, 0.045f},   {J::kShoulderLeft, 0.07f},
+        {J::kShoulderRight, 0.07f}, {J::kHead, 0.1f}};
+    float floor = std::numeric_limits<float>::infinity();
+    for (const auto& [joint, below] : kContacts) {
+      floor = std::min(floor, body[joint].y - below * s);
     }
     const float hip_height = 0.03f - floor;
+    // How far the hips rise above where the body's pose puts them, as
+    // jumping: the webcam's height for them, at the drawn body's scale, less
+    // the pose's. Rising from the floor or a crouch moves both alike.
+    const float lift = t[1] * mediapipe_scale - hip_height;
+    UpdateRest(t, lift, time);
     // At the play distance, moved by their steps toward the webcam or away
     // from where they settled; sideways as they are; and rising above where
-    // they stand (jumping). Crouches come through the legs.
-    const Vec3 root(
-        t[0] + hips.x, hip_height + std::max(0.0f, t[1] - rest_[1]),
-        std::clamp(float(cvars::kinect_webcam_distance) + (t[2] - rest_[2]),
-                   kMinDistance, kMaxDistance));
+    // the pose rests them (jumping). The webcam finds them at the scale of
+    // MediaPipe's body, so their steps are scaled up as it is.
+    const Vec3 root((t[0] + hips.x) * mediapipe_scale,
+                    hip_height + std::max(0.0f, lift - rest_[1]),
+                    std::clamp(float(cvars::kinect_webcam_distance) +
+                                   (t[2] - rest_[2]) * mediapipe_scale,
+                               kMinDistance, kMaxDistance));
     for (Vec3& joint : body.joints) {
       joint = joint + root;
     }
     std::memcpy(placement.t, t, sizeof(t));
-    placement.anchor = root - hips;
+    placement.mediapipe_scale = mediapipe_scale;
+    placement.anchor = root - hips * mediapipe_scale;
     placement.webcam_focal = focal;
     placement.legs_seen = legs_seen;
     placement.play_distance = root.z;
     return true;
   }
 
-  void UpdateRest(const float t[3], double time) {
+  // Where the player rests: their distance from the webcam, and how high
+  // the webcam sees their hips over where their pose puts them (lift).
+  void UpdateRest(const float t[3], float lift, double time) {
     const double since_seen = time - last_seen_;
     last_seen_ = time;
     if (t[2] < kAtWebcamDistance) {
@@ -1033,6 +1206,7 @@ class KinectCameraWebcam : public KinectCamera {
       have_rest_ = false;
       settled_ = false;
       std::memcpy(rest_, t, sizeof(rest_));
+      rest_[1] = lift;
       return;
     }
     if (!have_rest_ || since_seen > kForgetSeconds) {
@@ -1041,8 +1215,9 @@ class KinectCameraWebcam : public KinectCamera {
       settle_start_ = time;
       settle_.clear();
       std::memcpy(rest_, t, sizeof(rest_));
+      rest_[1] = lift;
     } else {
-      rest_[1] += (t[1] - rest_[1]) *
+      rest_[1] += (lift - rest_[1]) *
                   (1.0f - std::exp(-float(since_seen) / kHeightFollowSeconds));
     }
     if (settled_) {
@@ -1077,10 +1252,90 @@ class KinectCameraWebcam : public KinectCamera {
     }
   }
 
+  // The outline of the body drawn: where the webcam's picture shows each
+  // joint, and how much larger it shows the player than the view titles
+  // see. False if it doesn't show enough of them.
+  bool MakeOutline(const PoseLandmarks& pose, const Body& body,
+                   const Placement& placement, double time,
+                   BodyRenderer::Outline& outline) {
+    using J = BodyJoint;
+    // The landmarks smoothed a little while still, or the outline shivers
+    // with them.
+    float image[L::kCount][2];
+    for (int i = 0; i < L::kCount; ++i) {
+      for (int k = 0; k < 2; ++k) {
+        image[i][k] = image_filters_[i * 2 + k].Filter(pose.image[i][k], time);
+      }
+    }
+    auto& joints = outline.joints;
+    auto at = [&](J joint, int i) {
+      joints[size_t(joint)] = {image[i][0], image[i][1]};
+    };
+    auto at_mid = [&](J joint, int a, int b) {
+      joints[size_t(joint)] = {(image[a][0] + image[b][0]) * 0.5f,
+                               (image[a][1] + image[b][1]) * 0.5f};
+    };
+    at_mid(J::kHipCenter, L::kHipLeft, L::kHipRight);
+    at_mid(J::kShoulderCenter, L::kShoulderLeft, L::kShoulderRight);
+    const auto& hip = joints[size_t(J::kHipCenter)];
+    const auto& neck = joints[size_t(J::kShoulderCenter)];
+    joints[size_t(J::kSpine)] = {hip[0] + (neck[0] - hip[0]) * 0.2f,
+                                 hip[1] + (neck[1] - hip[1]) * 0.2f};
+    at_mid(J::kHead, L::kEarLeft, L::kEarRight);
+    at(J::kShoulderLeft, L::kShoulderLeft);
+    at(J::kElbowLeft, L::kElbowLeft);
+    at(J::kWristLeft, L::kWristLeft);
+    at_mid(J::kHandLeft, L::kPinkyLeft, L::kIndexLeft);
+    at(J::kShoulderRight, L::kShoulderRight);
+    at(J::kElbowRight, L::kElbowRight);
+    at(J::kWristRight, L::kWristRight);
+    at_mid(J::kHandRight, L::kPinkyRight, L::kIndexRight);
+    // The drawn hip joints, nearer together than MediaPipe's.
+    for (auto [joint, i] : {std::pair{J::kHipLeft, int(L::kHipLeft)},
+                            std::pair{J::kHipRight, int(L::kHipRight)}}) {
+      joints[size_t(joint)] = {
+          hip[0] + (image[i][0] - hip[0]) * placement.hip_fraction,
+          hip[1] + (image[i][1] - hip[1]) * placement.hip_fraction};
+    }
+    at(J::kKneeLeft, L::kKneeLeft);
+    at(J::kAnkleLeft, L::kAnkleLeft);
+    at(J::kFootLeft, L::kFootLeft);
+    at(J::kKneeRight, L::kKneeRight);
+    at(J::kAnkleRight, L::kAnkleRight);
+    at(J::kFootRight, L::kFootRight);
+    outline.shown = placement.shown;
+    // The scale, by the torso, shoulders and head: as long in the picture as
+    // in the view.
+    float picture = 0.0f, in_view = 0.0f;
+    for (auto [a, b] : {std::pair{J::kHipCenter, J::kShoulderCenter},
+                        std::pair{J::kShoulderLeft, J::kShoulderRight},
+                        std::pair{J::kShoulderCenter, J::kHead}}) {
+      if (!outline.shown[size_t(a)] || !outline.shown[size_t(b)]) {
+        continue;
+      }
+      picture += std::hypot(joints[size_t(b)][0] - joints[size_t(a)][0],
+                            joints[size_t(b)][1] - joints[size_t(a)][1]);
+      float ax, ay, bx, by;
+      BodyRenderer::Project(renderer_.ToCamera(body[a]), ax, ay);
+      BodyRenderer::Project(renderer_.ToCamera(body[b]), bx, by);
+      in_view += std::hypot(bx - ax, by - ay);
+    }
+    if (in_view < 20.0f || picture < 10.0f) {
+      return false;
+    }
+    outline.scale = outline_scale_filter_.Filter(picture / in_view, time);
+    return true;
+  }
+
   // The webcam's picture as the Kinect's color, registered to the depth: the
-  // player's hips where the drawn body's are, at its scale. Bayer GRBG.
+  // player's hips where the drawn body's are, at its scale. Bayer GRBG. With
+  // an outline, the body's pixels come from where it found them, and the
+  // room around it, where the picture now shows the player, from where it
+  // last showed the room.
   void MakeColor(const RgbFrame& frame, const Body* body,
-                 const Placement& placement, uint8_t* out) {
+                 const Placement& placement,
+                 const BodyRenderer::Outline* outline, const PoseMask* mask,
+                 uint8_t* out) {
     const float focal =
         body ? placement.webcam_focal : WebcamFocal(frame.width, frame.height);
     float pv_x = BodyRenderer::kCenterX, pv_y = BodyRenderer::kCenterY;
@@ -1097,6 +1352,12 @@ class KinectCameraWebcam : public KinectCamera {
       pw_y = frame.height * 0.5f - focal * t[1] / t[2];
       scale = (BodyRenderer::kFocalLength / hip.z) / (focal / t[2]);
     }
+    const float* source = nullptr;
+    if (body && outline && mask && renderer_.outlined()) {
+      scale = 1.0f / outline->scale;
+      source = renderer_.source().data();
+      UpdateBackground(frame, *mask);
+    }
     const bool mirror = cvars::kinect_mirror;
     for (int y = 0; y < kHeight; ++y) {
       const float sy = (y - pv_y) / scale + pw_y;
@@ -1104,10 +1365,68 @@ class KinectCameraWebcam : public KinectCamera {
         const int ox = mirror ? kWidth - 1 - x : x;
         // GRBG: green, red on even rows; blue, green on odd ones.
         const int channel = (y & 1) ? ((x & 1) ? 1 : 2) : ((x & 1) ? 0 : 1);
-        const float sx = (x - pv_x) / scale + pw_x;
-        out[y * kWidth + ox] = Sample(frame, sx, sy, channel);
+        float sx = (x - pv_x) / scale + pw_x;
+        float ty = sy;
+        const RgbFrame* from = &frame;
+        if (source) {
+          const float* body_source = &source[(size_t(y) * kWidth + x) * 2];
+          if (!std::isnan(body_source[0])) {
+            sx = body_source[0];
+            ty = body_source[1];
+          } else if (ShowsPlayer(sx, sy)) {
+            from = &background_;
+          }
+        }
+        out[y * kWidth + ox] = Sample(*from, sx, ty, channel);
       }
     }
+  }
+
+  // The room as the webcam has seen it around the player lately, and where
+  // it shows them now.
+  void UpdateBackground(const RgbFrame& frame, const PoseMask& mask) {
+    if (background_.width != frame.width ||
+        background_.height != frame.height) {
+      background_ = frame;
+    }
+    player_.resize(size_t(frame.width) * frame.height);
+    float bx0, by0, bx1, by1;
+    mask.Bounds(bx0, by0, bx1, by1);
+    const int x0 = std::clamp(int(bx0), 0, frame.width);
+    const int x1 = std::clamp(int(bx1) + 1, 0, frame.width);
+    const int y0 = std::clamp(int(by0), 0, frame.height);
+    const int y1 = std::clamp(int(by1) + 1, 0, frame.height);
+    for (int y = 0; y < frame.height; ++y) {
+      const size_t row = size_t(y) * frame.width;
+      uint8_t* player = &player_[row];
+      const uint8_t* in = &frame.pixels[row * 3];
+      uint8_t* room = &background_.pixels[row * 3];
+      if (y < y0 || y >= y1) {
+        std::fill_n(player, frame.width, uint8_t(0));
+        std::memcpy(room, in, size_t(frame.width) * 3);
+        continue;
+      }
+      for (int x = 0; x < frame.width; ++x) {
+        const float m = x >= x0 && x < x1 ? mask.At(float(x), float(y)) : 0.0f;
+        player[x] = m >= 0.5f;
+        // Clear of the player's edge, where the mask is unsure, and a part
+        // at a time, so a blurred limb the mask missed fades out.
+        if (m < 0.25f) {
+          for (int c = 0; c < 3; ++c) {
+            uint8_t& r = room[x * 3 + c];
+            r = uint8_t(r + ((int(in[x * 3 + c]) - r) * 77 >> 8));
+          }
+        }
+      }
+    }
+  }
+
+  bool ShowsPlayer(float x, float y) const {
+    const int xi = int(x + 0.5f);
+    const int yi = int(y + 0.5f);
+    return xi >= 0 && yi >= 0 && xi < background_.width &&
+           yi < background_.height &&
+           player_[size_t(yi) * background_.width + xi];
   }
 
   static uint8_t Sample(const RgbFrame& frame, float x, float y, int channel) {
@@ -1142,8 +1461,25 @@ class KinectCameraWebcam : public KinectCamera {
   std::thread thread_;
   std::vector<OneEuroFilter> landmark_filters_ =
       std::vector<OneEuroFilter>(L::kCount * 3, OneEuroFilter(1.5f, 5.0f));
+  // Smoother while still than the landmarks: the hips' distance from the
+  // webcam, found from how large the player looks, wavers by a centimeter or
+  // two.
   std::vector<OneEuroFilter> position_filters_ =
-      std::vector<OneEuroFilter>(3, OneEuroFilter(1.0f, 2.0f));
+      std::vector<OneEuroFilter>(3, OneEuroFilter(0.4f, 4.0f));
+  // Left then right: thigh, shin and foot.
+  std::array<LegBone, 6> leg_bones_;
+  // The outline's scale, picture pixels per view pixel.
+  OneEuroFilter outline_scale_filter_ = OneEuroFilter(1.0f, 0.5f);
+  // The landmarks in the picture, for the outline: pixels, so a beta for
+  // speeds about 200 times the meters a second of landmark_filters_'.
+  std::vector<OneEuroFilter> image_filters_ =
+      std::vector<OneEuroFilter>(L::kCount * 2, OneEuroFilter(1.5f, 0.025f));
+  // PlaceBody's: how much larger the drawn body is than MediaPipe's.
+  float mediapipe_scale_ = 0.0f;
+  double scale_time_ = 0.0;
+  // UpdateBackground's.
+  RgbFrame background_;
+  std::vector<uint8_t> player_;
   // Where the player stands at rest (UpdateRest).
   bool have_rest_ = false;
   bool settled_ = false;
