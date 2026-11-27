@@ -93,7 +93,8 @@ Related settings:
 
 - `kinect_camera` (`auto`): `auto` uses a Kinect, or a webcam without one. `kinect` or `webcam` uses only one of them.
 - `kinect_webcam`: the webcam to use, by part of its name. Empty uses the first one.
-- `kinect_webcam_fov` (70): the webcam's horizontal field of view in degrees.
+- `kinect_webcam_fov` (70): the webcam's field of view along its long side, in degrees.
+- `kinect_webcam_rotation` (0): how far the webcam's picture is turned clockwise, 0, 90, 180 or 270. A webcam on its side (90 or 270) sees a standing player head to toe from much nearer. The Kinect view (F9) shows the picture the right way up when this is right.
 - `kinect_webcam_distance` (2.6) and `kinect_webcam_player_height` (1.70): where the player stands from the Kinect and how tall they are, in meters.
 - `kinect_webcam_models_path` and `kinect_onnxruntime_path`: where the pose models and ONNX Runtime are, if not in the `kinect` folder.
 - `kinect_view`: shows the Kinect view from the start.

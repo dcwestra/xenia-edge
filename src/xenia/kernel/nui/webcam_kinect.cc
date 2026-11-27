@@ -53,6 +53,14 @@ DEFINE_double(kinect_webcam_fov, 70.0,
               "picture across, for placing the player from it. A narrower mode "
               "cut from it is allowed for.",
               "Kernel");
+DEFINE_int32(kinect_webcam_rotation, 0,
+             "Turn the webcam's picture this many degrees clockwise (0, 90, "
+             "180 or 270) before using it, for a webcam that isn't upright. "
+             "On its side, a webcam sees a standing player head to toe from "
+             "much nearer: its long side is then up and down. The Kinect view "
+             "(F9) shows the picture as it's used, the right way up when this "
+             "is right. kinect_webcam_fov is still the webcam's long side's.",
+             "Kernel");
 DEFINE_double(kinect_webcam_distance, 2.6,
               "How far from the Kinect a webcam player stands, in meters, "
               "however far they are from the webcam: stepping toward or away "
@@ -642,6 +650,7 @@ class KinectCameraWebcam : public KinectCamera {
       if (recorder_) {
         RecordPicture(frame);
       }
+      RotateFrame(frame);
       // The view as titles have tilted the (simulated) sensor: they find the
       // floor and frame their players by tilting it.
       renderer_.SetCamera(kCameraHeight, KinectMotor::SimulatedTiltDegrees());
@@ -830,16 +839,52 @@ class KinectCameraWebcam : public KinectCamera {
     return t[2] > 0.3f;
   }
 
-  // The webcam's focal length in pixels, for its frames this wide.
-  float WebcamFocal(int width) const {
-    return width * 0.5f /
+  // The webcam's focal length in pixels, for its frames this size: its long
+  // side is kinect_webcam_fov's, whichever way the picture is turned.
+  float WebcamFocal(int width, int height) const {
+    return std::max(width, height) * 0.5f /
            (std::tan(float(cvars::kinect_webcam_fov) * kPi / 360.0f) *
             source_->field_fraction());
   }
 
+  // Turns the webcam's picture upright (kinect_webcam_rotation).
+  void RotateFrame(RgbFrame& frame) {
+    const int turns = ((cvars::kinect_webcam_rotation / 90) % 4 + 4) % 4;
+    if (!turns) {
+      return;
+    }
+    const int w = frame.width, h = frame.height;
+    turned_.width = turns & 1 ? h : w;
+    turned_.height = turns & 1 ? w : h;
+    turned_.pixels.resize(frame.pixels.size());
+    for (int y = 0; y < turned_.height; ++y) {
+      for (int x = 0; x < turned_.width; ++x) {
+        // The picture's pixel that lands here.
+        int sx, sy;
+        switch (turns) {
+          case 1:  // A quarter turn clockwise.
+            sx = y;
+            sy = h - 1 - x;
+            break;
+          case 2:
+            sx = w - 1 - x;
+            sy = h - 1 - y;
+            break;
+          default:  // Three quarters clockwise.
+            sx = w - 1 - y;
+            sy = x;
+            break;
+        }
+        std::memcpy(&turned_.pixels[(size_t(y) * turned_.width + x) * 3],
+                    &frame.pixels[(size_t(sy) * w + sx) * 3], 3);
+      }
+    }
+    std::swap(frame, turned_);
+  }
+
   bool PlaceBody(const PoseLandmarks& raw_pose, int width, int height,
                  double time, Body& body, Placement& placement) {
-    const float focal = WebcamFocal(width);
+    const float focal = WebcamFocal(width, height);
     float t[3];
     if (!SolvePosition(raw_pose, width, height, focal, t)) {
       return false;
@@ -1037,7 +1082,7 @@ class KinectCameraWebcam : public KinectCamera {
   void MakeColor(const RgbFrame& frame, const Body* body,
                  const Placement& placement, uint8_t* out) {
     const float focal =
-        body ? placement.webcam_focal : WebcamFocal(frame.width);
+        body ? placement.webcam_focal : WebcamFocal(frame.width, frame.height);
     float pv_x = BodyRenderer::kCenterX, pv_y = BodyRenderer::kCenterY;
     float pw_x = frame.width * 0.5f, pw_y = frame.height * 0.5f;
     float scale = BodyRenderer::kFocalLength / focal;
@@ -1085,6 +1130,8 @@ class KinectCameraWebcam : public KinectCamera {
   // one.
   KinectRecorder* recorder_ = nullptr;
   std::vector<uint8_t> picture_;
+  // RotateFrame's buffer for the picture turned.
+  RgbFrame turned_;
   // webcam_choice().generation when source_ was opened.
   uint32_t webcam_generation_ = 0;
   std::unique_ptr<PoseEstimator> pose_estimator_;
