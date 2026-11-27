@@ -145,8 +145,6 @@ class XeniaEdgeGenerator(Generator):
             '--gpu=vulkan',
             '--hid=sdl',
             '--apu=sdl',
-            f'--mount_cache={_flag(config.get_bool("xenia_cache", True))}',
-            '--mount_scratch=true',
             '--discord=false',
             f'--fullscreen={_flag(config.get_bool("xenia_fullscreen", True))}',
             f'--apply_patches={_flag(config.get_bool("xenia_patches", True))}',
