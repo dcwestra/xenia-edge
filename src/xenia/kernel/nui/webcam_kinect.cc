@@ -64,9 +64,12 @@ DEFINE_int32(kinect_webcam_rotation, 0,
              "is right. kinect_webcam_fov is still the webcam's long side's.",
              "Kernel");
 DEFINE_double(kinect_webcam_distance, 2.6,
-              "How far from the Kinect a webcam player stands, in meters, "
-              "however far they are from the webcam: stepping toward or away "
-              "from it moves them from there. Titles aim the Kinect for "
+              "How far from the Kinect a webcam player stands at the least, "
+              "in meters. One who settles nearer the webcam stands this far "
+              "from the Kinect, stepping toward or away from it moving them "
+              "from there; one further back stands as far from the Kinect as "
+              "from the webcam (up to 3.6 m), with as much room above their "
+              "head as a real Kinect would leave. Titles aim the Kinect for "
               "players about this far: nearer, Kinect Adventures has their "
               "feet out of view.",
               "Kernel");
@@ -156,9 +159,10 @@ constexpr float kHipHalfWidth = 0.09f;
 constexpr float kThighLength = 0.42f;
 constexpr float kShinLength = 0.41f;
 constexpr float kFootLength = 0.14f;  // Ankle to toes.
-// The players' range in front of the virtual Kinect.
+// The players' range in front of the virtual Kinect, short of its room's back
+// wall.
 constexpr float kMinDistance = 1.5f;
-constexpr float kMaxDistance = 3.2f;
+constexpr float kMaxDistance = 3.6f;
 constexpr int kPoseThreads = 2;
 // A recorded webcam picture's header (KinectRecorder::Stream::kWebcam).
 constexpr size_t kWebcamHeaderBytes = 8;
@@ -1173,15 +1177,18 @@ class KinectCameraWebcam : public KinectCamera {
     // the pose's. Rising from the floor or a crouch moves both alike.
     const float lift = t[1] * mediapipe_scale - hip_height;
     UpdateRest(t, lift, time);
-    // At the play distance, moved by their steps toward the webcam or away
-    // from where they settled; sideways as they are; and rising above where
-    // the pose rests them (jumping). The webcam finds them at the scale of
-    // MediaPipe's body, so their steps are scaled up as it is.
-    const Vec3 root((t[0] + hips.x) * mediapipe_scale,
-                    hip_height + std::max(0.0f, lift - rest_[1]),
-                    std::clamp(float(cvars::kinect_webcam_distance) +
-                                   (t[2] - rest_[2]) * mediapipe_scale,
-                               kMinDistance, kMaxDistance));
+    // As far from the Kinect as from the webcam, pushed back by however much
+    // nearer than the play distance they settled, so moved from there by
+    // their steps; sideways as they are; and rising above where the pose
+    // rests them (jumping). The webcam finds them at the scale of MediaPipe's
+    // body, so their distance is scaled up as it is.
+    const Vec3 root(
+        (t[0] + hips.x) * mediapipe_scale,
+        hip_height + std::max(0.0f, lift - rest_[1]),
+        std::clamp(t[2] * mediapipe_scale +
+                       std::max(0.0f, float(cvars::kinect_webcam_distance) -
+                                          rest_[2] * mediapipe_scale),
+                   kMinDistance, kMaxDistance));
     for (Vec3& joint : body.joints) {
       joint = joint + root;
     }

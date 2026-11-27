@@ -86,7 +86,7 @@ Without a Kinect, a webcam (USB or a laptop's own) can take its place. Games tra
 
 1. Run [`tools/kinect/get_webcam_files.sh`](tools/kinect/get_webcam_files.sh). It downloads MediaPipe's pose model and converts it for ONNX Runtime, and downloads ONNX Runtime too unless the system has it (Fedora: `sudo dnf install onnxruntime`). Everything goes in the `kinect` folder of Xenia's storage folder.
 2. Copy the game configs as for a Kinect (step 3 above).
-3. Stand where the webcam sees you, or sit: when your legs are out of view, standing legs are drawn for you. Where you first settle is the play distance; stepping toward or away from the webcam from there, sideways and jumping all come through.
+3. Stand where the webcam sees you, or sit: when your legs are out of view, standing legs are drawn for you. Where you first settle is the play distance: nearer the webcam than `kinect_webcam_distance`, you stand that far from the Kinect; further back, as far as you are from the webcam (up to 3.6 m), and the game's tilt then leaves room above your head for raised arms and jumps, as a real Kinect's does. Stepping toward or away from the webcam from there, sideways and jumping all come through.
 4. Press **F9** in a game for the **Kinect view**: what the game sees and the players it tracks, the webcam's picture with the pose found in it, and advice on aiming the webcam or where to stand. It works with a Kinect too.
 
 Related settings:
@@ -95,7 +95,8 @@ Related settings:
 - `kinect_webcam`: the webcam to use, by part of its name. Empty uses the first one.
 - `kinect_webcam_fov` (70): the webcam's field of view along its long side, in degrees.
 - `kinect_webcam_rotation` (0): how far the webcam's picture is turned clockwise, 0, 90, 180 or 270. A webcam on its side (90 or 270) sees a standing player head to toe from much nearer. The Kinect view (F9) shows the picture the right way up when this is right.
-- `kinect_webcam_distance` (2.6) and `kinect_webcam_player_height` (1.70): where the player stands from the Kinect and how tall they are, in meters.
+- `kinect_webcam_distance` (2.6): the nearest the player stands from the Kinect, in meters (see step 3).
+- `kinect_webcam_player_height` (1.70): how tall the player is, in meters.
 - `kinect_webcam_models_path` and `kinect_onnxruntime_path`: where the pose models and ONNX Runtime are, if not in the `kinect` folder.
 - `kinect_view`: shows the Kinect view from the start.
 
