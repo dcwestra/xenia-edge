@@ -132,6 +132,14 @@ constexpr double kForgetSeconds = 3.0;
 // playing: they settle afresh once they're back.
 constexpr float kAtWebcamDistance = 0.8f;
 constexpr float kHeightFollowSeconds = 4.0f;
+// MediaPipe has a player standing upright in front of a level webcam lean
+// toward it, about 13 degrees, and a webcam aimed up or down adds its pitch.
+// The lean their torso has while they stand still, the median of the last
+// kLeanSamples since they settled, is taken out of the pose, updated each
+// kLeanSamplesPerUpdate and eased in over kLeanFollowSeconds.
+constexpr size_t kLeanSamples = 1800;
+constexpr size_t kLeanSamplesPerUpdate = 30;
+constexpr float kLeanFollowSeconds = 0.5f;
 // How slowly the scale of MediaPipe's body to the drawn one follows it.
 constexpr float kScaleFollowSeconds = 5.0f;
 constexpr float kMinVisibility = 0.5f;
@@ -981,6 +989,8 @@ class KinectCameraWebcam : public KinectCamera {
     for (int k = 0; k < 3; ++k) {
       t[k] = position_filters_[k].Filter(t[k], time);
     }
+    const float lean = TorsoLean(pose);
+    StraightenPose(pose, time);
     // In the room's axes (y up), from MediaPipe's origin between the hips.
     auto world = [&](int i) {
       return Vec3(pose.world[i][0], -pose.world[i][1], pose.world[i][2]);
@@ -1176,7 +1186,7 @@ class KinectCameraWebcam : public KinectCamera {
     // jumping: the webcam's height for them, at the drawn body's scale, less
     // the pose's. Rising from the floor or a crouch moves both alike.
     const float lift = t[1] * mediapipe_scale - hip_height;
-    UpdateRest(t, lift, time);
+    UpdateRest(t, lift, lean, time);
     // As far from the Kinect as from the webcam, pushed back by however much
     // nearer than the play distance they settled, so moved from there by
     // their steps; sideways as they are; and rising above where the pose
@@ -1201,9 +1211,51 @@ class KinectCameraWebcam : public KinectCamera {
     return true;
   }
 
-  // Where the player rests: their distance from the webcam, and how high
-  // the webcam sees their hips over where their pose puts them (lift).
-  void UpdateRest(const float t[3], float lift, double time) {
+  // How far MediaPipe has the torso lean away from the webcam, from the hips'
+  // center to the shoulders', in radians (toward it, negative), or NaN
+  // without them.
+  static float TorsoLean(const PoseLandmarks& pose) {
+    for (int i :
+         {L::kShoulderLeft, L::kShoulderRight, L::kHipLeft, L::kHipRight}) {
+      if (pose.visibility[i] < kMinVisibility) {
+        return std::numeric_limits<float>::quiet_NaN();
+      }
+    }
+    auto torso = [&](int k) {
+      return (pose.world[L::kShoulderLeft][k] +
+              pose.world[L::kShoulderRight][k] - pose.world[L::kHipLeft][k] -
+              pose.world[L::kHipRight][k]) *
+             0.5f;
+    };
+    // MediaPipe's y is down.
+    const float up = -torso(1);
+    if (up <= 0.0f) {
+      return std::numeric_limits<float>::quiet_NaN();
+    }
+    return std::atan2(torso(2), up);
+  }
+
+  // Turns the pose about the webcam's x axis to take out the lean the player
+  // settled with (kLeanFollowSeconds).
+  void StraightenPose(PoseLandmarks& pose, double time) {
+    lean_ += (lean_target_ - lean_) *
+             (1.0f - std::exp(-float(std::clamp(time - lean_time_, 0.0, 1.0)) /
+                              kLeanFollowSeconds));
+    lean_time_ = time;
+    const float c = std::cos(lean_);
+    const float s = std::sin(lean_);
+    for (float* world : pose.world) {
+      const float y = world[1];
+      const float z = world[2];
+      world[1] = y * c - z * s;
+      world[2] = y * s + z * c;
+    }
+  }
+
+  // Where the player rests: their distance from the webcam, how high the
+  // webcam sees their hips over where their pose puts them (lift), and the
+  // lean MediaPipe gives their torso while they stand still (TorsoLean).
+  void UpdateRest(const float t[3], float lift, float lean, double time) {
     const double since_seen = time - last_seen_;
     last_seen_ = time;
     if (t[2] < kAtWebcamDistance) {
@@ -1212,6 +1264,8 @@ class KinectCameraWebcam : public KinectCamera {
       // they stay at the play distance.
       have_rest_ = false;
       settled_ = false;
+      leans_.clear();
+      lean_count_ = 0;
       std::memcpy(rest_, t, sizeof(rest_));
       rest_[1] = lift;
       return;
@@ -1219,6 +1273,8 @@ class KinectCameraWebcam : public KinectCamera {
     if (!have_rest_ || since_seen > kForgetSeconds) {
       have_rest_ = true;
       settled_ = false;
+      leans_.clear();
+      lean_count_ = 0;
       settle_start_ = time;
       settle_.clear();
       std::memcpy(rest_, t, sizeof(rest_));
@@ -1227,11 +1283,6 @@ class KinectCameraWebcam : public KinectCamera {
       rest_[1] += (lift - rest_[1]) *
                   (1.0f - std::exp(-float(since_seen) / kHeightFollowSeconds));
     }
-    if (settled_) {
-      return;
-    }
-    // Until they settle, wherever they are is the play distance.
-    rest_[2] = t[2];
     settle_.push_back({time, t[2]});
     while (settle_.front().first < time - kSettleSeconds) {
       settle_.pop_front();
@@ -1243,16 +1294,43 @@ class KinectCameraWebcam : public KinectCamera {
     }
     const bool still =
         time - settle_start_ >= kSettleSeconds && high - low <= kSettleRange;
+    auto median = [](std::vector<float>& values) {
+      std::nth_element(values.begin(), values.begin() + values.size() / 2,
+                       values.end());
+      return values[values.size() / 2];
+    };
+    // Standing still rather than walking, when they lean as they go: the
+    // lean then is mostly how they stand, whatever they hold a moment.
+    if (still && !std::isnan(lean)) {
+      leans_.push_back(lean);
+      if (leans_.size() > kLeanSamples) {
+        leans_.pop_front();
+      }
+      if (++lean_count_ % kLeanSamplesPerUpdate == 0) {
+        const bool first = lean_count_ == kLeanSamplesPerUpdate;
+        std::vector<float> values(leans_.begin(), leans_.end());
+        lean_target_ = median(values);
+        if (first && cvars::log_kinect) {
+          XELOGI(
+              "Kinect: the webcam player's pose is straightened by {:.1f} "
+              "degrees",
+              -lean_target_ * 180.0f / kPi);
+        }
+      }
+    }
+    if (settled_) {
+      return;
+    }
+    // Until they settle, wherever they are is the play distance.
+    rest_[2] = t[2];
     if (!still && time - settle_start_ < kMaxSettleSeconds) {
       return;
     }
-    std::vector<float> values;
+    std::vector<float> distances;
     for (const auto& [when, z] : settle_) {
-      values.push_back(z);
+      distances.push_back(z);
     }
-    std::nth_element(values.begin(), values.begin() + values.size() / 2,
-                     values.end());
-    rest_[2] = values[values.size() / 2];
+    rest_[2] = median(distances);
     settled_ = true;
     if (cvars::log_kinect) {
       XELOGI("Kinect: the webcam player settled {:.2f} m from it", rest_[2]);
@@ -1492,6 +1570,13 @@ class KinectCameraWebcam : public KinectCamera {
   bool settled_ = false;
   double settle_start_ = 0.0;
   std::deque<std::pair<double, float>> settle_;
+  // UpdateRest's: TorsoLean's while they stood still since they settled,
+  // and what StraightenPose takes out, easing toward their median.
+  std::deque<float> leans_;
+  size_t lean_count_ = 0;
+  float lean_ = 0.0f;
+  float lean_target_ = 0.0f;
+  double lean_time_ = 0.0;
   float rest_[3] = {};
   double last_seen_ = 0.0;
   // For the Kinect view.
