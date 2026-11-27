@@ -25,6 +25,7 @@
 #include "xenia/base/platform.h"
 #include "xenia/base/string.h"
 #include "xenia/kernel/nui/kinect_libusb.h"
+#include "xenia/kernel/nui/kinect_view.h"
 #include "xenia/kernel/nui/webcam_kinect.h"
 
 DEFINE_bool(kinect_mirror, false,
@@ -838,7 +839,9 @@ std::unique_ptr<KinectMotor> KinectMotor::Open() {
   return OpenKinectMotor();
 }
 
-std::unique_ptr<KinectCamera> KinectCamera::Open(
+namespace {
+
+std::unique_ptr<KinectCamera> OpenChosenCamera(
     const std::filesystem::path& storage_root) {
   if (!cvars::kinect_playback_path.empty()) {
     auto playback = std::make_unique<KinectCameraPlayback>();
@@ -860,6 +863,62 @@ std::unique_ptr<KinectCamera> KinectCamera::Open(
     return OpenWebcamKinectCamera(storage_root);
   }
   return nullptr;
+}
+
+std::mutex preview_mutex;
+// Not destroyed at exit, which can come after what it uses is gone: the
+// Kinect view stops it as it closes.
+KinectCamera* preview_camera = nullptr;
+bool preview_failed = false;
+
+}  // namespace
+
+std::unique_ptr<KinectCamera> KinectCamera::Open(
+    const std::filesystem::path& storage_root) {
+  StopKinectPreview();
+  return OpenChosenCamera(storage_root);
+}
+
+void StartKinectPreview(const std::filesystem::path& storage_root) {
+  std::lock_guard<std::mutex> lock(preview_mutex);
+  if (preview_camera || preview_failed) {
+    return;
+  }
+  KinectView& view = KinectView::Get();
+  view.Clear();
+  std::unique_ptr<KinectCamera> camera = OpenChosenCamera(storage_root);
+  // Color as the sensor gives it, without a title's settings.
+  if (camera && camera->Start(
+                    [](const uint8_t* data, size_t size, uint32_t) {
+                      if (size == KinectCamera::kDepthFrameBytes) {
+                        KinectView::Get().PublishPackedDepth(data);
+                      }
+                    },
+                    [](const uint8_t* data, size_t size, uint32_t) {
+                      if (size == KinectCamera::kColorFrameBytes) {
+                        KinectView::Get().PublishColor(data);
+                      }
+                    })) {
+    preview_camera = camera.release();
+    view.SetPreview(KinectView::Preview::kShowing);
+    XELOGI("Kinect: showing the camera in the Kinect view until a game starts");
+  } else {
+    preview_failed = true;
+    view.SetPreview(KinectView::Preview::kNoCamera);
+  }
+}
+
+void StopKinectPreview() {
+  std::lock_guard<std::mutex> lock(preview_mutex);
+  preview_failed = false;
+  KinectView& view = KinectView::Get();
+  if (preview_camera) {
+    preview_camera->Stop();
+    delete preview_camera;
+    preview_camera = nullptr;
+    view.Clear();
+  }
+  view.SetPreview(KinectView::Preview::kOff);
 }
 
 }  // namespace nui

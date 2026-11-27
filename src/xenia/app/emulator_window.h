@@ -50,6 +50,9 @@ namespace xam {
 class DashMouse;
 }  // namespace xam
 }  // namespace kernel
+namespace ui {
+class KinectViewDialog;
+}  // namespace ui
 namespace app {
 
 class GameListPanel;
@@ -301,6 +304,9 @@ class EmulatorWindow {
   ui::Presenter* presenter_painting_ = nullptr;
   // The Kinect view overlay (F9), dropped before the drawers it draws with.
   std::unique_ptr<kernel::nui::KinectViewOverlay> kinect_view_;
+  bool kinect_view_wanted_ = false;
+  // Destroyed by wx once closed.
+  ui::KinectViewDialog* kinect_view_dialog_ = nullptr;
 
   bool emulator_initialized_ = false;
 
@@ -380,6 +386,9 @@ class EmulatorWindow {
   // own: never while hidden (disable_ui) and unattended only while it already
   // has the focus, as nobody asked for it.
   bool MayTakeFocus() const;
+  // Shows the Kinect view as kinect_view_wanted_ says: in a title, the
+  // overlay; without one, its own window, previewing the camera.
+  void SyncKinectView();
   // Shows the game list, windowed at the default size, after a title stops or
   // fails to launch.
   void RestoreListWindow();

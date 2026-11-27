@@ -87,7 +87,7 @@ Without a Kinect, a webcam (USB or a laptop's own) can take its place. Games tra
 1. Run [`tools/kinect/get_webcam_files.sh`](tools/kinect/get_webcam_files.sh). It downloads MediaPipe's pose model and converts it for ONNX Runtime, and downloads ONNX Runtime too unless the system has it (Fedora: `sudo dnf install onnxruntime`). Everything goes in the `kinect` folder of Xenia's storage folder.
 2. Copy the game configs as for a Kinect (step 3 above).
 3. Stand where the webcam sees you, or sit: when your legs are out of view, standing legs are drawn for you. Where you first settle is the play distance: nearer the webcam than `kinect_webcam_distance`, you stand that far from the Kinect; further back, as far as you are from the webcam (up to 3.6 m), and the game's tilt then leaves room above your head for raised arms and jumps, as a real Kinect's does. Stepping toward or away from the webcam from there, sideways and jumping all come through.
-4. Press **F9** in a game for the **Kinect view**: what the game sees and the players it tracks, the webcam's picture with the pose found in it, and advice on aiming the webcam or where to stand. It works with a Kinect too.
+4. Press **F9** (or **View > Kinect View**) for the **Kinect view**: what the game sees and the players it tracks, the webcam's picture with the pose found in it, and advice on aiming the webcam or where to stand. From the game list it opens in a window of its own, so you can aim the webcam and find your spot before starting a game; it closes as the game starts and comes back in the game's corner if you keep it on. It works with a Kinect too.
 
 Related settings:
 

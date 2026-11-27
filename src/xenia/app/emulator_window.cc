@@ -55,6 +55,7 @@
 #include "xenia/base/threading.h"
 #include "xenia/base/utf8.h"
 #include "xenia/config.h"
+#include "xenia/kernel/nui/kinect_camera.h"
 #include "xenia/kernel/nui/kinect_view.h"
 #include "xenia/kernel/nui/webcam_kinect.h"
 #include "xenia/ui/imgui_audio_dialog.h"
@@ -64,6 +65,7 @@
 #include "xenia/ui/imgui_music_dialog.h"
 #include "xenia/ui/imgui_performance_dialog.h"
 #include "xenia/ui/imgui_postprocessing_dialog.h"
+#include "xenia/ui/kinect_view_dialog_wx.h"
 #include "xenia/ui/profile_dialogs.h"
 #include "xenia/vfs/devices/disc_zarchive_device.h"
 #include "xenia/vfs/devices/xcontent_container_device.h"
@@ -638,6 +640,9 @@ EmulatorWindow::~EmulatorWindow() {
   library_fill_alive_->store(false);
   // Its textures belong to the immediate drawer.
   kinect_view_.reset();
+  // The preview's camera isn't destroyed at exit, when what it uses may be
+  // gone.
+  kernel::nui::StopKinectPreview();
 
   // The burst thread captures through the UI thread, which is this one, so
   // keep running its calls until it notices the stop.
@@ -1000,7 +1005,7 @@ void EmulatorWindow::OnEmulatorInitialized() {
 
   emulator_initialized_ = true;
   window_->SetMainMenuEnabled(true);
-  if (cvars::kinect_view && !kinect_view_) {
+  if (cvars::kinect_view && !kinect_view_wanted_) {
     ToggleKinectView();
   }
   RefreshProfileMenu();
@@ -1304,7 +1309,7 @@ bool EmulatorWindow::Initialize() {
       // OnKeyDown.
       auto kinect_view_item = WxMenuItem::CreateCheck(
           _("&Kinect View (F9)"), false, [this](bool checked) {
-            if (checked != bool(kinect_view_)) {
+            if (checked != kinect_view_wanted_) {
               ToggleKinectView();
             } else if (view_kinect_view_item_) {
               view_kinect_view_item_->SetChecked(checked);
@@ -1606,6 +1611,13 @@ bool EmulatorWindow::Initialize() {
         if (event.GetKeyCode() == 'O' && event.ControlDown() &&
             !event.AltDown() && !emulator_->is_title_open()) {
           FileOpen();
+          return;
+        }
+        // F9 from the game list too, where the Kinect view shows the camera
+        // before a game starts. A title's window gets it in OnKeyDown.
+        if (event.GetKeyCode() == WXK_F9 && !event.HasAnyModifiers() &&
+            !emulator_->is_title_open()) {
+          ToggleKinectView();
           return;
         }
         event.Skip();
@@ -2587,6 +2599,7 @@ bool EmulatorWindow::MayTakeFocus() const {
 }
 
 void EmulatorWindow::ApplyContentVisibility() {
+  SyncKinectView();
   auto* wx_window = dynamic_cast<ui::WxWindow*>(window_.get());
   if (!wx_window) {
     return;
@@ -3088,14 +3101,43 @@ void EmulatorWindow::ToggleDebugSettingsDialog() {
 }
 
 void EmulatorWindow::ToggleKinectView() {
-  if (kinect_view_) {
+  kinect_view_wanted_ = !kinect_view_wanted_;
+  SyncKinectView();
+}
+
+void EmulatorWindow::SyncKinectView() {
+  const bool title_active =
+      emulator_ && (emulator_->is_title_open() || target_pending_launch_);
+  const bool overlay = kinect_view_wanted_ && title_active;
+  // Without a title there's no presenter for the overlay to draw with.
+  const bool dialog =
+      kinect_view_wanted_ && !title_active && emulator_initialized_;
+  if (!overlay) {
     kinect_view_.reset();
-  } else if (imgui_drawer_) {
-    kinect_view_ = std::make_unique<kernel::nui::KinectViewOverlay>(
-        imgui_drawer_.get(), emulator_->kernel_state());
+  } else if (!kinect_view_ && imgui_drawer_) {
+    kinect_view_ =
+        std::make_unique<kernel::nui::KinectViewOverlay>(imgui_drawer_.get());
+  }
+  if (dialog) {
+    if (!kinect_view_dialog_) {
+      auto* wx_window = dynamic_cast<ui::WxWindow*>(window_.get());
+      kinect_view_dialog_ = new ui::KinectViewDialog(
+          wx_window ? wx_window->frame() : nullptr, [this]() {
+            kinect_view_wanted_ = false;
+            SyncKinectView();
+          });
+      kinect_view_dialog_->Show();
+    }
+    kernel::nui::StartKinectPreview(emulator_->storage_root());
+  } else {
+    if (kinect_view_dialog_) {
+      kinect_view_dialog_->Destroy();
+      kinect_view_dialog_ = nullptr;
+    }
+    kernel::nui::StopKinectPreview();
   }
   if (view_kinect_view_item_) {
-    view_kinect_view_item_->SetChecked(bool(kinect_view_));
+    view_kinect_view_item_->SetChecked(kinect_view_wanted_);
   }
 }
 
@@ -4569,6 +4611,10 @@ xe::X_STATUS EmulatorWindow::RunTitle(const std::filesystem::path& path_to_file,
 
     return X_STATUS_UNSUCCESSFUL;
   }
+
+  // The Kinect view's preview holds the camera, which the title (or the
+  // process spawned for it) opens, and reads the cvars reloaded below.
+  kernel::nui::StopKinectPreview();
 
   bool spawn_fresh = !Emulator::CanRelaunchInProcess();
 #if XE_PLATFORM_LINUX

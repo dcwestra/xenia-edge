@@ -76,6 +76,14 @@ class KinectCamera {
   virtual void Stop() = 0;
 };
 
+// The Kinect view's preview while no title uses the camera: the one
+// kinect_camera chooses streams to the view, so it can be aimed, and the
+// player can find where to stand, before a game starts. KinectCamera::Open
+// stops it first, as a camera opens only once. Starting does nothing while it
+// runs, or once it has found no camera, until it's stopped.
+void StartKinectPreview(const std::filesystem::path& storage_root);
+void StopKinectPreview();
+
 // For measuring how long frames take to reach titles: an event as a frame
 // passes a stage, with a value, to kinect_timing_log (milliseconds since its
 // first event). Does nothing without it.

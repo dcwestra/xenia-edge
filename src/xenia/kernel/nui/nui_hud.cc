@@ -19,6 +19,7 @@
 #include "xenia/base/memory.h"
 #include "xenia/base/string.h"
 #include "xenia/kernel/nui/kinect_camera.h"
+#include "xenia/kernel/nui/kinect_view.h"
 
 DEFINE_path(kinect_skeleton_log, "",
             "Write the skeletons a Kinect title tracks, every frame it hands "
@@ -85,6 +86,29 @@ void NuiHud::OnSkeletonFrame(const uint8_t* message, uint32_t size) {
   }
   LogKinectTiming("skeleton", tracked);
   LogSkeletons();
+  PublishToView();
+}
+
+void NuiHud::PublishToView() {
+  static_assert(kJointCount == KinectView::kJoints);
+  KinectView& view = KinectView::Get();
+  if (!view.shown()) {
+    return;
+  }
+  std::vector<KinectView::Skeleton> tracked;
+  for (const Skeleton& skeleton : skeletons_) {
+    if (skeleton.state != kTrackingStateTracked) {
+      continue;
+    }
+    KinectView::Skeleton& out = tracked.emplace_back();
+    for (int j = 0; j < kJointCount; ++j) {
+      out.joints[j][0] = skeleton.joints[j].x;
+      out.joints[j][1] = skeleton.joints[j].y;
+      out.joints[j][2] = skeleton.joints[j].z;
+      out.states[j] = skeleton.joints[j].state;
+    }
+  }
+  view.PublishSkeletons(tracked);
 }
 
 void NuiHud::LogSkeletons() {
@@ -127,27 +151,6 @@ void NuiHud::LogSkeletons() {
     std::fputc('\n', skeleton_log_);
   }
   ++skeleton_log_frames_;
-}
-
-std::vector<NuiHud::TrackedSkeleton> NuiHud::GetTrackedSkeletons() {
-  std::vector<TrackedSkeleton> tracked;
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (std::chrono::steady_clock::now() - frame_time_ > kFrameTimeout) {
-    return tracked;
-  }
-  for (const Skeleton& skeleton : skeletons_) {
-    if (skeleton.state != kTrackingStateTracked) {
-      continue;
-    }
-    TrackedSkeleton& out = tracked.emplace_back();
-    for (int j = 0; j < kJointCount; ++j) {
-      out.joints[j][0] = skeleton.joints[j].x;
-      out.joints[j][1] = skeleton.joints[j].y;
-      out.joints[j][2] = skeleton.joints[j].z;
-      out.states[j] = skeleton.joints[j].state;
-    }
-  }
-  return tracked;
 }
 
 NuiHud::~NuiHud() {

@@ -38,15 +38,6 @@ class NuiHud {
   // tracked player, or none recently.
   bool GetHandCursor(uint32_t tracking_id, float& x_out, float& y_out);
 
-  // A player the title tracks, as it last sent them, for the Kinect view:
-  // skeleton space, meters from the sensor, x mirrored against its picture.
-  struct TrackedSkeleton {
-    float joints[kJointCount][3];
-    uint32_t states[kJointCount];  // 0 not tracked, 1 inferred, 2 tracked.
-  };
-  // The players tracked in the last frame, if one came recently.
-  std::vector<TrackedSkeleton> GetTrackedSkeletons();
-
  private:
   struct Joint {
     float x, y, z;
@@ -61,6 +52,9 @@ class NuiHud {
 
   // Appends the tracked skeletons to kinect_skeleton_log, if it's set.
   void LogSkeletons();
+  // The tracked players, to the Kinect view while it's shown: skeleton
+  // space, meters from the sensor, x mirrored against its picture.
+  void PublishToView();
 
   std::mutex mutex_;
   Skeleton skeletons_[kSkeletonCount] = {};

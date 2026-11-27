@@ -14,14 +14,13 @@
 
 #include "third_party/imgui/imgui.h"
 #include "xenia/base/cvar.h"
-#include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/nui/kinect_camera.h"
-#include "xenia/kernel/nui/nui_hud.h"
 
 DEFINE_bool(kinect_view, false,
             "Show the Kinect view from the start (F9 shows and hides it): "
             "what Kinect titles see, and with a webcam standing in for a "
-            "Kinect, how to stand or aim it.",
+            "Kinect, how to stand or aim it. From the game list it shows the "
+            "camera before a game starts.",
             "Kernel");
 
 namespace xe {
@@ -35,6 +34,9 @@ constexpr int kPreviewWidth = 320;
 constexpr int kPreviewHeight = 240;
 // The sensor's nominal depth view, for drawing titles' skeletons on it.
 constexpr float kFocalLength = 571.26f;
+// Skeletons older than this are no longer shown, the title having stopped
+// tracking.
+constexpr auto kSkeletonTimeout = std::chrono::milliseconds(300);
 
 // The NUI skeleton's bones, by joint index.
 constexpr int kSkeletonBones[][2] = {
@@ -69,7 +71,7 @@ bool KinectView::Due(Clock::time_point& last) {
 }
 
 void KinectView::PublishPackedDepth(const uint8_t* packed) {
-  if (!shown_ || !Due(depth_time_)) {
+  if (!shown() || !Due(depth_time_)) {
     return;
   }
   std::vector<uint16_t> raw(size_t(kSourceWidth) * kSourceHeight);
@@ -100,7 +102,7 @@ void KinectView::PublishPackedDepth(const uint8_t* packed) {
 }
 
 void KinectView::PublishColor(const uint8_t* bayer) {
-  if (!shown_ || !Due(color_time_)) {
+  if (!shown() || !Due(color_time_)) {
     return;
   }
   std::lock_guard<std::mutex> lock(mutex_);
@@ -124,7 +126,7 @@ void KinectView::PublishColor(const uint8_t* bayer) {
 
 void KinectView::PublishWebcam(const uint8_t* rgb, int width, int height,
                                const Webcam& webcam) {
-  if (!shown_) {
+  if (!shown()) {
     return;
   }
   std::lock_guard<std::mutex> lock(mutex_);
@@ -150,21 +152,96 @@ void KinectView::PublishWebcam(const uint8_t* rgb, int width, int height,
   ++webcam_.generation;
 }
 
-KinectViewOverlay::KinectViewOverlay(ui::ImGuiDrawer* imgui_drawer,
-                                     KernelState* kernel_state)
-    : imgui_drawer_(imgui_drawer), kernel_state_(kernel_state) {
-  KinectView::Get().shown_ = true;
+void KinectView::PublishSkeletons(const std::vector<Skeleton>& skeletons) {
+  if (!shown()) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  skeletons_ = skeletons;
+  skeletons_time_ = Clock::now();
+}
+
+void KinectView::Clear() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  for (Picture* picture : {&depth_, &color_, &webcam_}) {
+    picture->rgba.clear();
+    ++picture->generation;
+  }
+  webcam_status_ = Webcam();
+  skeletons_.clear();
+}
+
+KinectView::Snapshot KinectView::Take() {
+  Snapshot snapshot;
+  std::lock_guard<std::mutex> lock(mutex_);
+  snapshot.depth = depth_;
+  snapshot.color = color_;
+  snapshot.webcam = webcam_;
+  snapshot.webcam_status = webcam_status_;
+  if (Clock::now() - skeletons_time_ < kSkeletonTimeout) {
+    snapshot.skeletons = skeletons_;
+  }
+  snapshot.preview = preview_;
+  return snapshot;
+}
+
+std::vector<const char*> KinectView::Advice(const Webcam& webcam,
+                                            bool waiting_for_title) {
+  std::vector<const char*> advice;
+  if (!webcam.seen) {
+    advice.push_back("Step into the webcam's view.");
+    return advice;
+  }
+  const float* l = &webcam.landmarks[0][0];
+  auto x = [&](int i) { return l[i * 2]; };
+  auto y = [&](int i) { return l[i * 2 + 1]; };
+  const float shoulders_x = (x(11) + x(12)) * 0.5f;
+  const float shoulders_y = (y(11) + y(12)) * 0.5f;
+  const float shoulder_width = std::abs(x(11) - x(12));
+  // The top of the head: above the nose by about 0.6 of the nose's height
+  // above the shoulders.
+  const float crown = y(0) - (shoulders_y - y(0)) * 0.6f;
+  if (shoulder_width > 0.5f) {
+    advice.push_back("Too close to the webcam: step back.");
+  } else if (crown < 0.02f) {
+    advice.push_back(
+        "Your head is out of view: tilt the webcam up, or step back.");
+  } else if (shoulder_width < 0.08f) {
+    advice.push_back("Far from the webcam: step closer for steadier tracking.");
+  }
+  if (shoulders_x < 0.15f || shoulders_x > 0.85f) {
+    advice.push_back("Step toward the middle of the webcam's view.");
+  }
+  if (!webcam.legs_seen) {
+    advice.push_back(
+        "Your legs are out of view, so standing legs are drawn for you. To "
+        "use your own, tilt the webcam down or step back.");
+  }
+  if (webcam.settled && waiting_for_title) {
+    advice.push_back("The game hasn't found you yet: move a little.");
+  }
+  return advice;
+}
+
+KinectViewOverlay::KinectViewOverlay(ui::ImGuiDrawer* imgui_drawer)
+    : imgui_drawer_(imgui_drawer) {
+  KinectView::Get().AddViewer();
   imgui_drawer_->AddOverlay(this);
 }
 
 KinectViewOverlay::~KinectViewOverlay() {
-  KinectView::Get().shown_ = false;
+  KinectView::Get().RemoveViewer();
   imgui_drawer_->RemoveOverlay(this);
 }
 
 void KinectViewOverlay::Update(Texture& texture,
                                const KinectView::Picture& picture) {
-  if (picture.generation == texture.generation || picture.rgba.empty()) {
+  if (picture.generation == texture.generation) {
+    return;
+  }
+  if (picture.rgba.empty()) {
+    texture.texture.reset();
+    texture.generation = picture.generation;
     return;
   }
   texture.texture = imgui_drawer_->CreateTexture(
@@ -178,17 +255,17 @@ void KinectViewOverlay::Draw() {
   KinectView& view = KinectView::Get();
   KinectView::Webcam webcam;
   bool have_webcam;
+  std::vector<KinectView::Skeleton> skeletons;
   {
     std::lock_guard<std::mutex> lock(view.mutex_);
     Update(depth_, view.depth_);
     Update(color_, view.color_);
     Update(webcam_, view.webcam_);
     webcam = view.webcam_status_;
-    have_webcam = view.webcam_.generation != 0;
-  }
-  std::vector<NuiHud::TrackedSkeleton> skeletons;
-  if (kernel_state_ && kernel_state_->nui_hud()) {
-    skeletons = kernel_state_->nui_hud()->GetTrackedSkeletons();
+    have_webcam = !view.webcam_.rgba.empty();
+    if (KinectView::Clock::now() - view.skeletons_time_ < kSkeletonTimeout) {
+      skeletons = view.skeletons_;
+    }
   }
 
   const ImGuiIO& io = ImGui::GetIO();
@@ -215,7 +292,7 @@ void KinectViewOverlay::Draw() {
                  picture_size);
     const float sx = picture_size.x / kSourceWidth;
     const float sy = picture_size.y / kSourceHeight;
-    for (const NuiHud::TrackedSkeleton& skeleton : skeletons) {
+    for (const KinectView::Skeleton& skeleton : skeletons) {
       auto at = [&](int joint) {
         const float* p = skeleton.joints[joint];
         const float z = std::max(p[2], 0.1f);
@@ -281,43 +358,7 @@ void KinectViewOverlay::Draw() {
     }
     ImGui::Text("Kinect tilt: %+.0f degrees (simulated)", webcam.tilt_degrees);
 
-    // How to stand or aim the webcam, from where the player is in its
-    // picture.
-    std::vector<const char*> advice;
-    if (!webcam.seen) {
-      advice.push_back("Step into the webcam's view.");
-    } else {
-      const float* l = &webcam.landmarks[0][0];
-      auto x = [&](int i) { return l[i * 2]; };
-      auto y = [&](int i) { return l[i * 2 + 1]; };
-      const float shoulders_x = (x(11) + x(12)) * 0.5f;
-      const float shoulders_y = (y(11) + y(12)) * 0.5f;
-      const float shoulder_width = std::abs(x(11) - x(12));
-      // The top of the head: above the nose by about 0.6 of the nose's
-      // height above the shoulders.
-      const float crown = y(0) - (shoulders_y - y(0)) * 0.6f;
-      if (shoulder_width > 0.5f) {
-        advice.push_back("Too close to the webcam: step back.");
-      } else if (crown < 0.02f) {
-        advice.push_back(
-            "Your head is out of view: tilt the webcam up, or step back.");
-      } else if (shoulder_width < 0.08f) {
-        advice.push_back(
-            "Far from the webcam: step closer for steadier tracking.");
-      }
-      if (shoulders_x < 0.15f || shoulders_x > 0.85f) {
-        advice.push_back("Step toward the middle of the webcam's view.");
-      }
-      if (!webcam.legs_seen) {
-        advice.push_back(
-            "Your legs are out of view, so standing legs are drawn for you. "
-            "To use your own, tilt the webcam down or step back.");
-      }
-      if (webcam.settled && skeletons.empty()) {
-        advice.push_back("The game hasn't found you yet: move a little.");
-      }
-    }
-    for (const char* line : advice) {
+    for (const char* line : KinectView::Advice(webcam, skeletons.empty())) {
       ImGui::TextColored(kWarningColor, "%s", line);
     }
   }
